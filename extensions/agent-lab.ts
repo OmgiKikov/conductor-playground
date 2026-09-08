@@ -5,7 +5,8 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 import { Type } from 'typebox';
 import { z } from 'zod';
 import { ExperimentLab, draftHash, resultHash } from '../dist/experiment.js';
-import { agentSchema, createInputSchema, draftPatchSchema, settingsSchema, type DraftPatch, type Experiment, type HumanReviewInput } from '../dist/contracts.js';
+import { agentSchema, createInputSchema, dialogueSchema, draftPatchSchema, goldenCaseSchema, settingsSchema, targetSchema, type DraftPatch, type Experiment, type HumanReviewInput } from '../dist/contracts.js';
+import { evidenceSummary } from '../dist/comparison.js';
 import { demoInput } from '../dist/demo.js';
 import { activePhases, safeText, showBoard, verdicts, type BoardAction } from './cards.ts';
 
@@ -17,6 +18,7 @@ function summary(record: Experiment, directory: string) {
     draftHash: draftHash(record), resultHash: record.trials.length ? resultHash(record) : undefined,
     message: record.message, error: record.error, questions: record.questions,
     scenarioCount: record.scenarios.length, revisionCount: record.revisions.length,
+    target: record.target, profileCount: record.profiles.length, evidence: evidenceSummary(record),
     trialCount: record.trials.length, humanReviews: record.humanReviews ?? [], usage: record.usage,
     comparison: comparison && {
       baselineId: comparison.baselineId, candidateId: comparison.candidateId,
@@ -33,6 +35,30 @@ function summary(record: Experiment, directory: string) {
   };
 }
 
+function evidenceSection(record: Experiment): string[] {
+  const e = evidenceSummary(record);
+  const pct = (v: number | null) => v === null ? 'n/a' : `${Math.round(v * 100)}%`;
+  const num = (v: number | null) => v === null ? 'n/a' : v.toFixed(2);
+  const target = record.target.kind === 'http' ? `http ${safeText(record.target.url)}` : record.target.kind === 'module' ? `module ${safeText(record.target.path)}` : 'sandbox (trusted record tools)';
+  return [
+    `Target: ${target}. Real dialogues: ${record.dialogues.length}. Golden cases: ${record.goldenCases.length}. Observed profiles: ${record.profiles.length}. User modes: ${record.settings.userModes.join(', ')}.`, '',
+    '## Observed result', '',
+    ...(e.comparison ? [safeText(e.comparison.observed), safeText(e.comparison.status)] : ['No baseline/candidate comparison in this workflow. Per-mode pass rates below are observations on the approved cards, not confirmed improvements.']), '',
+    '## User modes', '', '| Mode | Passed / valid | Trials | Avg user turns | Calls | Cost | Failures only this mode found |', '|---|---|---|---|---|---|---|',
+    ...e.modes.map(m => `| ${m.userMode} | ${m.passed} / ${m.valid} (${pct(m.passRate)}) | ${m.trials} | ${num(m.avgUserTurns)} | ${m.calls} | ${m.costUsd === null ? 'unknown' : `$${m.costUsd.toFixed(4)}`} | ${m.uniqueFailedChecks.map(safeText).join(', ') || 'none'} |`), '',
+    '## Judge calibration', '', 'Positive class is "fail". TPR: human-confirmed failures the judge also flagged. TNR: human-confirmed passes the judge also passed.', '',
+    '| Key | Subject | n | TPR | TNR | Agreement | Enough data |', '|---|---|---|---|---|---|---|',
+    ...e.calibration.map(c => `| ${safeText(c.key)} | ${c.subject} | ${c.n} | ${pct(c.tpr)} | ${pct(c.tnr)} | ${pct(c.agreement)} | ${c.sufficient ? 'yes' : 'no (n<60)'} |`), '',
+    '## Simulator fidelity', '',
+    ...(e.fidelity ? [
+      `Real dialogues: ${e.fidelity.realDialogues}. Reactive simulated dialogues: ${e.fidelity.simulatedDialogues}. Human fidelity verdicts: ${e.fidelity.humanFidelity.passed} of ${e.fidelity.humanFidelity.reviewed} passed.`, '',
+      '| Metric | Real | Simulated | Gap |', '|---|---|---|---|',
+      ...e.fidelity.metrics.map(m => `| ${m.metric} | ${num(m.real)} | ${num(m.simulated)} | ${m.gap === null ? 'n/a' : m.gap.toFixed(2)} |`),
+    ] : ['No real dialogues supplied; fidelity cannot be estimated.']), '',
+    '## Evidence limits', '', ...e.notes.map(n => `- ${safeText(n)}`), '',
+  ];
+}
+
 async function exportArtifacts(record: Experiment, directory: string) {
   const exportDir = resolve(directory, 'exports');
   await mkdir(exportDir, { recursive: true, mode: 0o700 });
@@ -47,6 +73,7 @@ async function exportArtifacts(record: Experiment, directory: string) {
     safeText(record.message), '',
     `Scenarios: ${record.scenarios.length}. Trials: ${record.trials.length}. Human annotations: ${record.humanReviews?.length ?? 0}.`,
     `${record.mode === 'demo' ? 'Scripted role calls' : 'Model calls'}: ${record.usage.calls}. Observed cost: ${record.usage.costUsd === null ? 'unknown' : `$${record.usage.costUsd.toFixed(4)}`}.`, '',
+    ...evidenceSection(record),
     ...record.trials.flatMap(t => [
       `## ${t.id} · ${safeText(record.scenarios.find(s => s.id === t.scenarioId)?.title ?? t.scenarioId)}`, '',
       `Objective outcome: ${t.outcome}. ${safeText(t.reason)}`,
@@ -159,13 +186,16 @@ export default function agentLab(pi: ExtensionAPI) {
   };
   pi.registerTool({
     name: 'agent_lab_build', label: 'Prepare agent and dialogue cards',
-    description: 'Prepare an agent and a small editable set of user simulation cards from task/material contents. Uses current Pi model unless settings override. Stops before all dialogue evaluation: only a human in /agent-lab can review and approve the exact draft. Does not run, improve or approve the agent. mode=demo prepares the built-in scripted example without model calls. Native workflow is evaluation, with 5 cards and 1 repeat by default.',
+    description: 'Prepare an agent and a small editable set of user simulation cards from task/material contents. Uses current Pi model unless settings override. Stops before all dialogue evaluation: only a human in /agent-lab can review and approve the exact draft. Does not run, improve or approve the agent. mode=demo prepares the built-in scripted example without model calls. Native workflow is evaluation, with 5 cards and 1 repeat by default. target selects the agent under test: the trusted sandbox (default), an http endpoint or a local module adapter. goldenCases become curated cards; dialogues (de-identified real conversations) ground observed user profiles and simulator fidelity. settings.userModes may list static, scripted and reactive to compare what each user side finds.',
     parameters: Type.Object({
       task: Type.Optional(Type.String({ minLength: 1, maxLength: 8000 })),
       materials: Type.Optional(Type.Array(Type.Object({ name: Type.String({ minLength: 1, maxLength: 180 }), content: Type.String({ minLength: 1, maxLength: 120000 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 12 })),
       existingAgent: Type.Optional(Type.Unsafe(z.toJSONSchema(agentSchema))),
       settings: Type.Optional(Type.Unsafe(z.toJSONSchema(settingsSchema, { io: 'input' }))),
       scenarioCount: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+      target: Type.Optional(Type.Unsafe(z.toJSONSchema(targetSchema, { io: 'input' }))),
+      goldenCases: Type.Optional(Type.Unsafe(z.toJSONSchema(z.array(goldenCaseSchema).max(40), { io: 'input' }))),
+      dialogues: Type.Optional(Type.Unsafe(z.toJSONSchema(z.array(dialogueSchema).max(200), { io: 'input' }))),
       mode: Type.Optional(Type.Union([Type.Literal('live'), Type.Literal('demo')])),
     }, { additionalProperties: false }),
     executionMode: 'sequential',
@@ -254,7 +284,7 @@ export default function agentLab(pi: ExtensionAPI) {
       try {
         await lab.init();
         let id = args.trim() || undefined;
-        let section: 'agent' | 'cards' | 'results' | undefined;
+        let section: 'agent' | 'cards' | 'results' | 'stats' | undefined;
         let selected = 0;
         while (true) {
           const record = id ? await lab.get(id) : undefined;
@@ -279,7 +309,10 @@ export default function agentLab(pi: ExtensionAPI) {
               const r = action.record;
               if (r.workflow !== 'evaluate') throw new Error('Legacy comparison records cannot run from the evaluation board.');
               const hash = draftHash(r);
-              const message = `Я проверил агента, материалы, цели, пользователей и метрики всех ${r.scenarios.length} карточек.\nЗапуск: ${r.scenarios.length * r.settings.repeats} диалогов, ${r.settings.repeats} повтор(а), до ${r.settings.maxTurns} ходов, лимит ${r.settings.maxCalls} вызовов.\n${r.mode === 'demo' ? 'Сценарный демо: без модели.' : `Модель: ${safeText(r.settings.provider)}/${safeText(r.settings.model)}. Стоимость заранее неизвестна.`}\nВерсия: ${hash}\nПодтвердить эту версию и запустить?`;
+              const scripted = r.settings.userModes.includes('scripted') ? r.scenarios.filter(s => s.user.script?.length).length : 0;
+              const planned = r.settings.userModes.reduce((sum, mode) => sum + (mode === 'scripted' ? scripted : r.scenarios.length), 0) * r.settings.repeats;
+              const target = r.target.kind === 'sandbox' ? 'песочница с доверенными инструментами' : r.target.kind === 'http' ? `внешний агент по HTTP ${safeText(r.target.url)}` : `внешний агент из модуля ${safeText(r.target.path)}`;
+              const message = `Я проверил агента, материалы, цели, пользователей и метрики всех ${r.scenarios.length} карточек.\nЦель: ${target}.\nРежимы пользователя: ${r.settings.userModes.join(', ')}.\nЗапуск: ${planned} диалогов, ${r.settings.repeats} повтор(а), до ${r.settings.maxTurns} ходов, лимит ${r.settings.maxCalls} вызовов.\n${r.mode === 'demo' ? 'Сценарный демо: без модели.' : `Модель: ${safeText(r.settings.provider)}/${safeText(r.settings.model)}. Стоимость заранее неизвестна.`}\nВерсия: ${hash}\nПодтвердить эту версию и запустить?`;
               if (await ctx.ui.confirm('Проверка карточек человеком', message)) {
                 await lab.start(r.id, { approved: true, reviewer: 'human', expectedHash: hash }); section = 'results'; selected = 0;
               }

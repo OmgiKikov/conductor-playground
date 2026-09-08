@@ -5,6 +5,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { ExperimentLab } from './experiment.js';
 import { demoInput } from './demo.js';
 import { createInputSchema } from './contracts.js';
+import { evidenceSummary } from './comparison.js';
 import { getPiStatus } from './pi.js';
 
 async function main() {
@@ -13,7 +14,7 @@ async function main() {
   } });
   const command = positionals[0];
   if (values.help || !command) {
-    process.stdout.write('Agent Lab — goals, user cards, dialogues and human-reviewed metrics in Pi\n\nPrepare a draft, then use /agent-lab in Pi to edit, approve, run and review its cards.\n\nOptional CLI:\n  agent-lab build --input task.json [--data-dir .agent-lab]\n  agent-lab prepare --input task.json\n  agent-lab export --id EXPERIMENT_ID [--output evidence.json]\n  agent-lab status\n\nLegacy scripted comparison smoke:\n  agent-lab demo [--data-dir .agent-lab]\n  agent-lab run --id LEGACY_COMPARISON_ID\n\nbuild/prepare only save drafts. Human approval is given through the native Pi interface.\n'); return;
+    process.stdout.write('Agent Lab — goals, user cards, dialogues and human-reviewed metrics in Pi\n\nPrepare a draft, then use /agent-lab in Pi to edit, approve, run and review its cards.\n\nOptional CLI:\n  agent-lab build --input task.json [--data-dir .agent-lab]\n  agent-lab prepare --input task.json\n  agent-lab export --id EXPERIMENT_ID [--output evidence.json]   (includes the evidence summary: modes, judge calibration, simulator fidelity)\n  agent-lab status\n\ntask.json fields: task, materials, mode, settings (userModes: static|scripted|reactive), target (sandbox | http | module), goldenCases, dialogues, existingAgent.\n\nLegacy scripted comparison smoke:\n  agent-lab demo [--data-dir .agent-lab]\n  agent-lab run --id LEGACY_COMPARISON_ID\n\nbuild/prepare only save drafts. Human approval is given through the native Pi interface.\n'); return;
   }
   if (command === 'status') { process.stdout.write(`${JSON.stringify(await getPiStatus(), null, 2)}\n`); return; }
   const lab = new ExperimentLab(values['data-dir'] ?? resolve('.agent-lab'));
@@ -38,7 +39,7 @@ async function main() {
       if (result.phase !== 'complete') throw new Error(result.error ?? 'Experiment did not complete');
     } else if (command === 'export') {
       const record = await lab.get(id);
-      const content = JSON.stringify({ experiment: record, traceJournal: await lab.store.traceJournal(id) }, null, 2);
+      const content = JSON.stringify({ experiment: record, evidence: evidenceSummary(record), traceJournal: await lab.store.traceJournal(id) }, null, 2);
       if (values.output) await writeFile(values.output, content, { mode: 0o600 }); else process.stdout.write(`${content}\n`);
     } else throw new Error(`Unknown command: ${command}`);
   } finally {

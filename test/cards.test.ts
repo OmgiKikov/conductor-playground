@@ -19,7 +19,7 @@ async function fixture(): Promise<Experiment> {
     scenarios: prepared.scenarios.map(s => ({ ...s, split: 'dev' })),
     revisions: [{ id: 'revision-1', spec: prepared.agent, parentId: null, hypothesis: '', createdAt: '2026-09-08' }],
     selectedRevisionId: 'revision-1', manifestHash: null, reviewedAt: null, reviewMode: null, controlConsumedAt: null,
-    trials: [], comparisons: [], iterations: [], usage: emptyUsage(), error: null, limitations: [], humanReviews: [],
+    trials: [], comparisons: [], iterations: [], usage: emptyUsage(), error: null, limitations: [], humanReviews: [], target: { kind: 'sandbox' }, goldenCases: [], dialogues: [], profiles: [],
   };
 }
 
@@ -106,4 +106,23 @@ test('live polling stops on dispose and never applies a late response to a close
   await new Promise(resolve => setTimeout(resolve, 800));
   assert.equal(loads, 1);
   assert.equal(renders, 0);
+});
+
+test('the statistics section renders the evidence summary in narrow and wide terminals without claiming more than the data', async () => {
+  const record = await fixture();
+  record.settings.userModes = ['static', 'reactive'];
+  record.dialogues = [{ id: 'd1', messages: [{ role: 'user', content: 'hi?' }], outcome: 'abandoned' }];
+  const board = new LabBoard({ record, section: 'stats' }, theme, () => {}, () => {}, () => 40);
+  for (const width of [16, 40, 80, 132]) for (const line of board.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}`);
+  const text = stripTerminalSequences(board.render(120).join('\n'));
+  assert.match(text, /4 Статистика/);
+  assert.match(text, /static/); assert.match(text, /reactive/);
+  assert.match(text, /No human verdicts/);
+  assert.match(text, /Реальные диалоги: 1/);
+  assert.match(text, /Калибровка судьи/);
+  board.dispose();
+  const other = new LabBoard({ record }, theme, () => {}, () => {}, () => 40);
+  other.handleInput('4');
+  assert.match(stripTerminalSequences(other.render(120).join('\n')), /Верность симулятора/);
+  other.dispose();
 });

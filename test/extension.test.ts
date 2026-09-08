@@ -154,3 +154,33 @@ test('actual Pi SDK loader imports native cards, preparation-only tools and embe
     assert.match(protocol, /agent_lab_build|agent_lab_inspect/); assert.doesNotMatch(protocol, /https?:\/\//);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test('build accepts an external module target, real dialogues and golden cases; inspect and exports carry the evidence summary', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-extension-v2-'));
+  const { tools, shutdown } = registered();
+  const ctx = { cwd: directory, model: undefined, mode: 'print', hasUI: false } as ExtensionContext;
+  try {
+    const target = { kind: 'module', path: fileURLToPath(new URL('../examples/echo-agent.mjs', import.meta.url)), exportName: 'createSession' };
+    const report = output(await tools.get('agent_lab_build')!.execute('build-v2', {
+      mode: 'demo', scenarioCount: 1, target, settings: { userModes: ['static', 'reactive'] },
+      goldenCases: [{ id: 'gold_move', goal: 'Move appointment A101 to 14:00', opening: 'Please move appointment A101 to 14:00.', successCriteria: 'A101 is at 14:00',
+        initialState: { records: { A101: { time: '09:00', owner: 'Sample customer', status: 'booked' } }, writableFields: ['time'], transientFailures: 0 },
+        checks: [{ id: 'time', kind: 'state_equals', description: 'moved', recordId: 'A101', field: 'time', value: '14:00' }] }],
+      dialogues: [{ id: 'd1', messages: [{ role: 'user', content: 'move A101 to 14:00 pls' }], outcome: 'success' }],
+    }, undefined, undefined, ctx));
+    assert.equal(report.phase, 'review', report.error ?? '');
+    assert.deepEqual(report.target, target);
+    assert.equal(report.scenarioCount, 2);
+    assert.equal(report.profileCount, 1);
+    assert.equal(report.evidence.comparison, null);
+    assert.deepEqual(report.evidence.modes.map((m: { userMode: string }) => m.userMode), ['static', 'reactive']);
+    assert.ok(report.evidence.notes.some((n: string) => /No human verdicts/.test(n)));
+    const inspect = output(await tools.get('agent_lab_inspect')!.execute('inspect-v2', { id: report.id, export: true }, undefined, undefined, ctx));
+    assert.equal(inspect.evidence.fidelity.realDialogues, 1);
+    assert.equal(inspect.scenarios.filter((s: { provenance: string }) => s.provenance === 'curated').length, 1);
+    const markdown = await readFile(inspect.artifacts.report, 'utf8');
+    assert.match(markdown, /Observed result/); assert.match(markdown, /User modes/); assert.match(markdown, /Judge calibration/); assert.match(markdown, /Simulator fidelity/);
+    assert.match(markdown, /module/);
+    await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
+  } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
+});

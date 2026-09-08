@@ -1,6 +1,7 @@
 import type { ExtensionContext, Theme, ThemeColor } from '@earendil-works/pi-coding-agent';
 import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from '@earendil-works/pi-tui';
 import type { Experiment, Scenario, Trial } from '../dist/contracts.js';
+import { evidenceSummary } from '../dist/comparison.js';
 
 /** All material, model and persisted text crosses this boundary before terminal rendering. */
 export function safeText(value: unknown): string {
@@ -18,7 +19,7 @@ export const verdicts: Record<string, string> = {
   pass: 'ПРОЙДЕНО', fail: 'НЕ ПРОЙДЕНО', unknown: 'НЕЯСНО', invalid: 'НЕВАЛИДНО', cancelled: 'ОСТАНОВЛЕНО', ungraded: 'БЕЗ ОЦЕНКИ',
 };
 
-type Section = 'agent' | 'cards' | 'results';
+type Section = 'agent' | 'cards' | 'results' | 'stats';
 export type BoardAction =
   | { type: 'close' }
   | { type: 'back' }
@@ -111,6 +112,35 @@ function trialLines(trial: Trial, record: Experiment, expanded: boolean): Line[]
   return rows;
 }
 
+/** Everything here is an observation over the record; the wording says so before any number. */
+function statsLines(record: Experiment): Line[] {
+  const e = evidenceSummary(record);
+  const pct = (v: number | null) => v === null ? 'нет данных' : `${Math.round(v * 100)}%`;
+  const num = (v: number | null, digits = 2) => v === null ? 'нет данных' : v.toFixed(digits);
+  const rows: Line[] = [line('СТАТИСТИКА · наблюдения, не доказательства', 'accent', true), line('')];
+  if (e.comparison) rows.push(line('Наблюдаемый результат сравнения', 'accent'), line(e.comparison.observed), line(e.comparison.status, 'muted'), line(''));
+  rows.push(line('Режимы пользователя', 'accent'));
+  for (const m of e.modes) {
+    rows.push(line(`${m.userMode}: ${m.passed}/${m.valid} пройдено (${pct(m.passRate)}) · диалогов ${m.trials} · реплик пользователя ${num(m.avgUserTurns, 1)} · вызовов ${m.calls} · стоимость ${m.costUsd === null ? 'неизвестна' : `$${m.costUsd.toFixed(4)}`}`));
+    if (m.uniqueFailedChecks.length) rows.push(line(`  провалы, найденные только в этом режиме: ${m.uniqueFailedChecks.join(', ')}`, 'warning'));
+  }
+  rows.push(line(''), line('Калибровка судьи · человек против модели, положительный класс = ошибка', 'accent'));
+  if (!e.calibration.length) rows.push(line('Метрик и проверок нет.', 'muted'));
+  for (const c of e.calibration) {
+    rows.push(line(`${c.key} [${c.subject}]: n=${c.n} · TPR ${pct(c.tpr)} · TNR ${pct(c.tnr)} · согласие ${pct(c.agreement)}${c.n && !c.sufficient ? ' · недостаточно данных (n<60)' : ''}`, c.n ? (c.sufficient ? 'text' : 'warning') : 'muted'));
+  }
+  rows.push(line(''), line('Верность симулятора · реактивные диалоги против реальных', 'accent'));
+  if (!e.fidelity) rows.push(line('Реальные диалоги не загружены; верность оценить нельзя.', 'muted'));
+  else {
+    rows.push(line(`Реальные диалоги: ${e.fidelity.realDialogues} · реактивные симуляции: ${e.fidelity.simulatedDialogues}`, 'muted'));
+    const names: Record<string, string> = { userTurns: 'реплик пользователя на диалог', userMessageLength: 'длина реплики, символов', questionRate: 'доля реплик с вопросом', disengagementRate: 'доля ушедших пользователей' };
+    for (const m of e.fidelity.metrics) rows.push(line(`${names[m.metric] ?? m.metric}: реальные ${num(m.real)} · симуляция ${num(m.simulated)} · разрыв ${m.gap === null ? 'нет данных' : `${m.gap >= 0 ? '+' : ''}${m.gap.toFixed(2)}`}`));
+    rows.push(line(`Человеческие вердикты о верности симулятора: ${e.fidelity.humanFidelity.passed} из ${e.fidelity.humanFidelity.reviewed} пройдено`));
+  }
+  rows.push(line(''), line('Ограничения доказательств', 'accent'), ...(e.notes.length ? e.notes.map(n => line(`• ${n}`, 'warning')) : [line('Нет.', 'muted')]));
+  return rows;
+}
+
 /** A single native Pi component: immutable snapshots in, explicit human intentions out. */
 export class LabBoard implements Component {
   private record?: Experiment;
@@ -163,7 +193,7 @@ export class LabBoard implements Component {
     if (key('q') || key('ctrl+c')) return this.finish({ type: 'close' });
     if (key('escape')) return this.finish({ type: this.record ? 'back' : 'close' });
     if (this.record) {
-      const section = key('1') ? 'agent' : key('2') ? 'cards' : key('3') ? 'results' : undefined;
+      const section = key('1') ? 'agent' : key('2') ? 'cards' : key('3') ? 'results' : key('4') ? 'stats' : undefined;
       if (section) { this.section = section; this.selected = 0; this.scroll = 0; }
       const editable = this.record.workflow === 'evaluate' && this.record.phase === 'review';
       const type = key('e') && editable ? 'edit'
@@ -203,7 +233,7 @@ export class LabBoard implements Component {
     const record = this.record;
     if (record) {
       header.push(line(`${phases[record.phase] ?? record.phase} · ${record.mode === 'demo' ? 'СЦЕНАРНЫЙ ДЕМО' : 'LIVE'} · ${record.id}`, activePhases.has(record.phase) ? 'accent' : 'warning'));
-      header.push(line([['agent', '1 Агент'], ['cards', `2 Карточки (${record.scenarios.length})`], ['results', `3 Диалоги (${record.trials.length})`]]
+      header.push(line([['agent', '1 Агент'], ['cards', `2 Карточки (${record.scenarios.length})`], ['results', `3 Диалоги (${record.trials.length})`], ['stats', '4 Статистика']]
         .map(([id, label]) => this.section === id ? `[${label}]` : label).join('   '), 'muted'));
       header.push(line(`${record.message}${this.loadError ? ` · ${this.loadError}` : ''}`));
     } else header.push(line('Выберите эксперимент. Новую задачу и материалы дайте Pi в разговоре.', 'muted'));
@@ -226,6 +256,8 @@ export class LabBoard implements Component {
     } else if (this.section === 'results') {
       const trial = record.trials[this.selected];
       detail = trial ? trialLines(trial, record, this.expanded) : [line('Диалогов ещё нет.', 'text', true), line('Сначала проверьте карточки, агента и лимиты. Затем нажмите r для запуска.')];
+    } else if (this.section === 'stats') {
+      detail = statsLines(record);
     } else {
       const agent = record.revisions.find(r => r.id === record.selectedRevisionId)?.spec;
       detail = [line(record.task, 'text', true),
