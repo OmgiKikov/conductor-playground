@@ -396,3 +396,41 @@ test('scenario batches reject invalid attribution and incomplete human-review ca
     } finally { await f.close(); }
   }
 });
+
+test('profile extraction cites only supplied dialogues, sees user turns only, and the simulator may disengage without exaggerating', async () => {
+  const profile = { id: 'observed_1', persona: 'Observed appointment holder', characteristics: ['Writes short messages'], observedStyle: '12 chars on average', evidenceDialogueIds: ['d1'] };
+  const replies = [{ profiles: [profile] }, { profiles: [{ ...profile, evidenceDialogueIds: ['nope'] }] }, { message: 'ok, not now', done: true }];
+  const f = await fixture((_request, index) => JSON.stringify(replies[index]));
+  try {
+    const dialogues = [{ id: 'd1', messages: [{ role: 'user' as const, content: 'hello from user' }, { role: 'assistant' as const, content: 'ASSISTANT_PRIVATE reply' }], outcome: 'success' as const }];
+    const profiles = await f.adapter.profiles!({ task: 'Manage appointments', sources: [], dialogues }, callContext().ctx);
+    assert.deepEqual(profiles, [profile]);
+    assert.match(f.requests[0]?.systemPrompt ?? '', /Do not infer demographic traits/);
+    assert.match(f.requests[0]?.systemPrompt ?? '', /evidenceDialogueIds only from the supplied dialogues/);
+    const payload = JSON.stringify(f.requests[0]?.messages);
+    assert.match(payload, /hello from user/);
+    assert.doesNotMatch(payload, /ASSISTANT_PRIVATE/);
+    await assert.rejects(f.adapter.profiles!({ task: 'Manage appointments', sources: [], dialogues }, callContext().ctx), /evidence/i);
+    const turn = await f.adapter.userTurn({ user: { goal: 'g', facts: 'f', behavior: 'b', opening: 'o', maxFollowUps: 1, persona: profile.persona, characteristics: profile.characteristics }, messages: [{ role: 'assistant', content: 'I cannot help with that.' }], turn: 1 }, callContext().ctx);
+    assert.deepEqual(turn, { message: 'ok, not now', done: true });
+    assert.match(f.requests[2]?.systemPrompt ?? '', /Real users leave/);
+    assert.match(f.requests[2]?.systemPrompt ?? '', /Do not exaggerate traits/);
+  } finally { await f.close(); }
+});
+
+test('card generation with observed profiles requires a profileId and passes the profiles as evidence', async () => {
+  const quote = 'Support is available by email.';
+  const profile = { id: 'observed_1', persona: 'Observed customer', characteristics: ['Writes short messages'], observedStyle: 'short', evidenceDialogueIds: ['d1'] };
+  const requirements = [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }];
+  const outputs = [{ requirements, questions: [] }, { scenarios: [plainCard(0)] }, { requirements, questions: [] }, { scenarios: [{ ...plainCard(1), profileId: 'observed_1' }] }];
+  const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+  try {
+    const input = { task: 'Evaluate support answers', sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }], existingAgent: { name: 'A', instructions: 'Help.', tools: [] }, scenarioCount: 1, profiles: [profile] };
+    await assert.rejects(f.adapter.prepare(input, callContext().ctx), /profileId/);
+    const prepared = await f.adapter.prepare(input, callContext().ctx);
+    assert.equal(prepared.scenarios[0]?.profileId, 'observed_1');
+    assert.match(f.requests[3]?.systemPrompt ?? '', /profileId to one of them/);
+    assert.match(JSON.stringify(f.requests[3]?.messages), /observedProfiles/);
+    assert.match(JSON.stringify(f.requests[3]?.messages), /Observed customer/);
+  } finally { await f.close(); }
+});
