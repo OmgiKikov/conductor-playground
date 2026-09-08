@@ -290,7 +290,7 @@ Lane A: T1 → T2 → T3 → T4 → T5 (shared src/). Lane B: T6 (comparison.ts,
 - Produces: `sandbox(state: World, sources: Source[], push, ctx): Tool[]` из `sandbox.ts`; `compareTrials(...)` из `comparison.ts` с прежней сигнатурой; константы промптов из `prompts.ts`: `TOOL_GUIDE`, `DATA_BOUNDARY`, `REQUIREMENTS_ROLE`, `FAMILY_PLAN_ROLE`, `cardsRole(compare: boolean, hasProfiles: boolean): string`, `AGENT_ROLE`, `IMPROVE_ROLE`, `ASSESS_ROLE`, `SIMULATOR_ROLE`, `PROFILES_ROLE`.
 - Consumes: ничего нового.
 
-- [ ] **Step 1: Перенести `sandbox()` в `src/sandbox.ts`**
+- [x] **Step 1: Перенести `sandbox()` в `src/sandbox.ts`**
 
 ```ts
 // src/sandbox.ts
@@ -300,17 +300,17 @@ import { scalarSchema, type CallContext, type Source, type Tool, type Trial, typ
 export function sandbox(state: World, sources: Source[], push: (event: Omit<Trial['events'][number], 'seq'>) => void, ctx: CallContext): Tool[] { /* moved verbatim */ }
 ```
 
-- [ ] **Step 2: Перенести `clusterInterval` и `compareTrials` в `src/comparison.ts`**, оставить в `evaluation.ts` re-export `export { compareTrials } from './comparison.js';` на один коммит, затем обновить импорты в `experiment.ts` и тестах и удалить re-export.
+- [x] **Step 2: Перенести `clusterInterval` и `compareTrials` в `src/comparison.ts`**, оставить в `evaluation.ts` re-export `export { compareTrials } from './comparison.js';` на один коммит, затем обновить импорты в `experiment.ts` и тестах и удалить re-export.
 
-- [ ] **Step 3: Создать `src/prompts.ts`** и перенести дословно строки ролей из `pi.ts`. `cardsRole(compare, hasProfiles)` возвращает текущий текст плюс (при `hasProfiles`) абзац:
+- [x] **Step 3: Создать `src/prompts.ts`** и перенести дословно строки ролей из `pi.ts`. `cardsRole(compare, hasProfiles)` возвращает текущий текст плюс (при `hasProfiles`) абзац:
 
 ```ts
 export const PROFILE_CLAUSE = `observedProfiles lists user profiles extracted from real dialogues. Every synthetic card MUST set profileId to one of them. Do not write persona or characteristics yourself: the harness copies them from the chosen profile. Vary goals and facts, not personality.`;
 ```
 
-- [ ] **Step 4: В `experiment.ts` выделить `private async runSuite(record, revision, split, ctx)`** и вызвать его из `execute` и `evaluateReviewed`. Сообщение чекпоинта: `${label}: ${scenario.title} · ${repeat + 1}/${repeats}`.
+- [x] **Step 4: В `experiment.ts` выделить `private async runSuite(record, revision, split, ctx)`** и вызвать его из `execute` и `evaluateReviewed`. Сообщение чекпоинта: `${label}: ${scenario.title} · ${repeat + 1}/${repeats}`.
 
-- [ ] **Step 5: Запустить `npm test`**, ожидание: 66 pass. Коммит `refactor: split evaluation into sandbox/comparison, extract prompts and runSuite`.
+- [x] **Step 5: Запустить `npm test`**, ожидание: 66 pass. Коммит `refactor: split evaluation into sandbox/comparison, extract prompts and runSuite`.
 
 ### Task 2: Контракты v2
 
@@ -365,10 +365,10 @@ export function goldenToScenario(c: GoldenCase): Omit<Scenario, 'split'>;
 - `PrepareInput` += `profiles: Profile[]`; `Runtime` += `profiles?(input: { task: string; sources: Source[]; dialogues: Dialogue[] }, ctx): Promise<Profile[]>`.
 - `validatePreparation(raw, sources, workflow, profiles = [])`: если `profiles.length` и карточка synthetic → `profileId` обязателен и существует; persona/characteristics копируются из профиля; `provenance !== 'synthetic'` освобождает от `requirementIds.min(1)` и от требования покрытия критичных требований.
 
-- [ ] **Step 1: Написать `test/contracts.test.ts`** с кейсами: target http без абсолютного пути → reject; headersEnv с невалидным именем → reject; golden → scenario сохраняет checks/metrics и ставит `provenance:'curated'`; старый Experiment JSON без `workflow/humanReviews/target` парсится с defaults; synthetic без requirementIds → reject, curated без них → ok; `validatePreparation` с профилями перезаписывает persona; неизвестный `profileId` → reject; `userModes` дубликаты → reject.
-- [ ] **Step 2: Запустить тест, убедиться, что падает** (`tsx --test test/contracts.test.ts`).
-- [ ] **Step 3: Реализовать схемы** согласно блоку выше.
-- [ ] **Step 4: `npm test` зелёный**, коммит `feat(contracts): targets, user modes, golden cases, dialogues, profiles`.
+- [x] **Step 1: Написать `test/contracts.test.ts`** с кейсами: target http без абсолютного пути → reject; headersEnv с невалидным именем → reject; golden → scenario сохраняет checks/metrics и ставит `provenance:'curated'`; старый Experiment JSON без `workflow/humanReviews/target` парсится с defaults; synthetic без requirementIds → reject, curated без них → ok; `validatePreparation` с профилями перезаписывает persona; неизвестный `profileId` → reject; `userModes` дубликаты → reject.
+- [x] **Step 2: Запустить тест, убедиться, что падает** (`tsx --test test/contracts.test.ts`).
+- [x] **Step 3: Реализовать схемы** согласно блоку выше.
+- [x] **Step 4: `npm test` зелёный**, коммит `feat(contracts): targets, user modes, golden cases, dialogues, profiles`.
 
 ### Task 3: Внешние адаптеры цели
 
@@ -401,7 +401,7 @@ export async function openExternalTarget(input: ExternalTargetInput): Promise<Ta
 
 Общее: `events` → `ctx.onTargetEvent?.({ type: 'tool_call', tool, args })` и `({ type: 'tool_result', tool, result, state })`; `records` → `state.records = structuredClone(records)`; возвращается `reply` (пустая строка остаётся пустой: раннер сам помечает).
 
-- [ ] **Step 1: Написать `examples/echo-agent.mjs`**
+- [x] **Step 1: Написать `examples/echo-agent.mjs`**
 
 ```js
 export function createSession({ initialState }) {
@@ -418,8 +418,8 @@ export function createSession({ initialState }) {
 }
 ```
 
-- [ ] **Step 2: Написать `test/targets.test.ts`**: локальный `node:http` сервер с режимами ok/500/slow/garbage; проверки из диаграммы; module-адаптер с fixture из `examples/`; отсутствующий экспорт; `headersEnv` без переменной; заголовок реально приходит на сервер; `ctx.signal.abort()` прерывает медленный запрос с причиной сигнала.
-- [ ] **Step 3: Прогнать, падает.** **Step 4: Реализовать `targets.ts`.** **Step 5: Зелёный, коммит** `feat(targets): http and module adapters for external agents`.
+- [x] **Step 2: Написать `test/targets.test.ts`**: локальный `node:http` сервер с режимами ok/500/slow/garbage; проверки из диаграммы; module-адаптер с fixture из `examples/`; отсутствующий экспорт; `headersEnv` без переменной; заголовок реально приходит на сервер; `ctx.signal.abort()` прерывает медленный запрос с причиной сигнала.
+- [x] **Step 3: Прогнать, падает.** **Step 4: Реализовать `targets.ts`.** **Step 5: Зелёный, коммит** `feat(targets): http and module adapters for external agents`.
 
 ### Task 4: Режимы пользователя и внешняя цель в раннере
 
@@ -451,8 +451,8 @@ session = target.kind === 'sandbox'
 
 Для внешней цели в `trial.reason` при отсутствии `records` в ответах добавляется суффикс `; external state was not reported`, а `grade` работает над `state` как обычно.
 
-- [ ] **Step 1: Тесты**: static останавливается после первого ответа и не вызывает `userTurn`; scripted подаёт реплики по порядку и не вызывает `userTurn`; scripted с `maxFollowUps` меньше длины скрипта останавливается по бюджету; external module-цель: events в трассе с seq, records заменяют мир, `state_equals` проходит; external без records → check fail и суффикс в reason; ошибка адаптера → invalid со stage `target response`.
-- [ ] **Step 2: Падают. Step 3: Реализация. Step 4: Зелёный, коммит** `feat(evaluation): static/scripted/reactive user modes and external targets`.
+- [x] **Step 1: Тесты**: static останавливается после первого ответа и не вызывает `userTurn`; scripted подаёт реплики по порядку и не вызывает `userTurn`; scripted с `maxFollowUps` меньше длины скрипта останавливается по бюджету; external module-цель: events в трассе с seq, records заменяют мир, `state_equals` проходит; external без records → check fail и суффикс в reason; ошибка адаптера → invalid со stage `target response`.
+- [x] **Step 2: Падают. Step 3: Реализация. Step 4: Зелёный, коммит** `feat(evaluation): static/scripted/reactive user modes and external targets`.
 
 ### Task 5: Оркестрация: режимы, импорт реальных данных, профили
 
@@ -465,8 +465,8 @@ session = target.kind === 'sandbox'
 - `measurementHash` += `target, goldenCases, dialogues, profiles`. `draftHash` += `target, profiles`.
 - `demo.ts`: `profiles(input)` детерминированно: одна запись `{ id: 'observed_1', persona: 'Appointment holder (observed in real dialogues)', characteristics: [...из статистики диалогов...], observedStyle: 'avg N chars per message', evidenceDialogueIds: all }`; карточки `clarify` получают `script: ['My appointment ID is A103.']`, `preference` → `script: ['Actually, please move it to 18:00 instead.']`; demo `prepare` при наличии профилей ставит `profileId`.
 
-- [ ] **Step 1: Тесты**: evaluate с `userModes: ['static','scripted','reactive']` на демо даёт `3 × cards × repeats` минус пропуски, `trial.userMode` распределён; compare с двумя режимами → reject; goldenCases появляются как `curated` с их checks; dialogues → `profiles.length === 1`, все synthetic-карточки ссылаются на `observed_1` и имеют persona профиля; `measurementHash` меняется при изменении dialogues; профиль с чужим dialogue id → эксперимент в `error` с понятным сообщением.
-- [ ] **Step 2–4: как в T4.** Коммит `feat(experiment): user modes loop, golden set and dialogue import, grounded profiles`.
+- [x] **Step 1: Тесты**: evaluate с `userModes: ['static','scripted','reactive']` на демо даёт `3 × cards × repeats` минус пропуски, `trial.userMode` распределён; compare с двумя режимами → reject; goldenCases появляются как `curated` с их checks; dialogues → `profiles.length === 1`, все synthetic-карточки ссылаются на `observed_1` и имеют persona профиля; `measurementHash` меняется при изменении dialogues; профиль с чужим dialogue id → эксперимент в `error` с понятным сообщением.
+- [x] **Step 2–4: как в T4.** Коммит `feat(experiment): user modes loop, golden set and dialogue import, grounded profiles`.
 
 ### Task 6: Статистика: режимы, калибровка судьи, верность симулятора, описательное сравнение
 
@@ -494,8 +494,8 @@ export function evidenceSummary(record: Experiment): EvidenceSummary;
 - `comparison.observed` для последнего control-сравнения: `Кандидат исправил {fixed} из {validPairs} пар, регрессий {regressed}; семейная дельта {delta} (95% {lo}…{hi}).`; `status` = вердикт с первой причиной. Для evaluate workflow `comparison = null`.
 - `notes`: строки вида `Калибровка: n<60 для {key}`, `Верность: реальные диалоги не загружены`, `Scripted: пропущено N карточек`.
 
-- [ ] **Step 1: Тесты** на синтетических записях (фабрика в тесте): режимы с уникальными провалами; калибровка с 3 human/3 model → tp/fp правильные, `sufficient=false`; последний вердикт побеждает; верность без диалогов → null; с диалогами → real/simulated/gap; описательная строка при `insufficient`.
-- [ ] **Step 2–4.** Коммит `feat(comparison): user-mode comparison, judge calibration, simulator fidelity, descriptive evidence`.
+- [x] **Step 1: Тесты** на синтетических записях (фабрика в тесте): режимы с уникальными провалами; калибровка с 3 human/3 model → tp/fp правильные, `sufficient=false`; последний вердикт побеждает; верность без диалогов → null; с диалогами → real/simulated/gap; описательная строка при `insufficient`.
+- [x] **Step 2–4.** Коммит `feat(comparison): user-mode comparison, judge calibration, simulator fidelity, descriptive evidence`.
 
 ### Task 7: Промпты: профили из реальных диалогов, право уйти, без утрирования
 
@@ -510,8 +510,8 @@ export function evidenceSummary(record: Experiment): EvidenceSummary;
 - `cardsRole(compare, hasProfiles)` добавляет `PROFILE_CLAUSE` и поле `profileId` в схему генерируемых карточек.
 - `pi.ts`: реализация `profiles()` через `ask('User profiles', PROFILES_ROLE, input, z.strictObject({ profiles: z.array(profileSchema).min(1).max(6) }), ctx)` с проверкой evidence ids; `prepare` передаёт `observedProfiles` в evidence карточек.
 
-- [ ] **Step 1: Тесты** через offline SDK fixture: роль профилей отклоняет неизвестный dialogue id; при профилях запрос карточек содержит `observedProfiles` и слово `profileId`; ответ карточки с `profileId` получает persona из профиля (проверяется на выходе `prepare` + `validatePreparation`); запрос симулятора содержит «Real users leave» и «Do not exaggerate».
-- [ ] **Step 2–4.** Коммит `feat(pi): grounded user profiles, disengagement and anti-exaggeration in the simulator`.
+- [x] **Step 1: Тесты** через offline SDK fixture: роль профилей отклоняет неизвестный dialogue id; при профилях запрос карточек содержит `observedProfiles` и слово `profileId`; ответ карточки с `profileId` получает persona из профиля (проверяется на выходе `prepare` + `validatePreparation`); запрос симулятора содержит «Real users leave» и «Do not exaggerate».
+- [x] **Step 2–4.** Коммит `feat(pi): grounded user profiles, disengagement and anti-exaggeration in the simulator`.
 
 ### Task 8: Расширение Pi, доска, CLI, отчёт
 
@@ -526,24 +526,24 @@ export function evidenceSummary(record: Experiment): EvidenceSummary;
 - `/agent-lab` подтверждение запуска показывает число режимов и число диалогов `modes × cards × repeats`.
 - `cli.ts`: `export` включает `evidence: evidenceSummary(record)`; help упоминает target и import-поля.
 
-- [ ] **Step 1: Тесты**: build с `target: { kind: 'module', path: <examples/echo-agent.mjs> }` в demo-режиме → draft с `target.kind === 'module'`; inspect содержит `evidence.modes`; отчёт содержит «Наблюдаемый результат»; доска рендерит секцию 4 в ширинах 16/40/80/132 без переполнения и показывает «недостаточно данных».
-- [ ] **Step 2–4.** Коммит `feat(pi-extension): target/import parameters, evidence summary, stats board section`.
+- [x] **Step 1: Тесты**: build с `target: { kind: 'module', path: <examples/echo-agent.mjs> }` в demo-режиме → draft с `target.kind === 'module'`; inspect содержит `evidence.modes`; отчёт содержит «Наблюдаемый результат»; доска рендерит секцию 4 в ширинах 16/40/80/132 без переполнения и показывает «недостаточно данных».
+- [x] **Step 2–4.** Коммит `feat(pi-extension): target/import parameters, evidence summary, stats board section`.
 
 ### Task 9: Документация и глоссарий
 
 **Files:**
 - Modify: `README.md`, `skills/agent-builder/SKILL.md`, `CONTEXT.md`, `package.json` (`files`)
 
-- [ ] **Step 1: README**: разделы «Подключение своего агента» (контракты HTTP и module с JSON-примерами, `headersEnv`), «Импорт golden set и реальных диалогов» (формат `task.json`), «Режимы пользователя и эксперимент три‑в‑одном», «Калибровка судьи и верность симулятора» (что значат TPR/TNR, n≥60, что значит gap), «Границы» (reported state, синтетика).
-- [ ] **Step 2: SKILL.md**: протокол начинается с реальных данных: если есть golden set и диалоги, сначала они; профили только из диалогов; симулятор может уйти; калибровка перед доверием судье; режимы для проверки ценности симулятора.
-- [ ] **Step 3: CONTEXT.md**: термины Target, User mode, Golden case, Production dialogue, Profile, Calibration, Fidelity, Observed vs Confirmed.
-- [ ] **Step 4: `npm test`, `npm run typecheck`, `npm pack --dry-run`**. Коммит `docs: external agents, real-data import, calibration and fidelity`.
+- [x] **Step 1: README**: разделы «Подключение своего агента» (контракты HTTP и module с JSON-примерами, `headersEnv`), «Импорт golden set и реальных диалогов» (формат `task.json`), «Режимы пользователя и эксперимент три‑в‑одном», «Калибровка судьи и верность симулятора» (что значат TPR/TNR, n≥60, что значит gap), «Границы» (reported state, синтетика).
+- [x] **Step 2: SKILL.md**: протокол начинается с реальных данных: если есть golden set и диалоги, сначала они; профили только из диалогов; симулятор может уйти; калибровка перед доверием судье; режимы для проверки ценности симулятора.
+- [x] **Step 3: CONTEXT.md**: термины Target, User mode, Golden case, Production dialogue, Profile, Calibration, Fidelity, Observed vs Confirmed.
+- [x] **Step 4: `npm test`, `npm run typecheck`, `npm pack --dry-run`**. Коммит `docs: external agents, real-data import, calibration and fidelity`.
 
 ### Task 10: Верификация
 
-- [ ] `npm test` (ожидается ≥ 100 тестов, 0 fail), `npx tsc --noEmit`, `npm pack --dry-run` содержит `examples/`.
-- [ ] Прогон демо end-to-end через CLI: `node dist/cli.js build --input <task.json с dialogues и goldenCases и userModes>` → phase review; затем через ExperimentLab в тесте — три режима, статистика на выходе.
-- [ ] Live-проверка с настроенным провайдером (если доступен `openai-codex/gpt-5.6-sol`): одна карточка, режим reactive, module-цель `examples/echo-agent.mjs`. Отчёт с описательным блоком. Если провайдер недоступен, зафиксировать это явно в финальном отчёте.
+- [x] `npm test` (ожидается ≥ 100 тестов, 0 fail), `npx tsc --noEmit`, `npm pack --dry-run` содержит `examples/`.
+- [x] Прогон демо end-to-end через CLI: `node dist/cli.js build --input <task.json с dialogues и goldenCases и userModes>` → phase review; затем через ExperimentLab в тесте — три режима, статистика на выходе.
+- [x] Live-проверка с настроенным провайдером (если доступен `openai-codex/gpt-5.6-sol`): одна карточка, режим reactive, module-цель `examples/echo-agent.mjs`. Отчёт с описательным блоком. Если провайдер недоступен, зафиксировать это явно в финальном отчёте.
 
 ---
 
@@ -568,6 +568,20 @@ export function evidenceSummary(record: Experiment): EvidenceSummary;
 - Simulated Customers Never Walk Away: https://arxiv.org/abs/2606.20708
 - LangWatch Scenario: https://github.com/langwatch/scenario · DeepEval ConversationSimulator: https://deepeval.com/docs/conversation-simulator · promptfoo simulated user: https://www.promptfoo.dev/docs/providers/simulated-user/
 - Pi extensions: https://pi.dev/docs/latest/extensions
+
+## Статус выполнения (2026-09-09)
+
+Все задачи T1–T10 выполнены на ветке `pi-agent-builder-evals`, коммиты от `5f20cba` до текущего HEAD.
+
+| Проверка | Результат |
+|---|---|
+| `npm test` | 91 тестов, 0 падений (было 66) |
+| `npm run typecheck` (src + extensions) | чисто |
+| `npm pack --dry-run` | 42 файла, `examples/echo-agent.mjs` включён |
+| CLI end-to-end, demo, 3 режима, golden + диалоги | 7 диалогов: static 3/3, scripted 1/1, reactive 3/3; верность real 2 / sim 3; экспорт содержит evidence |
+| Live, `openai-codex/gpt-5.6-sol`, module-цель `examples/echo-agent.mjs` | подготовка 4 вызова ($0.134): 2 профиля с верными evidence, карточка с profileId и скопированной персоной, golden как curated; прогон 6 вызовов ($0.152 всего): golden pass по сообщённому состоянию, синтетическая карточка fail с уликой судьи #1, рубрика верности симулятора pass |
+
+Оговорки live-проверки: подтверждение черновика выдал проверочный скрипт, а не человек; echo-агент не понимает формат «3:30 PM», поэтому провал синтетической карточки это свойство справочного адаптера, а не модели. Человеческих вердиктов нет, калибровка судьи помечена как неизвестная.
 
 ## GSTACK REVIEW REPORT
 
