@@ -1,0 +1,48 @@
+{
+  "name": "pi-agent-lab",
+  "version": "0.2.0",
+  "description": "Native Pi cards for user goals, simulated dialogues and human-reviewed evaluation",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "agent-lab": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "extensions",
+    "skills",
+    "docs",
+    "README.md",
+    "CONTEXT.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/agent-lab.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "typecheck": "tsc --noEmit && tsc --noEmit --strict --noUncheckedIndexedAccess --target ES2023 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/*.ts",
+    "demo": "tsx src/cli.ts demo",
+    "test": "npm run build && tsx --test test/*.test.ts",
+    "pi": "pi -e ./extensions/agent-lab.ts --skill ./skills/agent-builder/SKILL.md",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1",
+    "typebox": "1.3.7",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3"
+  }
+}
