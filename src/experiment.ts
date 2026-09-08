@@ -4,10 +4,20 @@ import {
   type CallContext, type CreateInput, type DraftPatch, type Experiment, type HumanReviewInput, type Revision, type Runtime,
 } from './contracts.js';
 import { ExperimentStore } from './store.js';
-import { evaluateTrial, compareTrials } from './evaluation.js';
+import { evaluateTrial } from './evaluation.js';
+import { compareTrials } from './comparison.js';
 import { createDemoRuntime } from './demo.js';
 import { createPiRuntime } from './pi.js';
 
+/*
+ * Phase machine owned by ExperimentLab. Every transition is an atomic checkpoint.
+ *
+ *   preparing ─► review ─┬─► evaluating ─► results_review ─► complete      (workflow: evaluate)
+ *                        └─► baseline ─► improving* ─► control ─► complete (workflow: compare)
+ *   any running phase ─► cancelled | error | interrupted
+ *
+ * runSuite is the only trial loop; both workflows call it.
+ */
 const runningPhases = new Set(['preparing', 'evaluating', 'baseline', 'improving', 'control']);
 export function draftHash(record: Experiment): string {
   return fingerprint({ task: record.task, workflow: record.workflow, mode: record.mode, sources: record.sources,
@@ -230,21 +240,35 @@ export class ExperimentLab {
     // ponytail: full JSON checkpoints keep one canonical record; split trial storage when runs exceed local-scale sizes.
     await this.store.save(record);
   }
+  /** Re-checks the frozen manifest before and after every trial; a drifted suite stops the run instead of grading it. */
+  private frozenGuard(record: Experiment, hash: string, ctx: CallContext): () => void {
+    const message = record.workflow === 'evaluate'
+      ? 'The approved evaluation conditions changed. Create a fresh reviewed run.'
+      : 'The frozen measurement changed; a fresh baseline is required.';
+    return () => {
+      ctx.signal.throwIfAborted();
+      if (measurementHash(record) !== hash) throw new Error(message);
+    };
+  }
+  /** The single trial loop: every scenario of the split, every repeat, one checkpoint per trial. */
+  private async runSuite(record: Experiment, runtime: Runtime, revision: Revision, split: 'dev' | 'control', label: string, ctx: CallContext): Promise<void> {
+    const hash = record.manifestHash;
+    if (!hash) throw new Error('Missing measurement manifest.');
+    const guard = this.frozenGuard(record, hash, ctx);
+    for (const scenario of record.scenarios.filter(s => s.split === split)) for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
+      guard();
+      const trial = await evaluateTrial({ runtime, revision, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx });
+      record.trials.push(trial);
+      await this.checkpoint(record, record.phase, `${label}${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
+      guard();
+    }
+  }
   private async evaluateReviewed(record: Experiment, ctx: CallContext): Promise<void> {
     const runtime = await this.runtime(record);
-    const agent = record.revisions[0]; const hash = record.manifestHash;
-    if (!agent || !hash) throw new Error('Missing reviewed agent or measurement manifest.');
-    const guard = () => {
-      ctx.signal.throwIfAborted();
-      if (measurementHash(record) !== hash) throw new Error('The approved evaluation conditions changed. Create a fresh reviewed run.');
-    };
-    for (const scenario of record.scenarios) for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
-      guard();
-      const trial = await evaluateTrial({ runtime, revision: agent, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx });
-      record.trials.push(trial);
-      await this.checkpoint(record, 'evaluating', `${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
-    }
-    guard();
+    const agent = record.revisions[0];
+    if (!agent || !record.manifestHash) throw new Error('Missing reviewed agent or measurement manifest.');
+    await this.runSuite(record, runtime, agent, 'dev', '', ctx);
+    this.frozenGuard(record, record.manifestHash, ctx)();
     await this.checkpoint(record, 'results_review', 'Dialogues and assessments are ready. Review simulator fidelity and evidence before accepting the results.');
   }
   private async execute(record: Experiment, ctx: CallContext): Promise<void> {
@@ -252,19 +276,9 @@ export class ExperimentLab {
     const baseline = record.revisions[0];
     if (!baseline || !record.manifestHash) throw new Error('Missing frozen baseline or measurement manifest.');
     const hash = record.manifestHash;
-    const guard = () => {
-      ctx.signal.throwIfAborted();
-      if (measurementHash(record) !== hash) throw new Error('The frozen measurement changed; a fresh baseline is required.');
-    };
-    const evaluate = async (current: Revision, split: 'dev' | 'control') => {
-      for (const scenario of record.scenarios.filter(s => s.split === split)) for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
-        guard();
-        const trial = await evaluateTrial({ runtime, revision: current, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx });
-        record.trials.push(trial);
-        await this.checkpoint(record, record.phase, `${split === 'dev' ? 'Development' : 'Control'}: ${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
-        guard();
-      }
-    };
+    const guard = this.frozenGuard(record, hash, ctx);
+    const evaluate = (current: Revision, split: 'dev' | 'control') =>
+      this.runSuite(record, runtime, current, split, split === 'dev' ? 'Development: ' : 'Control: ', ctx);
     await this.checkpoint(record, 'baseline', 'Measuring the original agent on development scenarios.');
     await evaluate(baseline, 'dev');
     let best = baseline;

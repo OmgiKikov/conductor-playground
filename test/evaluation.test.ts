@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compareTrials, evaluateTrial } from '../src/evaluation.js';
+import { evaluateTrial } from '../src/evaluation.js';
+import { compareTrials } from '../src/comparison.js';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
 import { fingerprint, validatePreparation, type CallContext, type MetricAssessment, type Revision, type Rubric, type Runtime, type Scenario, type Source, type Tool, type Trial } from '../src/contracts.js';
 
