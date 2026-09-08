@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { evaluateTrial } from '../src/evaluation.js';
 import { compareTrials } from '../src/comparison.js';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
@@ -15,7 +18,7 @@ async function fixture() {
   const preparation = validatePreparation(await runtime.prepare({ task: input.task, sources }, context()), sources);
   const baseline: Revision = { id: 'baseline', parentId: null, createdAt: '2026-01-01T00:00:00Z', hypothesis: 'Original', spec: preparation.agent };
   const candidate: Revision = { ...structuredClone(baseline), id: 'candidate', parentId: 'baseline', spec: { ...preparation.agent, tools: [...preparation.agent.tools, 'update_record'] } };
-  const evaluate = (scenario = preparation.scenarios[0]!, revision = baseline, actor = runtime, ctx = context(), repeat = 0) => evaluateTrial({ runtime: actor, revision, scenario, repeat, manifestHash: 'frozen', sources, settings: input.settings, ctx });
+  const evaluate = (scenario = preparation.scenarios[0]!, revision = baseline, actor = runtime, ctx = context(), repeat = 0) => evaluateTrial({ runtime: actor, revision, scenario, repeat, manifestHash: 'frozen', sources, settings: input.settings, ctx, userMode: 'reactive', target: { kind: 'sandbox' } });
   return { input, sources, runtime, preparation, baseline, candidate, evaluate };
 }
 
@@ -450,4 +453,55 @@ test('family clustering prevents repeats/paraphrases from inventing independent 
     assert.equal(invalid.verdict, 'incomparable');
     assert.equal(invalid.plannedPairs, 0);
   }
+});
+
+test('static and scripted user modes never call the simulator and stop within their own bounds', async () => {
+  const f = await fixture();
+  const runtime: Runtime = { ...f.runtime, userTurn: async () => { throw new Error('simulator must not run'); } };
+  const clarify = f.preparation.scenarios.find(s => s.id === 'c_clarify')!;
+  const run = (scenario: Scenario, userMode: 'static' | 'scripted') => evaluateTrial({ runtime, revision: f.candidate, scenario, repeat: 0, manifestHash: 'frozen', sources: f.sources, settings: f.input.settings, ctx: context(), userMode, target: { kind: 'sandbox' } });
+  const staticTrial = await run(clarify, 'static');
+  assert.equal(staticTrial.userMode, 'static');
+  assert.equal(staticTrial.events.filter(e => e.type === 'user').length, 1);
+  assert.equal(staticTrial.events.some(e => e.type === 'simulator'), false);
+  assert.equal(staticTrial.outcome, 'fail');
+  const scripted: Scenario = { ...clarify, user: { ...clarify.user, script: ['My appointment ID is A103.', 'Thanks, that is all.'], maxFollowUps: 5 } };
+  const scriptedTrial = await run(scripted, 'scripted');
+  assert.equal(scriptedTrial.userMode, 'scripted');
+  assert.equal(scriptedTrial.outcome, 'pass', scriptedTrial.reason);
+  assert.deepEqual(scriptedTrial.events.filter(e => e.type === 'user').map(e => e.text), [clarify.user.opening, 'My appointment ID is A103.', 'Thanks, that is all.']);
+  const scriptedEvents = scriptedTrial.events.filter(e => e.type === 'simulator');
+  assert.equal(scriptedEvents.length, 2);
+  assert.ok(scriptedEvents.every(e => (e.result as { scripted?: boolean }).scripted === true));
+  const bounded = await run({ ...scripted, user: { ...scripted.user, maxFollowUps: 1 } }, 'scripted');
+  assert.equal(bounded.events.filter(e => e.type === 'user').length, 2);
+  const noScript = await run(clarify, 'scripted');
+  assert.equal(noScript.events.filter(e => e.type === 'user').length, 1);
+  assert.equal(noScript.outcome, 'fail');
+});
+
+test('external module targets bypass the sandbox and are graded on reported records and events', async t => {
+  const f = await fixture();
+  const runtime: Runtime = { ...f.runtime, openTarget: async () => { throw new Error('sandbox target must not open'); } };
+  const direct = f.preparation.scenarios.find(s => s.id === 'a_direct')!;
+  const run = (scenario: Scenario, path: string) => evaluateTrial({ runtime, revision: f.baseline, scenario, repeat: 0, manifestHash: 'frozen', sources: f.sources, settings: f.input.settings, ctx: context(), userMode: 'static', target: { kind: 'module', path, exportName: 'createSession' } });
+  const reported = await run(direct, resolve('examples/echo-agent.mjs'));
+  assert.equal(reported.outcome, 'pass', reported.reason);
+  assert.equal(reported.finalState.records.A101!.time, '14:00');
+  assert.deepEqual(reported.events.filter(e => e.type === 'tool_call').map(e => e.tool), ['lookup_record', 'update_record']);
+  assert.ok(reported.events.every((e, i) => e.seq === i));
+  assert.doesNotMatch(reported.reason, /not reported/);
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-evaluation-'));
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(directory, { recursive: true, force: true }); });
+  const silent = join(directory, 'silent.mjs');
+  await writeFile(silent, 'export function createSession() { return { async respond() { return "Done, moved it."; } }; }\n');
+  const unreported = await run(direct, silent);
+  assert.equal(unreported.outcome, 'fail');
+  assert.match(unreported.reason, /external state was not reported/);
+  assert.equal(unreported.finalState.records.A101!.time, '09:00');
+  const broken = join(directory, 'broken.mjs');
+  await writeFile(broken, 'export function createSession() { return { async respond() { throw new Error("adapter boom"); } }; }\n');
+  const invalid = await run(direct, broken);
+  assert.equal(invalid.outcome, 'invalid');
+  assert.match(invalid.reason, /target response: .*adapter boom/);
 });

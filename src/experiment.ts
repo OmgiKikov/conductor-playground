@@ -258,7 +258,7 @@ export class ExperimentLab {
     const guard = this.frozenGuard(record, hash, ctx);
     for (const scenario of record.scenarios.filter(s => s.split === split)) for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
       guard();
-      const trial = await evaluateTrial({ runtime, revision, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx });
+      const trial = await evaluateTrial({ runtime, revision, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx, userMode: record.settings.userModes[0] ?? 'reactive', target: record.target });
       record.trials.push(trial);
       await this.checkpoint(record, record.phase, `${label}${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
       guard();

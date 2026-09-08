@@ -3,18 +3,22 @@ import { z } from 'zod';
 import {
   emptyUsage, userTurnSchema, metricAssessmentSchema,
   type CallContext, type CheckResult, type DialogueMessage, type Revision,
-  type Runtime, type Scenario, type Settings, type Source, type TargetSession, type TraceEvent, type Trial,
+  type Runtime, type Scenario, type Settings, type Source, type Target, type TargetSession, type TraceEvent, type Trial, type UserMode,
 } from './contracts.js';
 import { sandbox } from './sandbox.js';
+import { openExternalTarget } from './targets.js';
 
 /*
- * One trial = one fresh world, one target session, one simulated user.
+ * One trial = one fresh world, one target session, one user side.
  *
- *   opening ──► target.respond ──► [budget/done?] ──► runtime.userTurn ──► target.respond ──► ...
- *      │                                                                                 │
- *      └────────── every message, tool call/result and simulator decision → trial.events ◄┘
+ *   opening ──► target.respond ──► [static? budget? done?] ──► next user message ──► target.respond ──► ...
+ *      │                                   │ reactive: runtime.userTurn                            │
+ *      │                                   │ scripted: user.script[turn]                            │
+ *      └────────── every message, tool call/result and user decision → trial.events ◄──────────────┘
  *   end ──► grade(checks) over finalState + events ──► outcome ──► optional rubric assessment
  *
+ * Target: sandbox = nested model session with trusted tools mutating the world;
+ *         http/module = external agent whose reported events/records feed the same grading.
  * Invalid = the harness could not measure the agent. Fail = the agent was measured and fell short.
  */
 function freshReadEvidence(events: TraceEvent[]): { passed: boolean; evidence: string } {
@@ -78,13 +82,13 @@ function grade(scenario: Scenario, trial: Trial): CheckResult[] {
 
 export async function evaluateTrial(input: {
   runtime: Runtime; revision: Revision; scenario: Scenario; repeat: number; manifestHash: string;
-  sources: Source[]; settings: Settings; ctx: CallContext;
+  sources: Source[]; settings: Settings; ctx: CallContext; userMode: UserMode; target: Target;
 }): Promise<Trial> {
-  const { runtime, revision, scenario, repeat, manifestHash, sources, settings, ctx } = input;
+  const { runtime, revision, scenario, repeat, manifestHash, sources, settings, ctx, userMode, target } = input;
   const started = performance.now();
   const state = structuredClone(scenario.initialState);
   const trial: Trial = {
-    id: randomUUID(), revisionId: revision.id, scenarioId: scenario.id, familyId: scenario.familyId, userMode: 'reactive',
+    id: randomUUID(), revisionId: revision.id, scenarioId: scenario.id, familyId: scenario.familyId, userMode,
     repeat, split: scenario.split, manifestHash, outcome: 'invalid', reason: '', checks: [], events: [],
     initialState: structuredClone(state), finalState: structuredClone(state), usage: emptyUsage(), elapsedMs: 0,
   };
@@ -117,10 +121,15 @@ export async function evaluateTrial(input: {
   let stage = 'target initialization';
   let stopped = false;
   let finalUserReply = false;
+  let reportedState = false;
   try {
     ctx.signal.throwIfAborted();
-    const tools = sandbox(state, sources, emit, localCtx).filter(tool => revision.spec.tools.includes(tool.name));
-    session = await runtime.openTarget(structuredClone(revision.spec), structuredClone(sources), tools, localCtx);
+    if (target.kind === 'sandbox') {
+      const tools = sandbox(state, sources, emit, localCtx).filter(tool => revision.spec.tools.includes(tool.name));
+      session = await runtime.openTarget(structuredClone(revision.spec), structuredClone(sources), tools, localCtx);
+    } else {
+      session = await openExternalTarget({ target, sessionId: trial.id, scenarioId: scenario.id, state, history: () => structuredClone(messages), ctx: localCtx, onRecords: () => { reportedState = true; } });
+    }
     let userMessage = scenario.user.opening;
     for (let turn = 0; turn < settings.maxTurns; turn += 1) {
       ctx.signal.throwIfAborted();
@@ -132,7 +141,14 @@ export async function evaluateTrial(input: {
       if (typeof response !== 'string') throw new Error('Target returned a non-text response');
       append('assistant', response);
       if (!response.trim()) { trial.reason = 'Target produced an empty response'; break; }
-      if (finalUserReply || (scenario.user.maxFollowUps !== undefined && turn >= scenario.user.maxFollowUps)) { stopped = true; break; }
+      if (userMode === 'static' || finalUserReply || (scenario.user.maxFollowUps !== undefined && turn >= scenario.user.maxFollowUps)) { stopped = true; break; }
+      if (userMode === 'scripted') {
+        const next = scenario.user.script?.[turn];
+        if (next === undefined) { stopped = true; break; }
+        emit({ type: 'simulator', result: { message: next, done: false, scripted: true } });
+        userMessage = next;
+        continue;
+      }
       stage = 'user simulation';
       const decision = await runtime.userTurn({ user: structuredClone(scenario.user), messages: structuredClone(messages), turn }, userCtx);
       emit({ type: 'simulator', result: decision });
@@ -148,6 +164,7 @@ export async function evaluateTrial(input: {
     trial.outcome = !stopped ? 'fail' : trial.checks.length === 0 ? 'ungraded' : allPassed ? 'pass' : 'fail';
     trial.reason ||= !stopped ? 'Conversation did not complete within the target turn limit' : trial.checks.length === 0
       ? 'Dialogue completed without objective checks; rubric assessments are separate' : allPassed ? 'All objective checks passed' : 'One or more objective checks failed';
+    if (target.kind !== 'sandbox') trial.reason += reportedState ? '; state was reported by the external agent harness, not observed by trusted code' : '; external state was not reported';
   } catch (error) {
     if (persistenceFailed) throw persistenceError;
     trial.outcome = ctx.signal.aborted ? 'cancelled' : 'invalid';

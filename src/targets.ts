@@ -26,15 +26,17 @@ export type ExternalReply = z.infer<typeof externalReplySchema>;
 export interface ExternalTargetInput {
   target: Exclude<Target, { kind: 'sandbox' }>; sessionId: string; scenarioId: string;
   state: World; history: () => DialogueMessage[]; ctx: CallContext;
+  /** Called whenever the agent's harness reports records; the runner uses it to label reported state. */
+  onRecords?: () => void;
 }
 type SessionInput<K extends ExternalTargetInput['target']['kind']> = Omit<ExternalTargetInput, 'target'> & { target: Extract<Target, { kind: K }> };
 
-function applyReply(raw: unknown, state: World, ctx: CallContext): string {
+function applyReply(raw: unknown, state: World, ctx: CallContext, onRecords?: () => void): string {
   const parsed = externalReplySchema.safeParse(raw);
   if (!parsed.success) throw new Error(`External agent reply does not match the contract: ${parsed.error.issues.map(i => i.path.join('.') || 'reply').join(', ')}`);
   if (typeof parsed.data === 'string') return parsed.data;
   const { reply, events, records } = parsed.data;
-  if (records) state.records = structuredClone(records);
+  if (records) { state.records = structuredClone(records); onRecords?.(); }
   for (const event of events) {
     ctx.onTargetEvent?.({ type: 'tool_call', tool: event.tool, args: event.args });
     ctx.onTargetEvent?.({ type: 'tool_result', tool: event.tool, result: event.result, state });
@@ -73,7 +75,7 @@ async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> 
       if (text.length > 200000) throw new Error('External agent reply exceeds 200,000 characters');
       let body: unknown;
       try { body = JSON.parse(text); } catch { throw new Error('External agent reply is not valid JSON'); }
-      return applyReply(body, state, ctx);
+      return applyReply(body, state, ctx, input.onRecords);
     },
     async close() { closed = true; },
   };
@@ -98,7 +100,7 @@ async function moduleSession(input: SessionInput<'module'>): Promise<TargetSessi
       ctx.signal.throwIfAborted();
       const raw = await session.respond(message, history());
       ctx.signal.throwIfAborted();
-      return applyReply(raw, state, ctx);
+      return applyReply(raw, state, ctx, input.onRecords);
     },
     async close() { if (closed) return; closed = true; await session.close?.(); },
   };
