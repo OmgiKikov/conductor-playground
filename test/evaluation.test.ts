@@ -475,7 +475,7 @@ test('static and scripted user modes never call the simulator and stop within th
   assert.ok(scriptedEvents.every(e => (e.result as { scripted?: boolean }).scripted === true));
   const bounded = await run({ ...scripted, user: { ...scripted.user, maxFollowUps: 1 } }, 'scripted');
   assert.equal(bounded.events.filter(e => e.type === 'user').length, 2);
-  const noScript = await run(clarify, 'scripted');
+  const noScript = await run({ ...clarify, user: { ...clarify.user, script: undefined } }, 'scripted');
   assert.equal(noScript.events.filter(e => e.type === 'user').length, 1);
   assert.equal(noScript.outcome, 'fail');
 });

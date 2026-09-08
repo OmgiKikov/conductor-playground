@@ -6,7 +6,7 @@ import test, { type TestContext } from 'node:test';
 import { ExperimentLab, draftHash, measurementHash, resultHash } from '../src/experiment.js';
 import { ExperimentStore } from '../src/store.js';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
-import { fingerprint, validatePreparation, type Runtime } from '../src/contracts.js';
+import { createInputSchema, fingerprint, validatePreparation, type Runtime } from '../src/contracts.js';
 
 async function setup(t: TestContext, runtime?: Runtime) {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-experiment-'));
@@ -316,4 +316,63 @@ test('a large malformed assessor response preserves the completed trial with a p
   assert.equal(saved.trials[0]!.assessments, undefined);
   assert.match(saved.trials[0]!.assessmentError!, /invalid_type/);
   assert.ok(saved.trials[0]!.assessmentError!.length <= 4000);
+});
+
+test('evaluation runs every user mode, skips scripted cards without a script, and rejects multi-mode comparison', async t => {
+  const { lab } = await setup(t);
+  const input = demoInput(); input.workflow = 'evaluate'; input.scenarioCount = 3; input.settings.repeats = 1; input.settings.userModes = ['static', 'scripted', 'reactive'];
+  const created = await lab.create(input); await lab.waitForIdle();
+  const draft = await lab.get(created.id);
+  const withScript = draft.scenarios.filter(s => s.user.script?.length).length;
+  assert.ok(withScript >= 1 && withScript < draft.scenarios.length, `scripted cards: ${withScript}`);
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }); await lab.waitForIdle();
+  const result = await lab.get(draft.id);
+  assert.equal(result.phase, 'results_review', result.error ?? '');
+  const byMode = (mode: string) => result.trials.filter(tr => tr.userMode === mode).length;
+  assert.deepEqual([byMode('static'), byMode('scripted'), byMode('reactive')], [3, withScript, 3]);
+  assert.ok(result.limitations.some(l => /Scripted mode skipped/.test(l)));
+  assert.ok(result.trials.filter(tr => tr.userMode === 'static').every(tr => tr.events.filter(e => e.type === 'user').length === 1));
+  const compare = demoInput(); compare.settings.userModes = ['static', 'reactive'];
+  await assert.rejects(lab.create(compare), /exactly one user mode/);
+});
+
+test('golden cases and real dialogues enter the draft as curated cards and grounded profiles', async t => {
+  const { lab } = await setup(t);
+  const input = createInputSchema.parse({
+    ...demoInput(), workflow: 'evaluate', scenarioCount: 2, settings: { ...demoInput().settings, repeats: 1 },
+    goldenCases: [{ id: 'gold_move', goal: 'Move appointment A101 to 14:00', opening: 'Please move appointment A101 to 14:00.', successCriteria: 'A101 is at 14:00',
+      initialState: { records: { A101: { time: '09:00', owner: 'Sample customer', status: 'booked' } }, writableFields: ['time'], transientFailures: 0 },
+      checks: [{ id: 'time', kind: 'state_equals', description: 'moved', recordId: 'A101', field: 'time', value: '14:00' }] }],
+    dialogues: [
+      { id: 'd1', messages: [{ role: 'user', content: 'move A101 to 14:00 pls' }, { role: 'assistant', content: 'Done.' }], outcome: 'success' },
+      { id: 'd2', messages: [{ role: 'user', content: 'can you move my appt? not sure of the id' }, { role: 'assistant', content: 'Which appointment?' }], outcome: 'abandoned' },
+    ],
+  });
+  const created = await lab.create(input); await lab.waitForIdle();
+  const draft = await lab.get(created.id);
+  assert.equal(draft.phase, 'review', draft.error ?? '');
+  assert.equal(draft.profiles.length, 1);
+  assert.deepEqual(draft.profiles[0]!.evidenceDialogueIds, ['d1', 'd2']);
+  const golden = draft.scenarios.find(s => s.id === 'gold_move')!;
+  assert.equal(golden.provenance, 'curated'); assert.equal(golden.checks.length, 1); assert.deepEqual(golden.requirementIds, []);
+  const synthetic = draft.scenarios.filter(s => s.provenance === 'synthetic');
+  assert.equal(synthetic.length, 2);
+  assert.ok(synthetic.every(s => s.profileId === draft.profiles[0]!.id && s.user.persona === draft.profiles[0]!.persona));
+  assert.notEqual(measurementHash(draft), measurementHash({ ...draft, dialogues: [] }));
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }); await lab.waitForIdle();
+  const result = await lab.get(draft.id);
+  assert.equal(result.phase, 'results_review', result.error ?? '');
+  const goldenTrial = result.trials.find(tr => tr.scenarioId === 'gold_move')!;
+  assert.equal(goldenTrial.outcome, 'pass', goldenTrial.reason);
+});
+
+test('profiles with evidence outside the supplied dialogues fail preparation instead of grounding cards', async t => {
+  const runtime = createDemoRuntime();
+  runtime.profiles = async () => [{ id: 'bad', persona: 'x', characteristics: ['y'], observedStyle: 'z', evidenceDialogueIds: ['nope'] }];
+  const { lab } = await setup(t, runtime);
+  const input = createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1, dialogues: [{ id: 'd1', messages: [{ role: 'user', content: 'hi' }] }] });
+  const created = await lab.create(input); await lab.waitForIdle();
+  const failed = await lab.get(created.id);
+  assert.equal(failed.phase, 'error');
+  assert.match(failed.error ?? '', /evidence/i);
 });

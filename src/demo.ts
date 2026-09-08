@@ -54,7 +54,10 @@ function sampleScenarios(): ReturnType<typeof preparationSchema.parse>['scenario
   return variants.map((v, index) => ({
     id: v.familyId, familyId: ['a_direct', 'b_clarification', 'c_retry', 'd_read_only', 'e_preference'][Math.floor(index / 2)]!, title: v.title, requirementIds: v.requirementIds, provenance: 'curated' as const,
     user: { goal: v.requirementIds.includes('read') ? `Learn the time of appointment ${v.id} without changing it.` : `Move appointment ${v.id} to ${v.time}.`, facts: `Your appointment ID is ${v.id}. Your desired time is ${v.time}.`, behavior: v.behavior, opening: v.opening,
-      maxFollowUps: v.requirementIds.includes('clarify') || v.requirementIds.includes('preference') ? 1 : 0 },
+      maxFollowUps: v.requirementIds.includes('clarify') || v.requirementIds.includes('preference') ? 1 : 0,
+      // Scripted-mode lines mirror what the reactive simulator would say; direct and read-only cards have no follow-up to script.
+      ...(v.requirementIds.includes('clarify') ? { script: [v.opening.includes('my appointment') ? `My appointment ID is ${v.id}.` : `My desired time is ${v.time}.`] }
+        : v.requirementIds.includes('preference') ? { script: [`Actually, please move it to ${v.time} instead.`] } : {}) },
     initialState: { records: { [v.id]: { time: '09:00', owner: 'Sample customer', status: 'booked' } }, writableFields: ['time'], transientFailures: v.failures },
     checks: [
       { id: 'time', kind: 'state_equals' as const, description: 'The final appointment time matches the user request', recordId: v.id, field: 'time', value: v.time },
@@ -92,7 +95,8 @@ export function createDemoRuntime(): Runtime {
         if (!Number.isInteger(count) || count < 1 || count > 10) throw new Error('The demo scenario count must be an integer from 1 to 10');
         // Put one example of each mechanism first, then the remaining curated variants.
         scenarios = [...scenarios.filter((_, i) => i % 2 === 0), ...scenarios.filter((_, i) => i % 2 === 1)].slice(0, count).map(scenario => ({
-          ...scenario,
+          ...scenario, provenance: 'synthetic' as const,
+          ...(input.profiles?.[0] ? { profileId: input.profiles[0].id } : {}),
           user: { ...scenario.user, persona: 'An appointment holder arranging their own visit.',
             characteristics: ['Uses concise requests', scenario.requirementIds.includes('clarify') ? 'Provides an omitted detail when asked'
               : scenario.requirementIds.includes('preference') ? 'Revises the desired time once' : 'Ends after the assigned request is answered'] },
@@ -105,6 +109,21 @@ export function createDemoRuntime(): Runtime {
         requirements: ['change', 'read', 'clarify', 'retry', 'preference'].map((id, i) => ({ id, text: lines[i + 1], sourceId, quote: lines[i + 1], critical: true })),
         questions: [], agent: structuredClone(input.existingAgent ?? (input.workflow === 'evaluate' ? working : baseline)), scenarios,
       });
+    },
+    async profiles({ dialogues }, ctx) {
+      call(ctx);
+      if (!dialogues.length) return [];
+      // Deterministic stand-in for the model role: characteristics come from counted style, never invented.
+      const userMessages = dialogues.flatMap(d => d.messages.filter(m => m.role === 'user').map(m => m.content));
+      const average = userMessages.reduce((sum, m) => sum + m.length, 0) / Math.max(1, userMessages.length);
+      const questions = userMessages.filter(m => m.includes('?')).length / Math.max(1, userMessages.length);
+      const abandoned = dialogues.filter(d => d.outcome === 'abandoned').length / dialogues.length;
+      return [{
+        id: 'observed_1', persona: 'Appointment holder observed in the supplied real dialogues.',
+        characteristics: [average < 60 ? 'Writes short messages' : 'Writes detailed messages', questions >= 0.3 ? 'Often asks questions' : 'Rarely asks questions', abandoned > 0 ? 'May stop when blocked' : 'Stays until answered'],
+        observedStyle: `${userMessages.length} user messages, ${Math.round(average)} characters on average, ${Math.round(questions * 100)}% questions, ${Math.round(abandoned * 100)}% abandoned dialogues.`,
+        evidenceDialogueIds: dialogues.slice(0, 50).map(d => d.id),
+      }];
     },
     async assess({ scenario, trial }, ctx) {
       call(ctx);

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, fingerprint, humanReviewInputSchema, proposalSchema, settingsSchema, validatePreparation,
+  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, fingerprint, goldenToScenario, humanReviewInputSchema, proposalSchema, settingsSchema, validatePreparation,
   type CallContext, type CreateInput, type DraftPatch, type Experiment, type HumanReviewInput, type Revision, type Runtime,
 } from './contracts.js';
 import { ExperimentStore } from './store.js';
@@ -21,14 +21,16 @@ import { createPiRuntime } from './pi.js';
 const runningPhases = new Set(['preparing', 'evaluating', 'baseline', 'improving', 'control']);
 export function draftHash(record: Experiment): string {
   return fingerprint({ task: record.task, workflow: record.workflow, mode: record.mode, sources: record.sources,
-    settings: record.settings, requirements: record.requirements, questions: record.questions,
+    settings: record.settings, target: record.target, requirements: record.requirements, questions: record.questions,
+    goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles,
     scenarios: record.scenarios, agent: record.revisions[0]?.spec });
 }
 export function resultHash(record: Experiment): string {
   return fingerprint({ draft: draftHash(record), trials: record.trials, humanReviews: record.humanReviews ?? [] });
 }
 export function measurementHash(record: Experiment): string {
-  return fingerprint({ version: VERSION, workflow: record.workflow, task: record.task, baseline: record.revisions[0], mode: record.mode, sources: record.sources, requirements: record.requirements, scenarios: record.scenarios, settings: record.settings });
+  return fingerprint({ version: VERSION, workflow: record.workflow, task: record.task, baseline: record.revisions[0], mode: record.mode, sources: record.sources, requirements: record.requirements, scenarios: record.scenarios, settings: record.settings,
+    target: record.target, goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles });
 }
 function revision(spec: Revision['spec'], parentId: string | null, hypothesis: string): Revision {
   return { id: fingerprint(spec), parentId, spec: structuredClone(spec), hypothesis, createdAt: new Date().toISOString() };
@@ -80,6 +82,7 @@ export class ExperimentLab {
   async create(raw: CreateInput): Promise<Experiment> {
     this.ensureIdle();
     const input = createInputSchema.parse(raw);
+    if (input.workflow === 'compare' && input.settings.userModes.length !== 1) throw new Error('A comparison experiment runs exactly one user mode; choose static, scripted or reactive.');
     const now = new Date().toISOString();
     const record: Experiment = {
       schemaVersion: '1', id: randomUUID(), task: input.task, mode: input.mode, createdAt: now, updatedAt: now,
@@ -100,7 +103,20 @@ export class ExperimentLab {
     };
     await this.launch(record, async ctx => {
       const runtime = await this.runtime(record);
-      const prepared = validatePreparation(await runtime.prepare({ task: record.task, sources: record.sources, existingAgent: input.existingAgent, workflow: input.workflow, scenarioCount: input.scenarioCount }, ctx), record.sources, input.workflow);
+      if (record.dialogues.length && runtime.profiles) {
+        // Persona text may only come from observed dialogues; every profile must cite dialogues that were actually supplied.
+        const profiles = await runtime.profiles({ task: record.task, sources: structuredClone(record.sources), dialogues: structuredClone(record.dialogues) }, ctx);
+        const supplied = new Set(record.dialogues.map(d => d.id));
+        if (new Set(profiles.map(p => p.id)).size !== profiles.length) throw new Error('Observed profiles have duplicate IDs');
+        for (const profile of profiles) for (const id of profile.evidenceDialogueIds) if (!supplied.has(id)) throw new Error(`Profile ${profile.id} cites evidence dialogue ${id} that was not supplied`);
+        record.profiles = profiles;
+      }
+      const generated = await runtime.prepare({
+        task: record.task, sources: record.sources, existingAgent: input.existingAgent, workflow: input.workflow, scenarioCount: input.scenarioCount,
+        profiles: structuredClone(record.profiles), goldenCases: structuredClone(record.goldenCases),
+      }, ctx);
+      const golden = record.goldenCases.map(goldenToScenario);
+      const prepared = validatePreparation({ ...generated, scenarios: [...generated.scenarios, ...golden] }, record.sources, input.workflow, record.profiles);
       Object.assign(record, { requirements: prepared.requirements, questions: prepared.questions, scenarios: prepared.scenarios });
       const baseline = revision(input.existingAgent ?? prepared.agent, null, input.workflow === 'evaluate' ? 'Agent configuration selected for dialogue evaluation.' : 'Original agent before measured improvements.');
       record.revisions.push(baseline); record.selectedRevisionId = baseline.id;
@@ -251,17 +267,29 @@ export class ExperimentLab {
       if (measurementHash(record) !== hash) throw new Error(message);
     };
   }
-  /** The single trial loop: every scenario of the split, every repeat, one checkpoint per trial. */
+  /** The single trial loop: every user mode, every scenario of the split, every repeat, one checkpoint per trial. */
   private async runSuite(record: Experiment, runtime: Runtime, revision: Revision, split: 'dev' | 'control', label: string, ctx: CallContext): Promise<void> {
     const hash = record.manifestHash;
     if (!hash) throw new Error('Missing measurement manifest.');
     const guard = this.frozenGuard(record, hash, ctx);
-    for (const scenario of record.scenarios.filter(s => s.split === split)) for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
-      guard();
-      const trial = await evaluateTrial({ runtime, revision, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx, userMode: record.settings.userModes[0] ?? 'reactive', target: record.target });
-      record.trials.push(trial);
-      await this.checkpoint(record, record.phase, `${label}${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
-      guard();
+    const scenarios = record.scenarios.filter(s => s.split === split);
+    for (const userMode of record.settings.userModes) {
+      const skipped: string[] = [];
+      const prefix = record.settings.userModes.length > 1 ? `[${userMode}] ` : '';
+      for (const scenario of scenarios) {
+        if (userMode === 'scripted' && !scenario.user.script?.length) { skipped.push(scenario.id); continue; }
+        for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
+          guard();
+          const trial = await evaluateTrial({ runtime, revision, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx, userMode, target: record.target });
+          record.trials.push(trial);
+          await this.checkpoint(record, record.phase, `${label}${prefix}${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
+          guard();
+        }
+      }
+      if (skipped.length) {
+        const note = `Scripted mode skipped ${skipped.length} card(s) without a script: ${skipped.join(', ')}.`;
+        if (!record.limitations.includes(note)) record.limitations.push(note);
+      }
     }
   }
   private async evaluateReviewed(record: Experiment, ctx: CallContext): Promise<void> {
