@@ -84,7 +84,7 @@ export async function evaluateTrial(input: {
   const started = performance.now();
   const state = structuredClone(scenario.initialState);
   const trial: Trial = {
-    id: randomUUID(), revisionId: revision.id, scenarioId: scenario.id, familyId: scenario.familyId,
+    id: randomUUID(), revisionId: revision.id, scenarioId: scenario.id, familyId: scenario.familyId, userMode: 'reactive',
     repeat, split: scenario.split, manifestHash, outcome: 'invalid', reason: '', checks: [], events: [],
     initialState: structuredClone(state), finalState: structuredClone(state), usage: emptyUsage(), elapsedMs: 0,
   };

@@ -89,6 +89,7 @@ export class ExperimentLab {
       manifestHash: null, reviewedAt: null, reviewMode: null, controlConsumedAt: null, trials: [], comparisons: [], iterations: [],
       usage: emptyUsage(), error: null,
       workflow: input.workflow, humanReviews: [],
+      target: input.target, goldenCases: input.goldenCases, dialogues: input.dialogues, profiles: [],
       limitations: [
         'Tools operate on isolated test records, not production systems. Only instructions and registered tool permissions are edited.',
         'Scenario expectations require human review. Text matching checks measure literal content, not semantic correctness.',

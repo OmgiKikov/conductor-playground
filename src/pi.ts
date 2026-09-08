@@ -23,7 +23,7 @@ const familyPlanSchema = z.strictObject({ families: z.array(z.strictObject({
 })).min(4).max(16) });
 // New generated cards require an explicit interaction budget; older saved cards keep their original semantics.
 const generatedScenarioSchema = scenarioSchema.required({ successCriteria: true, assumptions: true, metrics: true })
-  .extend({ user: scenarioSchema.shape.user.required() })
+  .extend({ user: scenarioSchema.shape.user.required({ maxFollowUps: true, persona: true, characteristics: true }) })
   .refine(s => s.metrics.some(m => m.subject === 'agent') && s.metrics.some(m => m.subject === 'simulator'), 'Agent-goal and simulator-fidelity metrics are both required');
 const simulatorReplySchema = userTurnSchema.describe('A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
 const authHelp = 'Configure Pi with /login or set the selected provider API key, then select an authenticated model. Live mode never falls back to the demo.';
