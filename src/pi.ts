@@ -191,13 +191,15 @@ async function controlledSession(
 }
 
 /**
- * Models occasionally wrap the object in a markdown fence despite the instruction.
- * The payload inside is still the model's answer, so unwrap one fence before giving up;
- * anything else stays a hard failure, and the schema still decides what is valid.
+ * Models routinely wrap the object in a markdown fence, often after a sentence of
+ * preamble, despite the instruction. A fence is an explicit delimiter, so the first
+ * fenced block is taken as the answer. Bare JSON buried in prose stays a failure:
+ * guessing where an object starts is not the same as reading a delimiter. The schema
+ * still decides what is valid.
  */
 function parseJsonOutput(output: string): unknown {
   try { return JSON.parse(output); } catch { /* fall through to the fenced form */ }
-  const fenced = /^```[a-zA-Z]*\s*\n?([\s\S]*?)\n?```$/.exec(output.trim());
+  const fenced = /```[a-zA-Z]*\s*\n?([\s\S]*?)\n?```/.exec(output);
   if (!fenced?.[1]) throw new Error('Output is not JSON');
   return JSON.parse(fenced[1].trim());
 }

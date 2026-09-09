@@ -194,10 +194,14 @@ test('provider continuations respect call budget and malformed structured output
 
 test('a structured answer wrapped in a markdown fence is still the model answer', async () => {
   // Models wrap JSON in a fence often enough that rejecting it would fail runs over formatting, not content.
-  const fenced = await fixture(() => '```json\n{"message":"Move it to 11:00","done":false}\n```');
+  const fenced = await fixture((_request, index) => index === 0
+    ? '```json\n{"message":"Move it to 11:00","done":false}\n```'
+    : 'Looking at this, I will ask for the later slot.\n\n```json\n{"message":"Move it to 11:00","done":false}\n```');
   try {
-    const turn = await fenced.adapter.userTurn({ user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 }, callContext().ctx);
-    assert.deepEqual(turn, { message: 'Move it to 11:00', done: false });
+    const input = { user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 };
+    assert.deepEqual(await fenced.adapter.userTurn(input, callContext().ctx), { message: 'Move it to 11:00', done: false });
+    // The same answer after a sentence of preamble is still delimited by the fence.
+    assert.deepEqual(await fenced.adapter.userTurn(input, callContext().ctx), { message: 'Move it to 11:00', done: false });
   } finally { await fenced.close(); }
 
   const prose = await fixture(() => 'Here you go: {"message":"hi","done":false}');
