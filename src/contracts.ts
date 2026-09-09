@@ -202,7 +202,8 @@ export const createInputSchema = z.strictObject({
   settings: settingsSchema.default(() => settingsSchema.parse({})),
   existingAgent: agentSchema.optional(),
   workflow: z.enum(['evaluate', 'compare']).default('evaluate'),
-  scenarioCount: z.number().int().min(1).max(10).default(5),
+  /** 0 means: run only the owner's own cards and generate nothing. */
+  scenarioCount: z.number().int().min(0).max(10).default(5),
   target: targetSchema.default({ kind: 'sandbox' }),
   goldenCases: z.array(goldenCaseSchema).max(40).default([]),
   dialogues: z.array(dialogueSchema).max(200).default([]),
@@ -214,6 +215,9 @@ export const createInputSchema = z.strictObject({
   if (v.dialogues.reduce((n, d) => n + d.messages.reduce((m, x) => m + x.content.length, 0), 0) > 2000000) ctx.addIssue({ code: 'custom', message: 'Dialogues exceed 2,000,000 characters', path: ['dialogues'] });
   if (!unique(v.dialogues.map(d => d.id))) ctx.addIssue({ code: 'custom', message: 'Duplicate dialogue IDs', path: ['dialogues'] });
   if (!unique(v.goldenCases.map(g => g.id))) ctx.addIssue({ code: 'custom', message: 'Duplicate golden case IDs', path: ['goldenCases'] });
+  if (v.scenarioCount === 0 && !v.goldenCases.length && !v.dialogues.length) {
+    ctx.addIssue({ code: 'custom', message: 'scenarioCount 0 needs golden cases or production dialogues to have anything to run', path: ['scenarioCount'] });
+  }
   if (!unique(v.profiles.map(p => p.id))) ctx.addIssue({ code: 'custom', message: 'Duplicate profile IDs', path: ['profiles'] });
 });
 export type CreateInput = z.infer<typeof createInputSchema>;
@@ -222,7 +226,7 @@ export const preparationSchema = z.strictObject({
   requirements: z.array(requirementSchema).min(1).max(30),
   questions: z.array(text.max(2000)).max(12),
   agent: agentSchema,
-  scenarios: z.array(scenarioSchema).min(1).max(40),
+  scenarios: z.array(scenarioSchema).max(40),
 });
 export interface Preparation {
   requirements: Requirement[]; questions: string[]; agent: AgentSpec; scenarios: Scenario[];
@@ -329,6 +333,8 @@ export type UserTurn = z.infer<typeof userTurnSchema>;
 export interface PrepareInput {
   task: string; sources: Source[]; existingAgent?: AgentSpec; workflow?: 'evaluate' | 'compare'; scenarioCount?: number;
   profiles?: Profile[]; goldenCases?: GoldenCase[]; notes?: string; observedGoals?: ObservedGoal[];
+  /** The sandbox agent is only built when the sandbox answers; an external target has its own. */
+  targetKind?: Target['kind'];
 }
 export interface ImproveInput {
   task: string; sources: Source[]; requirements: Requirement[]; agent: AgentSpec;
@@ -354,6 +360,7 @@ export function fingerprint(value: unknown): string {
 
 export function validatePreparation(raw: unknown, sources: Source[], workflow: 'evaluate' | 'compare' = 'compare', profiles: Profile[] = []): Preparation {
   const p = preparationSchema.parse(raw);
+  if (!p.scenarios.length) throw new Error('No cards to run: supply golden cases or ask for generated ones');
   const requireUnique = (values: string[], name: string) => {
     if (!unique(values)) throw new Error(`Duplicate ${name}`);
   };

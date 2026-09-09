@@ -313,11 +313,12 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
           seenFamilies.add(scenario.familyId); scenarioIds.add(scenario.id); scenarios.push(scenario);
         }
       }
-      const agent = input.existingAgent ?? await ask(
-        'Agent construction',
-        AGENT_ROLE,
-        evidence, agentSchema, ctx,
-      );
+      // An external target answers with its own agent, so a sandbox AgentSpec would be
+      // built, paid for and never used.
+      const agent = input.existingAgent
+        ?? (input.targetKind && input.targetKind !== 'sandbox'
+          ? { name: 'External agent', instructions: 'The agent under evaluation runs outside Agent Lab and keeps its own instructions and tools.', tools: [] }
+          : await ask('Agent construction', AGENT_ROLE, evidence, agentSchema, ctx));
       return preparationSchema.parse({ ...grounding, scenarios, agent });
     },
     async goals(input, ctx) {

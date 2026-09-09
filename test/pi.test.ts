@@ -210,6 +210,26 @@ test('a structured answer wrapped in a markdown fence is still the model answer'
   } finally { await prose.close(); }
 });
 
+test('an external target with owner cards needs no generated cards and no sandbox agent', async () => {
+  // Nothing here may be invented by the model: the owner brought the cases and the agent.
+  const f = await fixture(() => JSON.stringify({
+    requirements: [{ id: 'req_1', text: 'The agent answers acquiring questions.', sourceId: 'source-1', quote: 'answers acquiring questions', critical: true }],
+    questions: [],
+  }));
+  try {
+    const prepared = await f.adapter.prepare({
+      task: 'Evaluate the owner agent',
+      sources: [{ id: 'source-1', name: 'perimeter.md', content: 'The agent answers acquiring questions and nothing else.', hash: 'h' }],
+      workflow: 'evaluate', scenarioCount: 0, targetKind: 'command',
+    }, callContext().ctx);
+    assert.equal(prepared.scenarios.length, 0);
+    assert.equal(prepared.agent.tools.length, 0);
+    assert.match(prepared.agent.name, /External/);
+    // Requirements only: no card batch and no agent construction were requested.
+    assert.equal(f.requests.length, 1);
+  } finally { await f.close(); }
+});
+
 test('deadline and external cancellation reach the actual SDK provider stream', async () => {
   for (const cancel of [false, true]) {
     let providerAborted = false;
