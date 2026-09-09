@@ -39,7 +39,8 @@ function evidenceSection(record: Experiment): string[] {
   const e = evidenceSummary(record);
   const pct = (v: number | null) => v === null ? 'n/a' : `${Math.round(v * 100)}%`;
   const num = (v: number | null) => v === null ? 'n/a' : v.toFixed(2);
-  const target = record.target.kind === 'http' ? `http ${safeText(record.target.url)}` : record.target.kind === 'module' ? `module ${safeText(record.target.path)}` : 'sandbox (trusted record tools)';
+  const target = record.target.kind === 'http' ? `http ${safeText(record.target.url)}` : record.target.kind === 'module' ? `module ${safeText(record.target.path)}`
+    : record.target.kind === 'command' ? `command ${safeText([record.target.command, ...record.target.args].join(' '))}` : 'sandbox (trusted record tools)';
   const v = e.verdict;
   return [
     '## Verdict', '',
@@ -324,7 +325,8 @@ export default function agentLab(pi: ExtensionAPI) {
               const hash = draftHash(r);
               const scripted = r.settings.userModes.includes('scripted') ? r.scenarios.filter(s => s.user.script?.length).length : 0;
               const planned = r.settings.userModes.reduce((sum, mode) => sum + (mode === 'scripted' ? scripted : r.scenarios.length), 0) * r.settings.repeats;
-              const target = r.target.kind === 'sandbox' ? 'песочница с доверенными инструментами' : r.target.kind === 'http' ? `внешний агент по HTTP ${safeText(r.target.url)}` : `внешний агент из модуля ${safeText(r.target.path)}`;
+              const target = r.target.kind === 'sandbox' ? 'песочница с доверенными инструментами' : r.target.kind === 'http' ? `внешний агент по HTTP ${safeText(r.target.url)}`
+                : r.target.kind === 'module' ? `внешний агент из модуля ${safeText(r.target.path)}` : `внешний агент как процесс ${safeText([r.target.command, ...r.target.args].join(' '))}`;
               const message = `Я проверил агента, материалы, цели, пользователей и метрики всех ${r.scenarios.length} карточек.\nЦель: ${target}.\nРежимы пользователя: ${r.settings.userModes.join(', ')}.\nЗапуск: ${planned} диалогов, ${r.settings.repeats} повтор(а), до ${r.settings.maxTurns} ходов, лимит ${r.settings.maxCalls} вызовов.\n${r.mode === 'demo' ? 'Сценарный демо: без модели.' : `Модель: ${safeText(r.settings.provider)}/${safeText(r.settings.model)}. Стоимость заранее неизвестна.`}\nВерсия: ${hash}\nПодтвердить эту версию и запустить?`;
               if (await ctx.ui.confirm('Проверка карточек человеком', message)) {
                 await lab.start(r.id, { approved: true, reviewer: 'human', expectedHash: hash }); section = 'results'; selected = 0;

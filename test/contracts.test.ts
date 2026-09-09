@@ -121,3 +121,11 @@ function legacyRecord() {
     manifestHash: null, reviewedAt: null, controlConsumedAt: null, comparisons: [], iterations: [], usage: emptyUsage(), error: null, limitations: [], trials: [],
   };
 }
+
+test('command targets run a local process: executable plus arguments, optional absolute cwd', () => {
+  const parsed = targetSchema.parse({ kind: 'command', command: 'python3', args: ['/abs/agent.py'] });
+  assert.deepEqual(parsed, { kind: 'command', command: 'python3', args: ['/abs/agent.py'], timeoutMs: 60000 });
+  assert.equal(targetSchema.safeParse({ kind: 'command', command: '' }).success, false);
+  assert.equal(targetSchema.safeParse({ kind: 'command', command: 'python3', cwd: 'relative/dir' }).success, false);
+  assert.ok(targetSchema.safeParse({ kind: 'command', command: 'python3', cwd: '/abs/dir' }).success);
+});

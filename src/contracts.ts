@@ -53,6 +53,12 @@ export const targetSchema = z.discriminatedUnion('kind', [
     kind: z.literal('module'), path: z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute path required'),
     exportName: z.string().regex(/^[A-Za-z_$][A-Za-z0-9_$]{0,99}$/).default('createSession'),
   }),
+  /** A local process (for example `python3 agent.py`) speaking one JSON request/reply per line over stdin/stdout. */
+  z.strictObject({
+    kind: z.literal('command'), command: z.string().min(1).max(4000), args: z.array(z.string().max(4000)).max(50).default([]),
+    cwd: z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute path required').optional(),
+    timeoutMs: z.number().int().min(1000).max(120000).default(60000),
+  }),
 ]);
 export type Target = z.infer<typeof targetSchema>;
 

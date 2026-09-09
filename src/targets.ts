@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { scalarSchema, type CallContext, type DialogueMessage, type Target, type TargetSession, type World } from './contracts.js';
@@ -106,6 +108,71 @@ async function moduleSession(input: SessionInput<'module'>): Promise<TargetSessi
   };
 }
 
+/*
+ * Command adapter: one process per dialogue, JSON lines both ways.
+ *   stdin  → {"type":"respond", sessionId, scenarioId, initialState, messages, message}
+ *   stdout ← "reply"  |  {"reply", "events"?, "records"?}
+ *   stdin  → {"type":"close", sessionId}, then stdin ends
+ * A reply that misses the deadline kills the process; an early exit surfaces the exit code and the stderr tail.
+ */
+async function commandSession(input: SessionInput<'command'>): Promise<TargetSession> {
+  const { target, sessionId, scenarioId, state, history, ctx } = input;
+  const child = spawn(target.command, target.args, { cwd: target.cwd, stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr = `${stderr}${String(chunk)}`.slice(-4000); });
+  child.stdin.on('error', () => {});
+  let pending: { resolve: (line: string) => void; reject: (error: Error) => void } | undefined;
+  let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  const takePending = () => { const waiting = pending; pending = undefined; return waiting; };
+  const exited = () => new Error(`External agent process exited${exit ? ` with code ${exit.code ?? exit.signal}` : ''}${stderr.trim() ? `: ${stderr.trim()}` : ''}`);
+  const lines = createInterface({ input: child.stdout });
+  lines.on('line', line => takePending()?.resolve(line));
+  child.on('close', (code, signal) => { exit = { code, signal }; takePending()?.reject(exited()); });
+  await new Promise<void>((resolve, reject) => {
+    child.once('spawn', () => resolve());
+    child.once('error', error => reject(new Error(`Cannot start external agent ${target.command}: ${error.message}`)));
+  });
+  const initialState = structuredClone(state);
+  const send = (payload: unknown) => new Promise<void>((resolve, reject) => { child.stdin.write(`${JSON.stringify(payload)}\n`, error => error ? reject(error) : resolve()); });
+  let closed = false;
+  return {
+    async respond(message) {
+      if (closed) throw new Error('External session is closed');
+      ctx.signal.throwIfAborted();
+      if (exit) throw exited();
+      const reply = new Promise<string>((resolve, reject) => { pending = { resolve, reject }; });
+      const timer = setTimeout(() => { takePending()?.reject(new Error(`External agent request exceeded ${target.timeoutMs} ms`)); child.kill('SIGKILL'); }, target.timeoutMs);
+      const onAbort = () => { takePending()?.reject(ctx.signal.reason instanceof Error ? ctx.signal.reason : new Error(String(ctx.signal.reason))); child.kill('SIGKILL'); };
+      ctx.signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        await send({ type: 'respond', sessionId, scenarioId, initialState, messages: history(), message }).catch(error => { throw exit ? exited() : new Error(`Cannot write to external agent: ${error instanceof Error ? error.message : String(error)}`); });
+        const line = await reply;
+        let body: unknown;
+        try { body = JSON.parse(line); } catch { throw new Error('External agent reply is not valid JSON'); }
+        return applyReply(body, state, ctx, input.onRecords);
+      } finally { clearTimeout(timer); ctx.signal.removeEventListener('abort', onAbort); }
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      if (!exit) {
+        await send({ type: 'close', sessionId }).catch(() => {});
+        child.stdin.end();
+        await new Promise<void>(resolve => {
+          if (exit) { resolve(); return; }
+          const timer = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 2000);
+          child.once('close', () => { clearTimeout(timer); resolve(); });
+        });
+      }
+      lines.close();
+    },
+  };
+}
+
 export async function openExternalTarget(input: ExternalTargetInput): Promise<TargetSession> {
-  return input.target.kind === 'http' ? httpSession({ ...input, target: input.target }) : moduleSession({ ...input, target: input.target });
+  switch (input.target.kind) {
+    case 'http': return httpSession({ ...input, target: input.target });
+    case 'module': return moduleSession({ ...input, target: input.target });
+    case 'command': return commandSession({ ...input, target: input.target });
+  }
 }

@@ -145,3 +145,51 @@ test('module adapter rejects a missing export and normalizes plain string replie
   assert.equal(events.length, 0);
   await session.close();
 });
+
+const stdioFixture = resolve('test/fixtures/stdio-agent.mjs');
+
+test('command adapter speaks JSON lines to a local process, applies reported records and closes it', async () => {
+  const state = world();
+  const { ctx, events } = context();
+  const session = await openExternalTarget({
+    target: { kind: 'command', command: process.execPath, args: [stdioFixture], timeoutMs: 5000 },
+    sessionId: 'trial-cmd', scenarioId: 'card-1', state, history: () => [{ role: 'user', content: 'earlier' }], ctx,
+  });
+  assert.equal(await session.respond('Please move A101 to 14:00'), 'Moved A101 to 14:00.');
+  assert.equal(state.records.A101!.time, '14:00');
+  assert.deepEqual(events.map(e => e.type), ['tool_call', 'tool_result']);
+  assert.equal(await session.respond('thanks'), 'You said: thanks (1 earlier)');
+  await session.close();
+  await session.close();
+});
+
+test('command adapter reports a crashed process with its stderr and kills a hanging one at the deadline', async () => {
+  const crashed = await openExternalTarget({ target: { kind: 'command', command: process.execPath, args: [stdioFixture, 'crash'], timeoutMs: 5000 }, sessionId: 't', scenarioId: 's', state: world(), history: () => [], ctx: context().ctx });
+  await assert.rejects(crashed.respond('hi'), /exited.*3.*crashed on purpose/s);
+  const started = performance.now();
+  const hanging = await openExternalTarget({ target: { kind: 'command', command: process.execPath, args: [stdioFixture, 'hang'], timeoutMs: 1000 }, sessionId: 't', scenarioId: 's', state: world(), history: () => [], ctx: context().ctx });
+  await assert.rejects(hanging.respond('hi'), /exceeded/);
+  assert.ok(performance.now() - started < 4000);
+  await hanging.close();
+  await assert.rejects(hanging.respond('again'), /closed/);
+});
+
+test('command adapter refuses a missing executable before any dialogue', async () => {
+  await assert.rejects(
+    openExternalTarget({ target: { kind: 'command', command: '/definitely/missing/agent', args: [], timeoutMs: 1000 }, sessionId: 't', scenarioId: 's', state: world(), history: () => [], ctx: context().ctx }),
+    /missing\/agent/,
+  );
+});
+
+test('the reference Python adapter answers through the command target when python3 is available', async t => {
+  const { spawnSync } = await import('node:child_process');
+  if (spawnSync('python3', ['--version']).status !== 0) { t.skip('python3 not installed'); return; }
+  const state = world();
+  const session = await openExternalTarget({
+    target: { kind: 'command', command: 'python3', args: [resolve('examples/echo-agent.py')], timeoutMs: 10000 },
+    sessionId: 't', scenarioId: 's', state, history: () => [], ctx: context().ctx,
+  });
+  assert.equal(await session.respond('Move A101 to 15:45'), 'Moved A101 to 15:45.');
+  assert.equal(state.records.A101!.time, '15:45');
+  await session.close();
+});
