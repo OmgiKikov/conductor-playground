@@ -244,3 +244,20 @@ test('unknown and invalid human verdicts are not decisions: they keep confidence
   assert.equal(decided.confidence, 'high');
   assert.equal(decided.nextSteps.some(n => n.code === 'record_verdicts'), false);
 });
+
+test('a revised human verdict counts by its latest value: fail replaced by unknown reopens the dialogue', () => {
+  const r = record({
+    scenarios: [{ ...scenario('s1'), provenance: 'curated' }, { ...scenario('s2'), provenance: 'production' }],
+    trials: Array.from({ length: 10 }, (_, i) => trial(`t${i}`, i % 2 ? 's1' : 's2', 'reactive', i < 2 ? 'fail' : 'pass', { failed: i < 2 ? ['time'] : [] })),
+    resultsReviewedAt: '2026-09-09T03:00:00Z',
+    humanReviews: [review('h0', 't0', 'fail', {}, '2026-09-09T00:00:00Z'), review('h1', 't1', 'fail', {}, '2026-09-09T00:00:00Z'), review('h2', 't1', 'unknown', {}, '2026-09-09T01:00:00Z')],
+  });
+  const revised = verdictSummary(r);
+  assert.equal(revised.confidence, 'medium');
+  assert.ok(revised.confidenceReasons.some(n => n.code === 'undecided_failures' && n.count === 1));
+  assert.ok(revised.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1));
+  const reaffirmed = verdictSummary({ ...r, humanReviews: [...r.humanReviews, review('h3', 't1', 'fail', {}, '2026-09-09T02:00:00Z')] });
+  assert.equal(reaffirmed.confidence, 'high');
+  const metricOnly = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'fail', { metricId: 'goal' }, '2026-09-09T00:00:00Z'), review('h2', 't1', 'unknown', { metricId: 'goal' }, '2026-09-09T01:00:00Z')] });
+  assert.equal(metricOnly.confidence, 'medium');
+});

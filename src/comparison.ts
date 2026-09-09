@@ -154,13 +154,18 @@ export interface CalibrationRow {
   key: string; subject: 'agent' | 'simulator' | 'check'; n: number; tp: number; tn: number; fp: number; fn: number;
   tpr: number | null; tnr: number | null; agreement: number | null; sufficient: boolean;
 }
-/** Judge agreement with the latest human verdict per trial and metric/check. "fail" is the positive class, so TPR is the share of human-confirmed failures the judge caught. */
-export function judgeCalibration(record: Experiment): CalibrationRow[] {
+/** The latest human verdict per review target (whole dialogue, one metric or one check); earlier verdicts on the same target are superseded. */
+function latestHumanReviews(record: Experiment): Map<string, HumanReview> {
   const latest = new Map<string, HumanReview>();
   for (const review of [...record.humanReviews].sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
-    if (review.metricId) latest.set(`${review.trialId}|metric:${review.metricId}`, review);
-    else if (review.checkId) latest.set(`${review.trialId}|check:${review.checkId}`, review);
+    latest.set(`${review.trialId}|${review.metricId ? `metric:${review.metricId}` : review.checkId ? `check:${review.checkId}` : 'dialogue'}`, review);
   }
+  return latest;
+}
+
+/** Judge agreement with the latest human verdict per trial and metric/check. "fail" is the positive class, so TPR is the share of human-confirmed failures the judge caught. */
+export function judgeCalibration(record: Experiment): CalibrationRow[] {
+  const latest = latestHumanReviews(record);
   const rows = new Map<string, CalibrationRow>();
   const row = (key: string, subject: CalibrationRow['subject']): CalibrationRow => {
     const existing = rows.get(key);
@@ -295,13 +300,14 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   ].sort((a, b) => b.failures - a.failures).slice(0, 3);
   const allSynthetic = provenance.curated.cards + provenance.production.cards === 0;
   const humanVerdicts = record.humanReviews.length > 0;
-  // Only pass/fail decides anything; unknown and invalid record that a person looked and could not confirm the result.
+  // Only the latest verdict per target counts, and only pass/fail decides anything; unknown and invalid record that a person looked and could not confirm the result.
   const decisive = (r: HumanReview) => r.verdict === 'pass' || r.verdict === 'fail';
-  const decisiveVerdicts = record.humanReviews.some(decisive);
+  const current = [...latestHumanReviews(record).values()];
+  const decisiveVerdicts = current.some(decisive);
   const finalized = !!record.resultsReviewedAt;
   // A failed dialogue is one that failed objectively or by the agent rubrics; every one of them needs a decisive human verdict before the result is trusted.
   const failedTrials = completed.filter(t => t.outcome === 'fail' || rubricFailed.has(t.id));
-  const reviewsFor = (trialId: string) => record.humanReviews.filter(r => r.trialId === trialId);
+  const reviewsFor = (trialId: string) => current.filter(r => r.trialId === trialId);
   const unreviewed = failedTrials.filter(t => reviewsFor(t.id).length === 0).length;
   const undecided = failedTrials.filter(t => { const reviews = reviewsFor(t.id); return reviews.length > 0 && !reviews.some(decisive); }).length;
   const reasons: VerdictNote[] = [];
