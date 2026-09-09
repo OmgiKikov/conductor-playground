@@ -190,6 +190,18 @@ async function controlledSession(
   };
 }
 
+/**
+ * Models occasionally wrap the object in a markdown fence despite the instruction.
+ * The payload inside is still the model's answer, so unwrap one fence before giving up;
+ * anything else stays a hard failure, and the schema still decides what is valid.
+ */
+function parseJsonOutput(output: string): unknown {
+  try { return JSON.parse(output); } catch { /* fall through to the fenced form */ }
+  const fenced = /^```[a-zA-Z]*\s*\n?([\s\S]*?)\n?```$/.exec(output.trim());
+  if (!fenced?.[1]) throw new Error('Output is not JSON');
+  return JSON.parse(fenced[1].trim());
+}
+
 async function jsonResponse<S extends z.ZodType>(
   modelRuntime: ModelRuntime, model: Model, label: string, role: string, input: unknown, schema: S, ctx: CallContext,
 ): Promise<z.infer<S>> {
@@ -199,7 +211,7 @@ async function jsonResponse<S extends z.ZodType>(
   try {
     const output = await session.respond(JSON.stringify(input));
     let parsed: unknown;
-    try { parsed = JSON.parse(output); }
+    try { parsed = parseJsonOutput(output); }
     catch { throw new Error('Pi returned malformed JSON; the run is invalid. Inspect the role configuration and retry.'); }
     const validated = schema.safeParse(parsed);
     if (!validated.success) throw new Error(`Pi returned an invalid structured response: ${validated.error.issues.map(i => i.path.join('.') || 'root').join(', ')}`);

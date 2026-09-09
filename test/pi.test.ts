@@ -192,6 +192,20 @@ test('provider continuations respect call budget and malformed structured output
   } finally { await malformed.close(); }
 });
 
+test('a structured answer wrapped in a markdown fence is still the model answer', async () => {
+  // Models wrap JSON in a fence often enough that rejecting it would fail runs over formatting, not content.
+  const fenced = await fixture(() => '```json\n{"message":"Move it to 11:00","done":false}\n```');
+  try {
+    const turn = await fenced.adapter.userTurn({ user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 }, callContext().ctx);
+    assert.deepEqual(turn, { message: 'Move it to 11:00', done: false });
+  } finally { await fenced.close(); }
+
+  const prose = await fixture(() => 'Here you go: {"message":"hi","done":false}');
+  try {
+    await assert.rejects(prose.adapter.userTurn({ user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 }, callContext().ctx), /malformed JSON/);
+  } finally { await prose.close(); }
+});
+
 test('deadline and external cancellation reach the actual SDK provider stream', async () => {
   for (const cancel of [false, true]) {
     let providerAborted = false;
