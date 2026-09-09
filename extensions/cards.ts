@@ -117,14 +117,17 @@ const confidenceLabels: Record<string, string> = { low: 'низкое', medium: 
 function noteText(note: VerdictNote): string {
   switch (note.code) {
     case 'none_graded': return 'Диалогов с оценкой ещё нет.';
+    case 'rubric_only': return 'Только оценки модели по рубрикам, объективных проверок нет: кодом ничего не подтверждено.';
     case 'few_graded': return `Оценено только ${note.count} диалог(ов), этого мало для вывода.`;
     case 'invalid': return `${note.count} диалог(ов) не удалось измерить (невалидны).`;
     case 'all_synthetic': return 'Все карточки синтетические: нет ни golden set, ни реальных диалогов.';
+    case 'simulator_flagged': return `Модель отметила ${note.count} диалог(ов), где симулированный пользователь мог выйти из роли.`;
     case 'no_human': return 'Ни одного человеческого вердикта: оценки модели не проверены.';
     case 'not_finalized': return 'Аудит результатов человеком не завершён.';
+    case 'unreviewed_failures': return `${note.count} провалившихся диалог(ов) без вердикта человека.`;
     case 'approve_and_run': return 'Утвердите карточки и запустите диалоги.';
     case 'add_real_data': return 'Добавьте golden set или реальные диалоги, чтобы результат не держался только на синтетике.';
-    case 'record_verdicts': return `Откройте ${note.count} провалившихся диалог(ов) и поставьте свои вердикты.`;
+    case 'record_verdicts': return `Откройте ${note.count} провалившихся диалог(ов) без вердикта и поставьте свои.`;
     case 'connect_agent': return 'Подключите своего агента (http или module), чтобы проверять то, что реально работает.';
     case 'fix_weakest': return `Начните с самого слабого места: ${note.detail} (${note.count} провал(ов)).`;
     case 'run_more': return `Прогоните больше карточек или повторов: ${note.count} диалог(ов) это маленькая выборка.`;
@@ -137,7 +140,8 @@ function verdictLines(record: Experiment): Line[] {
   const p = v.provenance;
   return [
     line('ИТОГ', 'accent', true),
-    line(v.graded ? `Пройдено ${v.passed} из ${v.graded} диалогов (${Math.round((v.passRate ?? 0) * 100)}%).` : 'Диалогов с оценкой ещё нет.', 'text', true),
+    line(v.graded ? `Пройдено ${v.passed} из ${v.graded} диалогов (${Math.round((v.passRate ?? 0) * 100)}%).` : v.rubric.assessed ? 'Объективных проверок нет.' : 'Диалогов с оценкой ещё нет.', 'text', true),
+    ...(v.rubric.assessed ? [line(`${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} по рубрикам (не проверена): ${v.rubric.passed} из ${v.rubric.assessed} диалогов без замечаний.`, 'muted')] : []),
     line(`Карточки: синтетических ${p.synthetic.cards}, golden ${p.curated.cards}, из продакшна ${p.production.cards}.`, 'muted'),
     line(v.weakSpots.length ? `Слабые места: ${v.weakSpots.map(w => `${w.description} (${w.failures} провал(ов))`).join('; ')}.` : 'Слабые места: не выявлены.'),
     line(`Доверие к результату: ${confidenceLabels[v.confidence] ?? v.confidence}. ${v.confidenceReasons.map(noteText).join(' ')}`, v.confidence === 'high' ? 'success' : 'warning'),

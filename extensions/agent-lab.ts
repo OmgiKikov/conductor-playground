@@ -45,6 +45,7 @@ function evidenceSection(record: Experiment): string[] {
     '## Verdict', '',
     safeText(v.headline), '',
     `Cards: ${v.provenance.synthetic.cards} synthetic, ${v.provenance.curated.cards} curated, ${v.provenance.production.cards} production.`,
+    ...(v.rubric.assessed ? [`${record.mode === 'demo' ? 'Scripted demo rubric estimates' : 'Model rubric estimates'} (unverified): ${v.rubric.passed} of ${v.rubric.assessed} dialogues passed all agent rubrics; ${v.rubric.failed} failed, ${v.rubric.unknown} unknown.`] : []),
     `Weak spots: ${v.weakSpots.length ? v.weakSpots.map(w => `${safeText(w.description)} (${w.failures})`).join('; ') : 'none found'}.`,
     `Confidence: ${v.confidence}. ${v.confidenceReasons.map(r => safeText(r.text)).join(' ')}`, '',
     'Next steps:', ...v.nextSteps.map(step => `- ${safeText(step.text)}`), '',

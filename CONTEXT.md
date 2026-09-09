@@ -28,7 +28,7 @@ A native Pi package that turns a task, materials and real data into simulated di
 
 **Owner notes**: The owner's own hints about users, goals and situations, in their words. First-class input for synthetic cards, recorded as owner-supplied assumptions, never promoted to business rules.
 
-**Verdict**: The plain-language layer over the evidence: how many graded dialogues passed, the weak spots, a confidence level (low, medium, high) with stated reasons, and next steps. It leads every surface; the research statistics sit beneath it.
+**Verdict**: The plain-language layer over the evidence: how many graded dialogues passed, model rubric estimates shown separately as unverified, the weak spots (objective checks and agent rubrics, including dialogues without objective checks), a confidence level with stated reasons, and next steps. High confidence needs a finalized human review with a verdict on every failed dialogue, at least one non-synthetic card, ten or more objectively graded dialogues and no invalid ones. It leads every surface; the research statistics sit beneath it.
 
 **User mode**: How the user side of a dialogue is produced. Reactive: a model plays the card and answers the target's actual replies. Scripted: the card's script lines are sent in order. Static: only the opening message. Running the same cards in several modes shows what the reactive simulator adds.
 

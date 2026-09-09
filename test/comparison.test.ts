@@ -170,7 +170,7 @@ test('the verdict says how many dialogues passed, where the agent is weak, how m
   const mixed = record({
     scenarios: [{ ...scenario('s1'), provenance: 'curated' as const }, { ...scenario('s2'), provenance: 'production' as const }],
     trials: Array.from({ length: 10 }, (_, i) => failing(`t${i}`, i % 2 ? 's1' : 's2', i < 2 ? ['time'] : [], i < 2 ? 'fail' : 'pass')),
-    humanReviews: [review('h1', 't0', 'fail', { metricId: 'goal' })], resultsReviewedAt: '2026-09-09T00:00:00Z', target: { kind: 'module', path: '/agent.mjs', exportName: 'createSession' },
+    humanReviews: [review('h1', 't0', 'fail', { metricId: 'goal' }), review('h2', 't1', 'fail')], resultsReviewedAt: '2026-09-09T00:00:00Z', target: { kind: 'module', path: '/agent.mjs', exportName: 'createSession' },
   });
   const trusted = verdictSummary(mixed);
   assert.equal(trusted.confidence, 'high');
@@ -183,4 +183,45 @@ test('the verdict says how many dialogues passed, where the agent is weak, how m
   assert.equal(empty.passRate, null);
   assert.match(empty.headline, /No graded dialogues/);
   assert.equal(evidenceSummary(synthetic).verdict.confidence, 'low');
+});
+
+test('rubric failures in dialogues without objective checks still count as weak spots and never earn high confidence', () => {
+  const rubricOnly = (id: string, goal: 'pass' | 'fail', fidelity: 'pass' | 'fail' = 'pass'): Trial => ({
+    ...trial(id, 's1', 'reactive', 'ungraded', { assessments: [{ metricId: 'goal', result: goal, rationale: 'r', evidence: [1] }, { metricId: 'fidelity', result: fidelity, rationale: 'r', evidence: [1] }] }), checks: [],
+  });
+  const r = record({
+    scenarios: [{ ...scenario('s1'), checks: [], provenance: 'curated' }],
+    trials: [rubricOnly('a', 'fail'), rubricOnly('b', 'fail', 'fail'), rubricOnly('c', 'pass')],
+    humanReviews: [review('h', 'a', 'fail', { metricId: 'goal' })], resultsReviewedAt: '2026-09-09T00:00:00Z',
+  });
+  const v = verdictSummary(r);
+  assert.deepEqual([v.passed, v.graded], [0, 0]);
+  assert.deepEqual(v.rubric, { assessed: 3, passed: 1, failed: 2, unknown: 0 });
+  assert.deepEqual(v.weakSpots, [{ kind: 'metric', description: 'Goal', failures: 2 }]);
+  assert.match(v.headline, /No objective checks/);
+  assert.match(v.headline, /1 of 3/);
+  assert.match(v.headline, /unverified/);
+  assert.notEqual(v.confidence, 'high');
+  assert.ok(v.confidenceReasons.some(n => n.code === 'rubric_only'));
+  assert.ok(v.confidenceReasons.some(n => n.code === 'simulator_flagged' && n.count === 1));
+  assert.equal(v.simulatorFlagged, 1);
+  assert.ok(v.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1));
+});
+
+test('high confidence requires human verdicts on every failed dialogue, not just a finalized review', () => {
+  const r = record({
+    scenarios: [{ ...scenario('s1'), provenance: 'curated' }, { ...scenario('s2'), provenance: 'production' }],
+    trials: Array.from({ length: 10 }, (_, i) => trial(`t${i}`, i % 2 ? 's1' : 's2', 'reactive', i < 2 ? 'fail' : 'pass', { failed: i < 2 ? ['time'] : [] })),
+    resultsReviewedAt: '2026-09-09T00:00:00Z', humanReviews: [],
+  });
+  const finalizedOnly = verdictSummary(r);
+  assert.equal(finalizedOnly.confidence, 'medium');
+  assert.ok(finalizedOnly.confidenceReasons.some(n => n.code === 'no_human'));
+  const partial = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail')] });
+  assert.equal(partial.confidence, 'medium');
+  assert.ok(partial.confidenceReasons.some(n => n.code === 'unreviewed_failures' && n.count === 1));
+  assert.ok(partial.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1));
+  const complete = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'fail')] });
+  assert.equal(complete.confidence, 'high');
+  assert.equal(complete.nextSteps.some(n => n.code === 'record_verdicts'), false);
 });
