@@ -123,11 +123,13 @@ function noteText(note: VerdictNote): string {
     case 'all_synthetic': return 'Все карточки синтетические: нет ни golden set, ни реальных диалогов.';
     case 'simulator_flagged': return `Модель отметила ${note.count} диалог(ов), где симулированный пользователь мог выйти из роли.`;
     case 'no_human': return 'Ни одного человеческого вердикта: оценки модели не проверены.';
+    case 'no_decisive_verdicts': return 'Все вердикты человека пока «неясно» или «невалидно»: ничего не подтверждено и не опровергнуто.';
     case 'not_finalized': return 'Аудит результатов человеком не завершён.';
     case 'unreviewed_failures': return `${note.count} провалившихся диалог(ов) без вердикта человека.`;
+    case 'undecided_failures': return `${note.count} провалившихся диалог(ов) только с вердиктами «неясно» или «невалидно».`;
     case 'approve_and_run': return 'Утвердите карточки и запустите диалоги.';
     case 'add_real_data': return 'Добавьте golden set или реальные диалоги, чтобы результат не держался только на синтетике.';
-    case 'record_verdicts': return `Откройте ${note.count} провалившихся диалог(ов) без вердикта и поставьте свои.`;
+    case 'record_verdicts': return `Откройте ${note.count} провалившихся диалог(ов) без решающего вердикта (пройдено или не пройдено) и поставьте свои.`;
     case 'connect_agent': return 'Подключите своего агента (http или module), чтобы проверять то, что реально работает.';
     case 'fix_weakest': return `Начните с самого слабого места: ${note.detail} (${note.count} провал(ов)).`;
     case 'run_more': return `Прогоните больше карточек или повторов: ${note.count} диалог(ов) это маленькая выборка.`;

@@ -225,3 +225,22 @@ test('high confidence requires human verdicts on every failed dialogue, not just
   assert.equal(complete.confidence, 'high');
   assert.equal(complete.nextSteps.some(n => n.code === 'record_verdicts'), false);
 });
+
+test('unknown and invalid human verdicts are not decisions: they keep confidence medium and stay listed as undecided', () => {
+  const r = record({
+    scenarios: [{ ...scenario('s1'), provenance: 'curated' }, { ...scenario('s2'), provenance: 'production' }],
+    trials: Array.from({ length: 10 }, (_, i) => trial(`t${i}`, i % 2 ? 's1' : 's2', 'reactive', i < 2 ? 'fail' : 'pass', { failed: i < 2 ? ['time'] : [] })),
+    resultsReviewedAt: '2026-09-09T00:00:00Z', humanReviews: [review('h0', 't0', 'unknown'), review('h1', 't1', 'invalid', { checkId: 'time' })],
+  });
+  const undecided = verdictSummary(r);
+  assert.equal(undecided.confidence, 'medium');
+  assert.ok(undecided.confidenceReasons.some(n => n.code === 'no_decisive_verdicts'));
+  assert.ok(undecided.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 2));
+  const half = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'unknown')] });
+  assert.equal(half.confidence, 'medium');
+  assert.ok(half.confidenceReasons.some(n => n.code === 'undecided_failures' && n.count === 1));
+  assert.ok(half.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1));
+  const decided = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'unknown'), review('h2', 't1', 'pass', { metricId: 'goal' })] });
+  assert.equal(decided.confidence, 'high');
+  assert.equal(decided.nextSteps.some(n => n.code === 'record_verdicts'), false);
+});

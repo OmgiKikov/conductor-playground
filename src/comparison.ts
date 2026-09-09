@@ -248,8 +248,9 @@ export interface VerdictSummary {
  * The plain-language layer: "is my agent good, and how much should I trust that?"
  * Confidence rules are deliberately simple and stated in the reasons:
  *   low     – fewer than 5 objectively graded dialogues (rubric-only runs included), or every card is synthetic, or more than a quarter of dialogues were invalid
- *   medium  – real or golden cards exist but human review is missing, not finalized, or skipped some failed dialogues
- *   high    – review finalized, every failed dialogue carries a human verdict, at least one non-synthetic card, 10+ graded dialogues, no invalid ones
+ *   medium  – real or golden cards exist but human review is missing, not finalized, or some failed dialogues lack a decisive (pass/fail) verdict
+ *   high    – review finalized, every failed dialogue carries a decisive human verdict, at least one non-synthetic card, 10+ graded dialogues, no invalid ones
+ *   unknown/invalid human verdicts never decide anything; they stay listed as undecided
  */
 export function verdictSummary(record: Experiment): VerdictSummary {
   const gradedTrials = record.trials.filter(graded);
@@ -294,10 +295,15 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   ].sort((a, b) => b.failures - a.failures).slice(0, 3);
   const allSynthetic = provenance.curated.cards + provenance.production.cards === 0;
   const humanVerdicts = record.humanReviews.length > 0;
+  // Only pass/fail decides anything; unknown and invalid record that a person looked and could not confirm the result.
+  const decisive = (r: HumanReview) => r.verdict === 'pass' || r.verdict === 'fail';
+  const decisiveVerdicts = record.humanReviews.some(decisive);
   const finalized = !!record.resultsReviewedAt;
-  // A failed dialogue is one that failed objectively or by the agent rubrics; every one of them needs a human look before the result is trusted.
+  // A failed dialogue is one that failed objectively or by the agent rubrics; every one of them needs a decisive human verdict before the result is trusted.
   const failedTrials = completed.filter(t => t.outcome === 'fail' || rubricFailed.has(t.id));
-  const unreviewed = failedTrials.filter(t => !record.humanReviews.some(r => r.trialId === t.id)).length;
+  const reviewsFor = (trialId: string) => record.humanReviews.filter(r => r.trialId === trialId);
+  const unreviewed = failedTrials.filter(t => reviewsFor(t.id).length === 0).length;
+  const undecided = failedTrials.filter(t => { const reviews = reviewsFor(t.id); return reviews.length > 0 && !reviews.some(decisive); }).length;
   const reasons: VerdictNote[] = [];
   if (gradedCount === 0 && rubric.assessed === 0) reasons.push({ code: 'none_graded', text: 'No graded dialogues yet.' });
   else if (gradedCount === 0) reasons.push({ code: 'rubric_only', text: 'Only model rubric estimates, no objective checks; nothing here is verified by code.' });
@@ -306,15 +312,20 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   if (allSynthetic) reasons.push({ code: 'all_synthetic', text: 'All cards are synthetic; nothing here comes from real users or a reviewed golden set.' });
   if (simulatorFlagged) reasons.push({ code: 'simulator_flagged', text: `The model flagged ${simulatorFlagged} dialogue(s) where the simulated user may have broken role.`, count: simulatorFlagged });
   if (!humanVerdicts) reasons.push({ code: 'no_human', text: 'No human verdicts yet; model estimates are unchecked.' });
+  else if (!decisiveVerdicts) reasons.push({ code: 'no_decisive_verdicts', text: 'Human verdicts so far are all unknown or invalid; nothing has been confirmed or refuted.' });
   else if (!finalized) reasons.push({ code: 'not_finalized', text: 'Human review of the results is not finalized.' });
-  else if (unreviewed) reasons.push({ code: 'unreviewed_failures', text: `${unreviewed} failed dialogue(s) have no human verdict.`, count: unreviewed });
+  else {
+    if (unreviewed) reasons.push({ code: 'unreviewed_failures', text: `${unreviewed} failed dialogue(s) have no human verdict.`, count: unreviewed });
+    if (undecided) reasons.push({ code: 'undecided_failures', text: `${undecided} failed dialogue(s) carry only unknown or invalid human verdicts.`, count: undecided });
+  }
   const invalidShare = record.trials.length ? invalid / record.trials.length : 0;
   const confidence: VerdictSummary['confidence'] = gradedCount < 5 || allSynthetic || invalidShare > 0.25 ? 'low'
-    : finalized && humanVerdicts && unreviewed === 0 && gradedCount >= 10 && invalid === 0 ? 'high' : 'medium';
+    : finalized && decisiveVerdicts && unreviewed === 0 && undecided === 0 && gradedCount >= 10 && invalid === 0 ? 'high' : 'medium';
   const nextSteps: VerdictNote[] = [];
   if (gradedCount === 0 && rubric.assessed === 0) nextSteps.push({ code: 'approve_and_run', text: 'Approve the cards in /agent-lab and run the dialogues.' });
   if (allSynthetic) nextSteps.push({ code: 'add_real_data', text: 'Add golden cases or real dialogues so the result does not rest on synthetic cards alone.' });
-  if (unreviewed) nextSteps.push({ code: 'record_verdicts', text: `Open the ${unreviewed} failed dialogue(s) without a human verdict in /agent-lab and record your verdicts.`, count: unreviewed });
+  const awaiting = unreviewed + undecided;
+  if (awaiting) nextSteps.push({ code: 'record_verdicts', text: `Open the ${awaiting} failed dialogue(s) without a decisive human verdict (pass or fail) in /agent-lab and record your verdicts.`, count: awaiting });
   if (record.target.kind === 'sandbox') nextSteps.push({ code: 'connect_agent', text: 'Point target at your own agent (http or module) to test the agent you ship.' });
   if (weakSpots[0]) nextSteps.push({ code: 'fix_weakest', text: `Start with the weakest spot: ${weakSpots[0].description} (${weakSpots[0].failures} failures).`, detail: weakSpots[0].description, count: weakSpots[0].failures });
   if (gradedCount > 0 && gradedCount < 10) nextSteps.push({ code: 'run_more', text: `Run more cards or repeats; ${gradedCount} graded dialogue(s) is a small sample.`, count: gradedCount });
