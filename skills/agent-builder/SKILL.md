@@ -1,11 +1,19 @@
 ---
 name: agent-builder
-description: Derive user goals, prepare simple simulated users, run human-reviewed dialogues with an agent, and inspect objective checks plus provisional rubric assessments in Pi.
+description: Inspect a local agent project, prepare its connection and user simulation cards, and evaluate human-reviewed dialogues in Pi.
 ---
 
 # Agent builder
 
-Work directly in this Pi conversation. `agent_lab_build` prepares a draft from the task, material names/full contents, optional existing AgentSpec, an optional target (the trusted sandbox, an http endpoint or a local module adapter), optional golden cases and optional de-identified real dialogues, using the current Pi model unless settings override it. settings.userModes may list static, scripted and reactive so the same cards run under each user side; preset=thorough sets all three with two repeats. notes and profiles carry the owner's own hints and user types. The default workflow evaluates one agent; it does not run dialogues, approve its own draft or optimize the agent automatically. The human opens `/agent-lab` to review and approve cards, run the evaluation, inspect results and record their review. No web interface or article retrieval is involved.
+Work directly in this Pi conversation. For the current PoC, start from the owner's local agent repository: read its code and prepare a local connection with the outer Pi tools. HTTP integration is an optional later path, not a prerequisite. `agent_lab_build` prepares a draft from the task, material names/full contents, optional existing AgentSpec, a target (local command/module, sandbox or HTTP), optional golden cases and optional de-identified real dialogues, using the current Pi model unless settings override it. settings.userModes may list static, scripted and reactive so the same cards run under each user side; preset=thorough sets all three with two repeats. notes and profiles carry the owner's own hints and user types. The default workflow evaluates one agent; it does not run dialogues, approve its own draft or optimize the agent automatically. The human opens `/agent-lab` to review and approve cards, run the evaluation, inspect results and record their review.
+
+## Start from the local project
+
+- Use the repository the owner named, or the current workspace when it contains the intended agent. Read its README, dependency/run configuration, entry point, prompts, tools and relevant tests to understand the actual call flow and session state. Find these details yourself before asking the owner; ask for a path only when the intended project is unavailable or ambiguous.
+- Reuse an existing callable entry point. Choose `command` for a local process such as Python, or `module` for a compatible JavaScript session factory. If the contract needs a wrapper, write the smallest adapter that calls the real agent; use the project's interpreter/environment and absolute paths, setting `cwd` when its imports or data depend on it. Preserve state between turns and reset it between dialogues. Keep JSON replies on stdout and diagnostic logs on stderr. Show the chosen entry point and command with the draft. Do not substitute a scripted echo or rebuild the agent as an AgentSpec. The existing command/module contracts are documented in the package README.
+- Collect relevant documented requirements, declared prompt behavior and user-facing knowledge into `materials` with original file names and exact excerpts; the owner need not paste files or hand-write target JSON. Read implementation code to understand capabilities and likely failure cases, but do not promote its current behavior or test expectations into unquestionable business rules. Mark inferred expectations as provisional for draft review and surface contradictions. Keep credentials out of materials. Pass the owner's hints as `notes`; golden data and production logs are optional for this PoC.
+
+Code inspection prepares the connection and scenarios; evidence about the agent still comes from running it. Nested card generation works from the extracted requirements, and the simulator receives only the approved user's knowledge. The outer Pi session may return to the code to explain a failure after inspecting its trace.
 
 ## Working protocol
 
@@ -52,7 +60,7 @@ Version comparison is a separate, explicitly selected workflow. It can propose d
 
 ## Pilot evidence and scope
 
-For a real pilot, obtain one existing agent and its callable local entry point or API, a human-reviewed golden set, the decision-driving metrics, and authorized de-identified production dialogues/traces with known failures. Start by understanding five real scenarios: user goal, initial known facts, private external state, possible clarifications, state transitions and completion criteria. Ask for concrete missing files, API/session/reset details or metric definitions; do not invent pilot data or assume an external adapter exists.
+For the current PoC, inspect one existing local agent, prepare its callable entry point and start with five reviewed scenarios. Understand the user goal, known facts, private external state, possible clarifications, state transitions and completion criteria. Read available files before asking for missing details. A golden set and de-identified production dialogues can strengthen a later pilot; their absence does not block the local PoC. Do not invent pilot data or assume an adapter exists before inspecting it.
 
 Build a mixed evidence set: preserve reviewed golden and production-derived cases with their provenance, then add synthetic cases to address specific gaps. A fully synthetic run remains a synthetic run. Define capability cases for current failures and regression cases for behavior that must not worsen; both inform candidate selection. Keep held-out evaluation separate from the material used to make changes.
 
@@ -60,4 +68,4 @@ Before claiming the reactive simulator adds value, compare it with a static expa
 
 Prompt-only improvement is a proposed first pilot scope, to isolate cause and effect. Agree the editable components before applying changes; AgentSpec supports instructions and the registered-tool allowlist and does not enforce prompt-only changes. Do not promise such enforcement without adding it. The default native workflow requires human draft and result review; approval to evaluate is not approval to change or deploy the agent. Running the built-in example supplies no real pilot data; the module target example is a reference adapter, not the owner's agent.
 
-This protocol is self-contained. The runtime has no browser, fetch, search-engine or filesystem tools and does not retrieve methodology from external articles. Human provenance references belong in the package documentation, not the agent's execution steps.
+This protocol is self-contained. Nested model sessions have no browser, search-engine or filesystem tools; repository inspection uses the outer Pi session's file and shell tools. No external article retrieval is needed.
