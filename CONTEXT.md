@@ -12,7 +12,9 @@ A native Pi package that turns a task, materials and real data into simulated di
 
 **Agent revision**: An immutable definition of an agent's instructions and permitted tools. A candidate is a proposed revision; the baseline is the original revision.
 
-**Target**: Who answers the simulated user. The sandbox target is a nested Pi session with trusted record tools. An http or module target is the owner's own agent behind a documented JSON contract.
+**Target**: Who answers the simulated user. The sandbox target is a nested Pi session with trusted record tools. An http, module or command target is the owner's own agent behind a documented JSON contract; a command target is a local process, typically a Python agent, speaking one JSON request and reply per line.
+
+**Observed goal**: What a real user tried to do, extracted from production dialogues. Its opening is the user's own message, verbatim; it becomes a production card with the observed profile and goal, perimeter and fidelity rubrics.
 
 **Reported state**: Records an external target's harness returns after a reply. The runner grades them like sandbox state but labels them as reported, not observed by trusted code.
 

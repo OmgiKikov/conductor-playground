@@ -480,3 +480,13 @@ test('card generation receives observed goals so synthetic cards add new situati
     assert.match(f.requests[1]?.systemPrompt ?? '', /observedGoals/);
   } finally { await f.close(); }
 });
+
+test('the card generator is told to probe the agent perimeter with an out-of-scope request graded by a rubric', async () => {
+  const quote = 'The assistant answers only questions about appointments and must decline legal advice.';
+  const outputs = [{ requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] }, { scenarios: [plainCard(0)] }];
+  const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+  try {
+    await f.adapter.prepare({ task: 'Evaluate the appointment assistant', sources: [{ id: 'source_1', name: 'Agent card', content: quote, hash: 'hash' }], existingAgent: { name: 'A', instructions: 'Help.', tools: [] }, scenarioCount: 1 }, callContext().ctx);
+    assert.match(f.requests[1]?.systemPrompt ?? '', /out-of-scope question whose success is a correct refusal or redirect/);
+  } finally { await f.close(); }
+});
