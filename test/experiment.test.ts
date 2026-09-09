@@ -376,3 +376,25 @@ test('profiles with evidence outside the supplied dialogues fail preparation ins
   assert.equal(failed.phase, 'error');
   assert.match(failed.error ?? '', /evidence/i);
 });
+
+test('owner notes and owner profiles are first-class inputs: cards may cite an owner profile and the runtime sees the notes', async t => {
+  const runtime = createDemoRuntime();
+  const prepare = runtime.prepare;
+  let seen: { notes?: string; profiles?: { id: string; source: string }[] } = {};
+  runtime.prepare = async (input, ctx) => { seen = { notes: input.notes, profiles: input.profiles?.map(p => ({ id: p.id, source: p.source })) }; return prepare(input, ctx); };
+  const { lab } = await setup(t, runtime);
+  const input = createInputSchema.parse({
+    ...demoInput(), workflow: 'evaluate', scenarioCount: 1, notes: 'Most users are in a hurry and do not know their appointment ID.',
+    profiles: [{ id: 'hurried_owner', persona: 'A customer in a hurry', characteristics: ['Terse', 'Impatient'] }],
+    dialogues: [{ id: 'd1', messages: [{ role: 'user', content: 'move A101 to 14:00' }], outcome: 'success' }],
+  });
+  const created = await lab.create(input); await lab.waitForIdle();
+  const draft = await lab.get(created.id);
+  assert.equal(draft.phase, 'review', draft.error ?? '');
+  assert.equal(seen.notes, input.notes);
+  assert.deepEqual(seen.profiles, [{ id: 'hurried_owner', source: 'owner' }, { id: 'observed_1', source: 'observed' }]);
+  assert.equal(draft.notes, input.notes);
+  assert.deepEqual(draft.profiles.map(p => p.source), ['owner', 'observed']);
+  assert.equal(draft.scenarios[0]!.profileId, 'hurried_owner');
+  assert.equal(draft.scenarios[0]!.user.persona, 'A customer in a hurry');
+});

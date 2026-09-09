@@ -404,7 +404,7 @@ test('profile extraction cites only supplied dialogues, sees user turns only, an
   try {
     const dialogues = [{ id: 'd1', messages: [{ role: 'user' as const, content: 'hello from user' }, { role: 'assistant' as const, content: 'ASSISTANT_PRIVATE reply' }], outcome: 'success' as const }];
     const profiles = await f.adapter.profiles!({ task: 'Manage appointments', sources: [], dialogues }, callContext().ctx);
-    assert.deepEqual(profiles, [profile]);
+    assert.deepEqual(profiles, [{ ...profile, source: 'observed' }]);
     assert.match(f.requests[0]?.systemPrompt ?? '', /Do not infer demographic traits/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /evidenceDialogueIds only from the supplied dialogues/);
     const payload = JSON.stringify(f.requests[0]?.messages);
@@ -432,5 +432,21 @@ test('card generation with observed profiles requires a profileId and passes the
     assert.match(f.requests[3]?.systemPrompt ?? '', /profileId to one of them/);
     assert.match(JSON.stringify(f.requests[3]?.messages), /observedProfiles/);
     assert.match(JSON.stringify(f.requests[3]?.messages), /Observed customer/);
+  } finally { await f.close(); }
+});
+
+test('owner notes reach the card generator as owner-supplied hints, not as business rules', async () => {
+  const quote = 'Support is available by email.';
+  const outputs = [{ requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] }, { scenarios: [plainCard(0)] }];
+  const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+  try {
+    await f.adapter.prepare({
+      task: 'Evaluate support answers', sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }],
+      existingAgent: { name: 'A', instructions: 'Help.', tools: [] }, scenarioCount: 1, notes: 'OWNER_HINT: users often write in a hurry and skip details.',
+    }, callContext().ctx);
+    assert.match(JSON.stringify(f.requests[1]?.messages), /OWNER_HINT/);
+    assert.doesNotMatch(JSON.stringify(f.requests[0]?.messages), /OWNER_HINT/);
+    assert.match(f.requests[1]?.systemPrompt ?? '', /ownerNotes/);
+    assert.match(f.requests[1]?.systemPrompt ?? '', /not business rules/);
   } finally { await f.close(); }
 });

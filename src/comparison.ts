@@ -233,11 +233,78 @@ export function simulatorFidelity(record: Experiment): FidelityReport | null {
   return { metrics, realDialogues: record.dialogues.length, simulatedDialogues: simulated.length, humanFidelity: { reviewed: verdicts.length, passed: verdicts.filter(r => r.verdict === 'pass').length } };
 }
 
+export interface VerdictNote { code: string; text: string; count?: number; detail?: string }
+export interface VerdictSummary {
+  headline: string; passed: number; graded: number; invalid: number; passRate: number | null;
+  provenance: Record<Scenario['provenance'], { cards: number; passed: number; graded: number }>;
+  weakSpots: { kind: 'check' | 'metric'; description: string; failures: number }[];
+  confidence: 'low' | 'medium' | 'high'; confidenceReasons: VerdictNote[]; nextSteps: VerdictNote[];
+}
+/**
+ * The plain-language layer: "is my agent good, and how much should I trust that?"
+ * Confidence rules are deliberately simple and stated in the reasons:
+ *   low     – fewer than 5 graded dialogues, or every card is synthetic, or more than a quarter of dialogues were invalid
+ *   medium  – real or golden cards exist but no human has finalized a review
+ *   high    – human review finalized, at least one non-synthetic card, 10+ graded dialogues, no invalid ones
+ */
+export function verdictSummary(record: Experiment): VerdictSummary {
+  const gradedTrials = record.trials.filter(graded);
+  const passed = gradedTrials.filter(t => t.outcome === 'pass').length;
+  const invalid = record.trials.filter(t => t.outcome === 'invalid').length;
+  const gradedCount = gradedTrials.length;
+  const provenance: VerdictSummary['provenance'] = { synthetic: { cards: 0, passed: 0, graded: 0 }, curated: { cards: 0, passed: 0, graded: 0 }, production: { cards: 0, passed: 0, graded: 0 } };
+  for (const scenario of record.scenarios) provenance[scenario.provenance].cards += 1;
+  for (const trial of gradedTrials) {
+    const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
+    if (!scenario) continue;
+    provenance[scenario.provenance].graded += 1;
+    if (trial.outcome === 'pass') provenance[scenario.provenance].passed += 1;
+  }
+  const checkFailures = new Map<string, number>();
+  const metricFailures = new Map<string, number>();
+  for (const trial of gradedTrials) {
+    for (const check of trial.checks) if (!check.passed) checkFailures.set(check.description, (checkFailures.get(check.description) ?? 0) + 1);
+    const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
+    for (const assessment of trial.assessments ?? []) if (assessment.result === 'fail') {
+      const name = scenario?.metrics?.find(m => m.id === assessment.metricId)?.name ?? assessment.metricId;
+      metricFailures.set(name, (metricFailures.get(name) ?? 0) + 1);
+    }
+  }
+  const weakSpots = [
+    ...[...checkFailures].map(([description, failures]) => ({ kind: 'check' as const, description, failures })),
+    ...[...metricFailures].map(([description, failures]) => ({ kind: 'metric' as const, description, failures })),
+  ].sort((a, b) => b.failures - a.failures).slice(0, 3);
+  const allSynthetic = provenance.curated.cards + provenance.production.cards === 0;
+  const humanVerdicts = record.humanReviews.length > 0;
+  const reasons: VerdictNote[] = [];
+  if (gradedCount === 0) reasons.push({ code: 'none_graded', text: 'No graded dialogues yet.' });
+  else if (gradedCount < 5) reasons.push({ code: 'few_graded', text: `Only ${gradedCount} graded dialogue(s); too few to judge the agent.`, count: gradedCount });
+  if (invalid) reasons.push({ code: 'invalid', text: `${invalid} dialogue(s) were invalid and could not measure the agent.`, count: invalid });
+  if (allSynthetic) reasons.push({ code: 'all_synthetic', text: 'All cards are synthetic; nothing here comes from real users or a reviewed golden set.' });
+  if (!humanVerdicts) reasons.push({ code: 'no_human', text: 'No human verdicts yet; model estimates are unchecked.' });
+  else if (!record.resultsReviewedAt) reasons.push({ code: 'not_finalized', text: 'Human review of the results is not finalized.' });
+  const invalidShare = record.trials.length ? invalid / record.trials.length : 0;
+  const confidence: VerdictSummary['confidence'] = gradedCount < 5 || allSynthetic || invalidShare > 0.25 ? 'low'
+    : record.resultsReviewedAt && gradedCount >= 10 && invalid === 0 ? 'high' : 'medium';
+  const failed = gradedTrials.filter(t => t.outcome === 'fail').length;
+  const nextSteps: VerdictNote[] = [];
+  if (gradedCount === 0) nextSteps.push({ code: 'approve_and_run', text: 'Approve the cards in /agent-lab and run the dialogues.' });
+  if (allSynthetic) nextSteps.push({ code: 'add_real_data', text: 'Add golden cases or real dialogues so the result does not rest on synthetic cards alone.' });
+  if (!humanVerdicts && failed) nextSteps.push({ code: 'record_verdicts', text: `Open the ${failed} failed dialogue(s) in /agent-lab and record your verdicts.`, count: failed });
+  if (record.target.kind === 'sandbox') nextSteps.push({ code: 'connect_agent', text: 'Point target at your own agent (http or module) to test the agent you ship.' });
+  if (weakSpots[0]) nextSteps.push({ code: 'fix_weakest', text: `Start with the weakest spot: ${weakSpots[0].description} (${weakSpots[0].failures} failures).`, detail: weakSpots[0].description, count: weakSpots[0].failures });
+  if (gradedCount > 0 && gradedCount < 10) nextSteps.push({ code: 'run_more', text: `Run more cards or repeats; ${gradedCount} graded dialogue(s) is a small sample.`, count: gradedCount });
+  const passRate = gradedCount ? passed / gradedCount : null;
+  const headline = gradedCount ? `${passed} of ${gradedCount} graded dialogues passed (${Math.round((passRate ?? 0) * 100)}%). Confidence ${confidence}.` : 'No graded dialogues yet.';
+  return { headline, passed, graded: gradedCount, invalid, passRate, provenance, weakSpots, confidence, confidenceReasons: reasons, nextSteps };
+}
+
 export interface EvidenceSummary {
+  verdict: VerdictSummary;
   comparison: { observed: string; status: string } | null;
   modes: ModeComparison[]; calibration: CalibrationRow[]; fidelity: FidelityReport | null; notes: string[];
 }
-/** The one object every surface renders: observed numbers first, then what they cannot yet support. */
+/** The one object every surface renders: the plain verdict first, observed numbers next, then what they cannot yet support. */
 export function evidenceSummary(record: Experiment): EvidenceSummary {
   const final = record.comparisons.findLast(c => c.split === 'control');
   const fmt = (n: number | null) => n === null ? 'unknown' : n.toFixed(2);
@@ -257,5 +324,5 @@ export function evidenceSummary(record: Experiment): EvidenceSummary {
   notes.push(...record.limitations.filter(l => l.startsWith('Scripted mode skipped')));
   const reactive = modes.find(m => m.userMode === 'reactive');
   if (record.settings.userModes.length > 1 && reactive?.uniqueFailedChecks.length) notes.push(`Only the reactive simulator exposed failing checks: ${reactive.uniqueFailedChecks.join(', ')}.`);
-  return { comparison, modes, calibration, fidelity, notes };
+  return { verdict: verdictSummary(record), comparison, modes, calibration, fidelity, notes };
 }

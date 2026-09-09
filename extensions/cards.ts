@@ -1,7 +1,7 @@
 import type { ExtensionContext, Theme, ThemeColor } from '@earendil-works/pi-coding-agent';
 import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from '@earendil-works/pi-tui';
 import type { Experiment, Scenario, Trial } from '../dist/contracts.js';
-import { evidenceSummary } from '../dist/comparison.js';
+import { evidenceSummary, verdictSummary, type VerdictNote } from '../dist/comparison.js';
 
 /** All material, model and persisted text crosses this boundary before terminal rendering. */
 export function safeText(value: unknown): string {
@@ -110,6 +110,43 @@ function trialLines(trial: Trial, record: Experiment, expanded: boolean): Line[]
   }
   if (expanded) rows.push(line('СОСТОЯНИЕ ДО', 'accent'), line(json(trial.initialState)), line('СОСТОЯНИЕ ПОСЛЕ', 'accent'), line(json(trial.finalState)));
   return rows;
+}
+
+const confidenceLabels: Record<string, string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
+/** Structured verdict notes rendered in the owner's language; unknown codes fall back to the core text. */
+function noteText(note: VerdictNote): string {
+  switch (note.code) {
+    case 'none_graded': return 'Диалогов с оценкой ещё нет.';
+    case 'few_graded': return `Оценено только ${note.count} диалог(ов), этого мало для вывода.`;
+    case 'invalid': return `${note.count} диалог(ов) не удалось измерить (невалидны).`;
+    case 'all_synthetic': return 'Все карточки синтетические: нет ни golden set, ни реальных диалогов.';
+    case 'no_human': return 'Ни одного человеческого вердикта: оценки модели не проверены.';
+    case 'not_finalized': return 'Аудит результатов человеком не завершён.';
+    case 'approve_and_run': return 'Утвердите карточки и запустите диалоги.';
+    case 'add_real_data': return 'Добавьте golden set или реальные диалоги, чтобы результат не держался только на синтетике.';
+    case 'record_verdicts': return `Откройте ${note.count} провалившихся диалог(ов) и поставьте свои вердикты.`;
+    case 'connect_agent': return 'Подключите своего агента (http или module), чтобы проверять то, что реально работает.';
+    case 'fix_weakest': return `Начните с самого слабого места: ${note.detail} (${note.count} провал(ов)).`;
+    case 'run_more': return `Прогоните больше карточек или повторов: ${note.count} диалог(ов) это маленькая выборка.`;
+    default: return note.text;
+  }
+}
+/** The simple layer: what passed, where it is weak, how much to trust it, what to do next. Research statistics live in section 4. */
+function verdictLines(record: Experiment): Line[] {
+  const v = verdictSummary(record);
+  const p = v.provenance;
+  return [
+    line('ИТОГ', 'accent', true),
+    line(v.graded ? `Пройдено ${v.passed} из ${v.graded} диалогов (${Math.round((v.passRate ?? 0) * 100)}%).` : 'Диалогов с оценкой ещё нет.', 'text', true),
+    line(`Карточки: синтетических ${p.synthetic.cards}, golden ${p.curated.cards}, из продакшна ${p.production.cards}.`, 'muted'),
+    line(v.weakSpots.length ? `Слабые места: ${v.weakSpots.map(w => `${w.description} (${w.failures} провал(ов))`).join('; ')}.` : 'Слабые места: не выявлены.'),
+    line(`Доверие к результату: ${confidenceLabels[v.confidence] ?? v.confidence}. ${v.confidenceReasons.map(noteText).join(' ')}`, v.confidence === 'high' ? 'success' : 'warning'),
+    line('Что дальше:', 'accent'), ...v.nextSteps.map(step => line(`• ${noteText(step)}`)),
+  ];
+}
+function verdictHeadline(record: Experiment): string {
+  const v = verdictSummary(record);
+  return `Итог: пройдено ${v.passed} из ${v.graded} (${Math.round((v.passRate ?? 0) * 100)}%) · доверие ${confidenceLabels[v.confidence] ?? v.confidence} · 1 подробнее`;
 }
 
 /** Everything here is an observation over the record; the wording says so before any number. */
@@ -235,7 +272,7 @@ export class LabBoard implements Component {
       header.push(line(`${phases[record.phase] ?? record.phase} · ${record.mode === 'demo' ? 'СЦЕНАРНЫЙ ДЕМО' : 'LIVE'} · ${record.id}`, activePhases.has(record.phase) ? 'accent' : 'warning'));
       header.push(line([['agent', '1 Агент'], ['cards', `2 Карточки (${record.scenarios.length})`], ['results', `3 Диалоги (${record.trials.length})`], ['stats', '4 Статистика']]
         .map(([id, label]) => this.section === id ? `[${label}]` : label).join('   '), 'muted'));
-      header.push(line(`${record.message}${this.loadError ? ` · ${this.loadError}` : ''}`));
+      header.push(line(`${record.trials.some(t => t.outcome === 'pass' || t.outcome === 'fail') && !activePhases.has(record.phase) ? verdictHeadline(record) : record.message}${this.loadError ? ` · ${this.loadError}` : ''}`));
     } else header.push(line('Выберите эксперимент. Новую задачу и материалы дайте Pi в разговоре.', 'muted'));
     const items = this.items();
     this.selected = Math.max(0, Math.min(this.selected, items.length - 1));
@@ -260,7 +297,7 @@ export class LabBoard implements Component {
       detail = statsLines(record);
     } else {
       const agent = record.revisions.find(r => r.id === record.selectedRevisionId)?.spec;
-      detail = [line(record.task, 'text', true),
+      detail = [...(record.trials.length ? [...verdictLines(record), line('')] : []), line(record.task, 'text', true),
         ...(record.questions.length ? [line('ТРЕБУЮТСЯ УТОЧНЕНИЯ', 'warning'), ...record.questions.map(q => line(`• ${q}`)), line('Уточните материалы и подготовьте новый эксперимент.')] : []),
         line(''), line('АГЕНТ', 'accent'), line(agent?.name ?? 'Подготавливается'), line(agent?.instructions ?? ''),
         line(`Инструменты: ${agent?.tools.join(', ') || 'нет'}`, 'muted'),

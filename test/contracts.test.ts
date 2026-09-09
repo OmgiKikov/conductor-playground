@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  createInputSchema, emptyUsage, experimentSchema, goldenCaseSchema, goldenToScenario, settingsSchema, targetSchema, validatePreparation,
+  createInputSchema, emptyUsage, experimentSchema, goldenCaseSchema, goldenToScenario, profileSchema, settingsSchema, targetSchema, validatePreparation,
   type Profile,
 } from '../src/contracts.js';
 
@@ -99,3 +99,25 @@ test('user modes default to reactive and reject duplicates; imports reject dupli
   const huge = Array.from({ length: 200 }, (_, i) => ({ id: `d${i}`, messages: Array.from({ length: 2 }, () => ({ role: 'user' as const, content: 'x'.repeat(8000) })) }));
   assert.equal(createInputSchema.safeParse({ ...base, dialogues: huge }).success, false);
 });
+
+test('owner-supplied profiles need no evidence, observed ones do, and owner notes travel with the input', () => {
+  assert.equal(profileSchema.safeParse({ id: 'p', persona: 'Busy parent', characteristics: ['Terse'] }).success, false);
+  const owner = profileSchema.parse({ id: 'p', persona: 'Busy parent', characteristics: ['Terse'], source: 'owner' });
+  assert.deepEqual([owner.source, owner.evidenceDialogueIds, owner.observedStyle], ['owner', [], undefined]);
+  const observed = profileSchema.parse({ id: 'o', persona: 'Observed', characteristics: ['Short'], evidenceDialogueIds: ['d1'] });
+  assert.equal(observed.source, 'observed');
+  const base = { task: 'task', materials: [{ name: 'm', content: 'c' }], mode: 'demo' as const };
+  const parsed = createInputSchema.parse({ ...base, notes: 'Users are often angry and rarely know their appointment ID.', profiles: [{ id: 'p', persona: 'Busy parent', characteristics: ['Terse'] }] });
+  assert.equal(parsed.notes, 'Users are often angry and rarely know their appointment ID.');
+  assert.equal(parsed.profiles[0]!.source, 'owner');
+  assert.equal(createInputSchema.safeParse({ ...base, profiles: [{ id: 'p', persona: 'A', characteristics: ['x'] }, { id: 'p', persona: 'B', characteristics: ['y'] }] }).success, false);
+  assert.equal(experimentSchema.parse({ ...legacyRecord(), profiles: [{ id: 'p', persona: 'Busy parent', characteristics: ['Terse'], source: 'owner' }] }).notes, '');
+});
+
+function legacyRecord() {
+  return {
+    schemaVersion: '1', id: 'legacy', task: 'task', mode: 'demo', createdAt: 'now', updatedAt: 'now', phase: 'complete', message: 'm',
+    sources: [], settings: settingsSchema.parse({}), requirements: [], questions: [], scenarios: [], revisions: [], selectedRevisionId: null,
+    manifestHash: null, reviewedAt: null, controlConsumedAt: null, comparisons: [], iterations: [], usage: emptyUsage(), error: null, limitations: [], trials: [],
+  };
+}

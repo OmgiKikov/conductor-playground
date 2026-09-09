@@ -274,6 +274,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
           cardsRole(compare, profiles.length > 0),
           {
             ...evidence,
+            ...(input.notes ? { ownerNotes: input.notes } : {}),
             ...(profiles.length ? { observedProfiles: profiles } : {}),
             ...(plan ? { familyPlan: plan.families, requestedFamilies } : {
               scenarioCount: total, requestedCount: batchSize,

@@ -184,3 +184,25 @@ test('build accepts an external module target, real dialogues and golden cases; 
     await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
   } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('the plain verdict leads every surface and the thorough preset widens the run without extra knobs', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-extension-verdict-'));
+  const { tools, shutdown } = registered();
+  const ctx = { cwd: directory, model: undefined, mode: 'print', hasUI: false } as ExtensionContext;
+  try {
+    const quick = output(await tools.get('agent_lab_build')!.execute('build-quick', { mode: 'demo', scenarioCount: 1, notes: 'Users rarely know their ID.' }, undefined, undefined, ctx));
+    assert.equal(quick.phase, 'review');
+    assert.deepEqual(quick.evidence.verdict.provenance.synthetic.cards, 1);
+    assert.match(quick.evidence.verdict.headline, /No graded dialogues/);
+    assert.ok(quick.evidence.verdict.nextSteps.length >= 1);
+    const thorough = output(await tools.get('agent_lab_build')!.execute('build-thorough', { mode: 'demo', scenarioCount: 1, preset: 'thorough' }, undefined, undefined, ctx));
+    const evidence = JSON.parse(await readFile(thorough.artifacts.evidence, 'utf8'));
+    assert.deepEqual(evidence.settings.userModes, ['static', 'scripted', 'reactive']);
+    assert.equal(evidence.settings.repeats, 2);
+    const markdown = await readFile(thorough.artifacts.report, 'utf8');
+    assert.ok(markdown.indexOf('## Verdict') < markdown.indexOf('## Observed result'));
+    assert.match(markdown, /Confidence: low/);
+    assert.match(markdown, /Cards: 1 synthetic, 0 curated, 0 production/);
+    await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
+  } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
+});

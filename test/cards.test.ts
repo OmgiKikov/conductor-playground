@@ -126,3 +126,26 @@ test('the statistics section renders the evidence summary in narrow and wide ter
   assert.match(stripTerminalSequences(other.render(120).join('\n')), /Верность симулятора/);
   other.dispose();
 });
+
+test('the board leads with a plain verdict once dialogues exist and keeps the research statistics one key away', async () => {
+  const record = await fixture();
+  record.phase = 'results_review';
+  const scenario = record.scenarios[0]!;
+  record.trials = [0, 1, 2].map(i => ({ id: `t${i}`, revisionId: 'revision-1', scenarioId: scenario.id, familyId: scenario.familyId, repeat: i, userMode: 'reactive' as const, split: 'dev' as const, manifestHash: 'hash',
+    outcome: i === 0 ? 'fail' as const : 'pass' as const, reason: '', checks: [{ id: 'time', description: 'Время изменено', passed: i !== 0, evidence: '' }],
+    events: [{ seq: 0, type: 'user' as const, text: 'hi' }, { seq: 1, type: 'assistant' as const, text: 'ok' }], initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 1 }));
+  const board = new LabBoard({ record, section: 'agent' }, theme, () => {}, () => {}, () => 40);
+  const text = stripTerminalSequences(board.render(120).join('\n'));
+  assert.match(text, /ИТОГ/);
+  assert.match(text, /Пройдено 2 из 3/);
+  assert.match(text, /Доверие к результату: низкое/);
+  assert.match(text, /синтетических 2/);
+  assert.match(text, /Время изменено/);
+  assert.match(text, /Что дальше/);
+  assert.doesNotMatch(text, /TPR/);
+  for (const width of [16, 40, 80]) for (const line of board.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}`);
+  board.dispose();
+  const results = new LabBoard({ record }, theme, () => {}, () => {}, () => 40);
+  assert.match(stripTerminalSequences(results.render(120).join('\n')), /Итог: пройдено 2 из 3/);
+  results.dispose();
+});

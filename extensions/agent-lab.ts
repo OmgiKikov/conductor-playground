@@ -5,7 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 import { Type } from 'typebox';
 import { z } from 'zod';
 import { ExperimentLab, draftHash, resultHash } from '../dist/experiment.js';
-import { agentSchema, createInputSchema, dialogueSchema, draftPatchSchema, goldenCaseSchema, settingsSchema, targetSchema, type DraftPatch, type Experiment, type HumanReviewInput } from '../dist/contracts.js';
+import { agentSchema, createInputSchema, dialogueSchema, draftPatchSchema, goldenCaseSchema, ownerProfileSchema, settingsSchema, targetSchema, type DraftPatch, type Experiment, type HumanReviewInput } from '../dist/contracts.js';
 import { evidenceSummary } from '../dist/comparison.js';
 import { demoInput } from '../dist/demo.js';
 import { activePhases, safeText, showBoard, verdicts, type BoardAction } from './cards.ts';
@@ -40,8 +40,15 @@ function evidenceSection(record: Experiment): string[] {
   const pct = (v: number | null) => v === null ? 'n/a' : `${Math.round(v * 100)}%`;
   const num = (v: number | null) => v === null ? 'n/a' : v.toFixed(2);
   const target = record.target.kind === 'http' ? `http ${safeText(record.target.url)}` : record.target.kind === 'module' ? `module ${safeText(record.target.path)}` : 'sandbox (trusted record tools)';
+  const v = e.verdict;
   return [
-    `Target: ${target}. Real dialogues: ${record.dialogues.length}. Golden cases: ${record.goldenCases.length}. Observed profiles: ${record.profiles.length}. User modes: ${record.settings.userModes.join(', ')}.`, '',
+    '## Verdict', '',
+    safeText(v.headline), '',
+    `Cards: ${v.provenance.synthetic.cards} synthetic, ${v.provenance.curated.cards} curated, ${v.provenance.production.cards} production.`,
+    `Weak spots: ${v.weakSpots.length ? v.weakSpots.map(w => `${safeText(w.description)} (${w.failures})`).join('; ') : 'none found'}.`,
+    `Confidence: ${v.confidence}. ${v.confidenceReasons.map(r => safeText(r.text)).join(' ')}`, '',
+    'Next steps:', ...v.nextSteps.map(step => `- ${safeText(step.text)}`), '',
+    `Target: ${target}. Real dialogues: ${record.dialogues.length}. Golden cases: ${record.goldenCases.length}. Profiles: ${record.profiles.length} (${record.profiles.filter(p => p.source === 'owner').length} owner-written). User modes: ${record.settings.userModes.join(', ')}.`, '',
     '## Observed result', '',
     ...(e.comparison ? [safeText(e.comparison.observed), safeText(e.comparison.status)] : ['No baseline/candidate comparison in this workflow. Per-mode pass rates below are observations on the approved cards, not confirmed improvements.']), '',
     '## User modes', '', '| Mode | Passed / valid | Trials | Avg user turns | Calls | Cost | Failures only this mode found |', '|---|---|---|---|---|---|---|',
@@ -186,7 +193,7 @@ export default function agentLab(pi: ExtensionAPI) {
   };
   pi.registerTool({
     name: 'agent_lab_build', label: 'Prepare agent and dialogue cards',
-    description: 'Prepare an agent and a small editable set of user simulation cards from task/material contents. Uses current Pi model unless settings override. Stops before all dialogue evaluation: only a human in /agent-lab can review and approve the exact draft. Does not run, improve or approve the agent. mode=demo prepares the built-in scripted example without model calls. Native workflow is evaluation, with 5 cards and 1 repeat by default. target selects the agent under test: the trusted sandbox (default), an http endpoint or a local module adapter. goldenCases become curated cards; dialogues (de-identified real conversations) ground observed user profiles and simulator fidelity. settings.userModes may list static, scripted and reactive to compare what each user side finds.',
+    description: 'Prepare an agent and a small editable set of user simulation cards from task/material contents. Uses current Pi model unless settings override. Stops before all dialogue evaluation: only a human in /agent-lab can review and approve the exact draft. Does not run, improve or approve the agent. mode=demo prepares the built-in scripted example without model calls. Native workflow is evaluation, with 5 cards and 1 repeat by default. target selects the agent under test: the trusted sandbox (default), an http endpoint or a local module adapter. goldenCases become curated cards; dialogues (de-identified real conversations) ground observed user profiles and simulator fidelity. settings.userModes may list static, scripted and reactive to compare what each user side finds. notes carry the owner\'s hints about users in their own words; profiles are owner-written user types. Both are legitimate inputs when no real data exists, and the verdict always states how much of the evidence is synthetic. preset=thorough widens the run without extra settings. Every result leads with a plain verdict: pass count, weak spots, confidence and next steps.',
     parameters: Type.Object({
       task: Type.Optional(Type.String({ minLength: 1, maxLength: 8000 })),
       materials: Type.Optional(Type.Array(Type.Object({ name: Type.String({ minLength: 1, maxLength: 180 }), content: Type.String({ minLength: 1, maxLength: 120000 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 12 })),
@@ -196,15 +203,20 @@ export default function agentLab(pi: ExtensionAPI) {
       target: Type.Optional(Type.Unsafe(z.toJSONSchema(targetSchema, { io: 'input' }))),
       goldenCases: Type.Optional(Type.Unsafe(z.toJSONSchema(z.array(goldenCaseSchema).max(40), { io: 'input' }))),
       dialogues: Type.Optional(Type.Unsafe(z.toJSONSchema(z.array(dialogueSchema).max(200), { io: 'input' }))),
+      notes: Type.Optional(Type.String({ maxLength: 8000, description: "The owner's own hints about users, goals and situations, in their words. First-class input for synthetic cards; never treated as a business rule." })),
+      profiles: Type.Optional(Type.Unsafe(z.toJSONSchema(z.array(ownerProfileSchema).max(6), { io: 'input' }))),
+      preset: Type.Optional(Type.Union([Type.Literal('quick'), Type.Literal('thorough')], { description: 'quick (default): reactive simulator, one repeat. thorough: static, scripted and reactive user modes with two repeats.' })),
       mode: Type.Optional(Type.Union([Type.Literal('live'), Type.Literal('demo')])),
     }, { additionalProperties: false }),
     executionMode: 'sequential',
     async execute(_callId, params, toolSignal, onUpdate, ctx) {
-      const mode = params.mode ?? 'live';
-      const supplied = (params.settings ?? {}) as Partial<z.infer<typeof settingsSchema>>;
+      const { preset, ...rest } = params;
+      const mode = rest.mode ?? 'live';
+      const supplied = (rest.settings ?? {}) as Partial<z.infer<typeof settingsSchema>>;
       const input = createInputSchema.parse({
-        ...(mode === 'demo' ? demoInput() : {}), ...params, mode, workflow: 'evaluate',
-        settings: { ...(mode === 'demo' ? demoInput().settings : {}), repeats: 1, ...supplied,
+        ...(mode === 'demo' ? demoInput() : {}), ...rest, mode, workflow: 'evaluate',
+        settings: { ...(mode === 'demo' ? demoInput().settings : {}), repeats: 1,
+          ...(preset === 'thorough' ? { userModes: ['static', 'scripted', 'reactive'], repeats: 2 } : {}), ...supplied,
           provider: supplied.provider || ctx.model?.provider || '', model: supplied.model || ctx.model?.id || '' },
       });
       const signal = AbortSignal.any([toolSignal, ctx.signal].filter((s): s is AbortSignal => !!s));

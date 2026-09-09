@@ -119,7 +119,7 @@ export function createDemoRuntime(): Runtime {
       const questions = userMessages.filter(m => m.includes('?')).length / Math.max(1, userMessages.length);
       const abandoned = dialogues.filter(d => d.outcome === 'abandoned').length / dialogues.length;
       return [{
-        id: 'observed_1', persona: 'Appointment holder observed in the supplied real dialogues.',
+        id: 'observed_1', source: 'observed' as const, persona: 'Appointment holder observed in the supplied real dialogues.',
         characteristics: [average < 60 ? 'Writes short messages' : 'Writes detailed messages', questions >= 0.3 ? 'Often asks questions' : 'Rarely asks questions', abandoned > 0 ? 'May stop when blocked' : 'Stays until answered'],
         observedStyle: `${userMessages.length} user messages, ${Math.round(average)} characters on average, ${Math.round(questions * 100)}% questions, ${Math.round(abandoned * 100)}% abandoned dialogues.`,
         evidenceDialogueIds: dialogues.slice(0, 50).map(d => d.id),

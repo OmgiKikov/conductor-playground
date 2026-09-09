@@ -117,11 +117,15 @@ export const dialogueSchema = z.strictObject({
   outcome: z.enum(['success', 'failure', 'abandoned', 'unknown']).default('unknown'),
 });
 export type Dialogue = z.infer<typeof dialogueSchema>;
-export const profileSchema = z.strictObject({
+const profileFields = {
   id: identifier, persona: text.max(2000), characteristics: z.array(text.max(300)).min(1).max(12),
-  observedStyle: text.max(2000), evidenceDialogueIds: z.array(identifier).min(1).max(50),
-});
+  observedStyle: text.max(2000).optional(), evidenceDialogueIds: z.array(identifier).max(50).default([]),
+};
+export const profileSchema = z.strictObject({ ...profileFields, source: z.enum(['observed', 'owner']).default('observed') })
+  .refine(p => p.source === 'owner' || p.evidenceDialogueIds.length > 0, { message: 'Observed profiles need evidence dialogue IDs', path: ['evidenceDialogueIds'] });
 export type Profile = z.infer<typeof profileSchema>;
+/** Profiles the owner writes by hand: a legitimate way to describe users when no dialogues exist. Synthetic, and labelled so. */
+export const ownerProfileSchema = z.strictObject({ ...profileFields, source: z.literal('owner').default('owner') });
 export const goldenCaseSchema = z.strictObject({
   id: identifier, familyId: identifier.optional(), title: text.max(200).optional(), goal: text.max(3000), opening: text.max(3000),
   facts: text.max(5000).default('No additional facts beyond the opening request.'), persona: text.max(2000).optional(),
@@ -155,11 +159,15 @@ export const createInputSchema = z.strictObject({
   target: targetSchema.default({ kind: 'sandbox' }),
   goldenCases: z.array(goldenCaseSchema).max(40).default([]),
   dialogues: z.array(dialogueSchema).max(200).default([]),
+  /** The owner's own hints about users, goals and situations. First-class input for cards; never a business rule. */
+  notes: z.string().trim().max(8000).default(''),
+  profiles: z.array(ownerProfileSchema).max(6).default([]),
 }).superRefine((v, ctx) => {
   if (v.materials.reduce((n, m) => n + m.content.length, 0) > 300000) ctx.addIssue({ code: 'custom', message: 'Materials exceed 300,000 characters', path: ['materials'] });
   if (v.dialogues.reduce((n, d) => n + d.messages.reduce((m, x) => m + x.content.length, 0), 0) > 2000000) ctx.addIssue({ code: 'custom', message: 'Dialogues exceed 2,000,000 characters', path: ['dialogues'] });
   if (!unique(v.dialogues.map(d => d.id))) ctx.addIssue({ code: 'custom', message: 'Duplicate dialogue IDs', path: ['dialogues'] });
   if (!unique(v.goldenCases.map(g => g.id))) ctx.addIssue({ code: 'custom', message: 'Duplicate golden case IDs', path: ['goldenCases'] });
+  if (!unique(v.profiles.map(p => p.id))) ctx.addIssue({ code: 'custom', message: 'Duplicate profile IDs', path: ['profiles'] });
 });
 export type CreateInput = z.infer<typeof createInputSchema>;
 
@@ -212,7 +220,7 @@ export interface Experiment {
   schemaVersion: '1'; id: string; task: string; mode: 'demo' | 'live'; workflow: 'evaluate' | 'compare';
   createdAt: string; updatedAt: string; phase: Phase; message: string;
   sources: Source[]; settings: Settings; target: Target; requirements: Requirement[]; questions: string[];
-  goldenCases: GoldenCase[]; dialogues: Dialogue[]; profiles: Profile[];
+  goldenCases: GoldenCase[]; dialogues: Dialogue[]; profiles: Profile[]; notes: string;
   scenarios: Scenario[]; revisions: Revision[]; selectedRevisionId: string | null;
   manifestHash: string | null; reviewedAt: string | null; reviewMode: 'human' | 'automated' | null; controlConsumedAt: string | null;
   trials: Trial[]; comparisons: Comparison[]; iterations: { revisionId: string; accepted: boolean; reason: string }[];
@@ -246,7 +254,8 @@ export const experimentSchema: z.ZodType<Experiment> = z.strictObject({
   sources: z.array(z.strictObject({ id: identifier, name: text, content: text, hash: text })).max(12), settings: settingsSchema,
   target: targetSchema.default({ kind: 'sandbox' }),
   requirements: z.array(requirementSchema), questions: z.array(z.string()), scenarios: z.array(scenarioSchema.extend({ split: z.enum(['dev', 'control']) })),
-  goldenCases: z.array(goldenCaseSchema).max(40).default([]), dialogues: z.array(dialogueSchema).max(200).default([]), profiles: z.array(profileSchema).max(6).default([]),
+  goldenCases: z.array(goldenCaseSchema).max(40).default([]), dialogues: z.array(dialogueSchema).max(200).default([]), profiles: z.array(profileSchema).max(12).default([]),
+  notes: z.string().max(8000).default(''),
   revisions: z.array(revisionSchema), selectedRevisionId: text.nullable(), manifestHash: text.nullable(), reviewedAt: text.nullable(), reviewMode: z.enum(['human', 'automated']).nullable().default(null), controlConsumedAt: text.nullable(),
   trials: z.array(trialSchema), comparisons: z.array(comparisonSchema), iterations: z.array(z.strictObject({ revisionId: text, accepted: z.boolean(), reason: z.string() })),
   usage: usageSchema, error: z.string().nullable(), limitations: z.array(z.string()),
@@ -272,7 +281,7 @@ export const userTurnSchema = z.strictObject({ message: z.string().max(6000), do
 export type UserTurn = z.infer<typeof userTurnSchema>;
 export interface PrepareInput {
   task: string; sources: Source[]; existingAgent?: AgentSpec; workflow?: 'evaluate' | 'compare'; scenarioCount?: number;
-  profiles?: Profile[]; goldenCases?: GoldenCase[];
+  profiles?: Profile[]; goldenCases?: GoldenCase[]; notes?: string;
 }
 export interface ImproveInput {
   task: string; sources: Source[]; requirements: Requirement[]; agent: AgentSpec;

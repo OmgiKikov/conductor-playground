@@ -22,7 +22,7 @@ const runningPhases = new Set(['preparing', 'evaluating', 'baseline', 'improving
 export function draftHash(record: Experiment): string {
   return fingerprint({ task: record.task, workflow: record.workflow, mode: record.mode, sources: record.sources,
     settings: record.settings, target: record.target, requirements: record.requirements, questions: record.questions,
-    goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles,
+    goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles, notes: record.notes,
     scenarios: record.scenarios, agent: record.revisions[0]?.spec });
 }
 export function resultHash(record: Experiment): string {
@@ -30,7 +30,7 @@ export function resultHash(record: Experiment): string {
 }
 export function measurementHash(record: Experiment): string {
   return fingerprint({ version: VERSION, workflow: record.workflow, task: record.task, baseline: record.revisions[0], mode: record.mode, sources: record.sources, requirements: record.requirements, scenarios: record.scenarios, settings: record.settings,
-    target: record.target, goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles });
+    target: record.target, goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles, notes: record.notes });
 }
 function revision(spec: Revision['spec'], parentId: string | null, hypothesis: string): Revision {
   return { id: fingerprint(spec), parentId, spec: structuredClone(spec), hypothesis, createdAt: new Date().toISOString() };
@@ -92,7 +92,7 @@ export class ExperimentLab {
       manifestHash: null, reviewedAt: null, reviewMode: null, controlConsumedAt: null, trials: [], comparisons: [], iterations: [],
       usage: emptyUsage(), error: null,
       workflow: input.workflow, humanReviews: [],
-      target: input.target, goldenCases: input.goldenCases, dialogues: input.dialogues, profiles: [],
+      target: input.target, goldenCases: input.goldenCases, dialogues: input.dialogues, profiles: input.profiles, notes: input.notes,
       limitations: [
         'Tools operate on isolated test records, not production systems. Only instructions and registered tool permissions are edited.',
         'Scenario expectations require human review. Text matching checks measure literal content, not semantic correctness.',
@@ -104,16 +104,16 @@ export class ExperimentLab {
     await this.launch(record, async ctx => {
       const runtime = await this.runtime(record);
       if (record.dialogues.length && runtime.profiles) {
-        // Persona text may only come from observed dialogues; every profile must cite dialogues that were actually supplied.
-        const profiles = await runtime.profiles({ task: record.task, sources: structuredClone(record.sources), dialogues: structuredClone(record.dialogues) }, ctx);
+        // Observed persona text may only come from supplied dialogues; owner-written profiles stay first and keep their source label.
+        const observed = await runtime.profiles({ task: record.task, sources: structuredClone(record.sources), dialogues: structuredClone(record.dialogues) }, ctx);
         const supplied = new Set(record.dialogues.map(d => d.id));
-        if (new Set(profiles.map(p => p.id)).size !== profiles.length) throw new Error('Observed profiles have duplicate IDs');
-        for (const profile of profiles) for (const id of profile.evidenceDialogueIds) if (!supplied.has(id)) throw new Error(`Profile ${profile.id} cites evidence dialogue ${id} that was not supplied`);
-        record.profiles = profiles;
+        for (const profile of observed) for (const id of profile.evidenceDialogueIds) if (!supplied.has(id)) throw new Error(`Profile ${profile.id} cites evidence dialogue ${id} that was not supplied`);
+        record.profiles = [...record.profiles, ...observed];
       }
+      if (new Set(record.profiles.map(p => p.id)).size !== record.profiles.length) throw new Error('Profiles have duplicate IDs');
       const generated = await runtime.prepare({
         task: record.task, sources: record.sources, existingAgent: input.existingAgent, workflow: input.workflow, scenarioCount: input.scenarioCount,
-        profiles: structuredClone(record.profiles), goldenCases: structuredClone(record.goldenCases),
+        profiles: structuredClone(record.profiles), goldenCases: structuredClone(record.goldenCases), notes: record.notes,
       }, ctx);
       const golden = record.goldenCases.map(goldenToScenario);
       const prepared = validatePreparation({ ...generated, scenarios: [...generated.scenarios, ...golden] }, record.sources, input.workflow, record.profiles);

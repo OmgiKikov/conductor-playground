@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { compareUserModes, evidenceSummary, judgeCalibration, simulatorFidelity } from '../src/comparison.js';
+import { compareUserModes, evidenceSummary, judgeCalibration, simulatorFidelity, verdictSummary } from '../src/comparison.js';
 import { emptyUsage, settingsSchema, type Experiment, type HumanReview, type MetricAssessment, type Outcome, type Scenario, type TraceEvent, type Trial, type UserMode } from '../src/contracts.js';
 
 const world = { records: { r: { t: '0' } }, writableFields: ['t'], transientFailures: 0 };
@@ -147,4 +147,40 @@ test('evidence summary states observed comparison results plainly and lists what
   assert.match(compare.comparison!.observed, /0\.75/);
   assert.match(compare.comparison!.status, /insufficient/);
   assert.match(compare.comparison!.status, /Only two families/);
+});
+
+test('the verdict says how many dialogues passed, where the agent is weak, how much to trust it and what to do next', () => {
+  const failing = (id: string, scenarioId: string, checks: string[], goal: 'pass' | 'fail') => trial(id, scenarioId, 'reactive', checks.length ? 'fail' : 'pass', { failed: checks, assessments: [{ metricId: 'goal', result: goal, rationale: 'r', evidence: [1] }] });
+  const synthetic = record({
+    scenarios: [scenario('s1'), scenario('s2')].map(s => ({ ...s, provenance: 'synthetic' as const })),
+    trials: [failing('a', 's1', ['time'], 'fail'), failing('b', 's1', ['time', 'extra'], 'fail'), failing('c', 's2', [], 'pass'), trial('d', 's2', 'reactive', 'invalid')],
+  });
+  const verdict = verdictSummary(synthetic);
+  assert.deepEqual([verdict.passed, verdict.graded, verdict.passRate], [1, 3, 1 / 3]);
+  assert.match(verdict.headline, /1 of 3/);
+  assert.deepEqual(verdict.provenance.synthetic, { cards: 2, passed: 1, graded: 3 });
+  assert.deepEqual(verdict.provenance.curated, { cards: 0, passed: 0, graded: 0 });
+  assert.deepEqual(verdict.weakSpots.map(w => [w.kind, w.description, w.failures]), [['check', 'time', 2], ['metric', 'Goal', 2], ['check', 'extra', 1]]);
+  assert.equal(verdict.confidence, 'low');
+  assert.ok(verdict.confidenceReasons.some(r => /synthetic/.test(r.text)));
+  assert.ok(verdict.confidenceReasons.some(r => /invalid/.test(r.text)));
+  assert.ok(verdict.nextSteps.some(s => /golden cases or real dialogues/.test(s.text)));
+  assert.ok(verdict.nextSteps.some(s => /verdicts/.test(s.text)));
+  assert.ok(verdict.nextSteps.some(s => /your own agent/.test(s.text)));
+  const mixed = record({
+    scenarios: [{ ...scenario('s1'), provenance: 'curated' as const }, { ...scenario('s2'), provenance: 'production' as const }],
+    trials: Array.from({ length: 10 }, (_, i) => failing(`t${i}`, i % 2 ? 's1' : 's2', i < 2 ? ['time'] : [], i < 2 ? 'fail' : 'pass')),
+    humanReviews: [review('h1', 't0', 'fail', { metricId: 'goal' })], resultsReviewedAt: '2026-09-09T00:00:00Z', target: { kind: 'module', path: '/agent.mjs', exportName: 'createSession' },
+  });
+  const trusted = verdictSummary(mixed);
+  assert.equal(trusted.confidence, 'high');
+  assert.deepEqual([trusted.passed, trusted.graded], [8, 10]);
+  assert.equal(trusted.nextSteps.some(s => /your own agent/.test(s.text)), false);
+  const partial = verdictSummary({ ...mixed, resultsReviewedAt: undefined, humanReviews: [] });
+  assert.equal(partial.confidence, 'medium');
+  assert.ok(partial.confidenceReasons.some(r => /human/.test(r.text)));
+  const empty = verdictSummary(record());
+  assert.equal(empty.passRate, null);
+  assert.match(empty.headline, /No graded dialogues/);
+  assert.equal(evidenceSummary(synthetic).verdict.confidence, 'low');
 });
