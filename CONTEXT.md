@@ -24,7 +24,11 @@ A native Pi package that turns a task, materials and real data into simulated di
 
 **Production dialogue**: A de-identified real conversation with the agent. It grounds user profiles and gives simulator fidelity something real to compare against.
 
-**Profile**: Observed persona and characteristics extracted from production dialogues, with evidence dialogue IDs. When profiles exist, synthetic cards may only choose one; the harness copies the persona text so a model cannot embellish it.
+**Profile**: A user type a card may adopt. Observed profiles are extracted from production dialogues with evidence dialogue IDs; owner profiles are written by the owner by hand. When any profiles exist, synthetic cards may only choose one; the harness copies the persona text so a model cannot embellish it.
+
+**Owner notes**: The owner's own hints about users, goals and situations, in their words. First-class input for synthetic cards, recorded as owner-supplied assumptions, never promoted to business rules.
+
+**Verdict**: The plain-language layer over the evidence: how many graded dialogues passed, the weak spots, a confidence level (low, medium, high) with stated reasons, and next steps. It leads every surface; the research statistics sit beneath it.
 
 **User mode**: How the user side of a dialogue is produced. Reactive: a model plays the card and answers the target's actual replies. Scripted: the card's script lines are sent in order. Static: only the opening message. Running the same cards in several modes shows what the reactive simulator adds.
 
