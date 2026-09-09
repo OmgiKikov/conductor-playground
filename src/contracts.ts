@@ -154,6 +154,47 @@ export function goldenToScenario(c: GoldenCase): Omit<Scenario, 'split'> {
   };
 }
 
+/*
+ * ObservedGoal: what a real user actually tried to do, extracted from production dialogues.
+ * The opening is the real user's own message, verbatim; it becomes a production card without model-written text.
+ */
+export const observedGoalSchema = z.strictObject({
+  id: identifier, goal: text.max(3000), opening: text.max(3000), profileId: identifier,
+  evidenceDialogueIds: z.array(identifier).min(1).max(50), successCriteria: text.max(3000),
+  facts: text.max(5000).default('Only what the real user revealed in the evidence dialogues.'),
+  outcome: z.enum(['success', 'failure', 'abandoned', 'unknown']).default('unknown'),
+});
+export type ObservedGoal = z.infer<typeof observedGoalSchema>;
+export function validateObservedGoals(goals: ObservedGoal[], dialogues: Dialogue[], profiles: Profile[]): void {
+  if (!unique(goals.map(g => g.id))) throw new Error('Observed goals have duplicate IDs');
+  const byId = new Map(dialogues.map(d => [d.id, d]));
+  for (const goal of goals) {
+    if (!profiles.some(p => p.id === goal.profileId)) throw new Error(`Observed goal ${goal.id} references an unknown profileId ${goal.profileId}`);
+    const evidence = goal.evidenceDialogueIds.map(id => byId.get(id));
+    if (evidence.some(d => !d)) throw new Error(`Observed goal ${goal.id} cites a dialogue that was not supplied`);
+    if (!evidence.some(d => d!.messages.some(m => m.role === 'user' && m.content.trim() === goal.opening.trim()))) {
+      throw new Error(`Observed goal ${goal.id} opening is not a verbatim user message from its evidence dialogues`);
+    }
+  }
+}
+export function goalToScenario(goal: ObservedGoal, profile?: Profile): Omit<Scenario, 'split'> {
+  return {
+    id: goal.id, familyId: goal.id, title: goal.goal.slice(0, 200), requirementIds: [], provenance: 'production', profileId: goal.profileId,
+    user: {
+      goal: goal.goal, facts: goal.facts, opening: goal.opening, maxFollowUps: 2,
+      behavior: 'Behave like the real user in the evidence dialogues: answer clarifications from the known facts, stop when the goal is reached or clearly blocked.',
+      ...(profile ? { persona: profile.persona, characteristics: [...profile.characteristics] } : {}),
+    },
+    initialState: { records: {}, writableFields: [], transientFailures: 0 }, checks: [], successCriteria: goal.successCriteria,
+    assumptions: [`Derived from a real dialogue (${goal.evidenceDialogueIds.join(', ')}); the opening is the real user's first message and the success criteria were inferred from the logged outcome (${goal.outcome}).`],
+    metrics: [
+      { id: 'goal_attainment', name: 'Goal attainment', subject: 'agent', description: 'Did the user get what they came for, as the real user would judge it.', passCriteria: 'The stated goal is reached or the user is told clearly and correctly why it cannot be.', failCriteria: 'The goal is not reached and no correct explanation is given, or the answer contradicts the success criteria.' },
+      { id: 'perimeter', name: 'Stays within the agent perimeter', subject: 'agent', description: 'The agent answers only what it is meant to answer and grounds answers in its materials.', passCriteria: 'Answers stay within the described perimeter and materials; out-of-scope requests are declined or redirected.', failCriteria: 'The agent answers outside its perimeter, invents facts, or fails to decline an out-of-scope request.' },
+      { id: 'user_fidelity', name: 'Simulated user fidelity', subject: 'simulator', description: 'The simulated user stayed within the observed profile and known facts.', passCriteria: 'Messages match the profile style and only use known facts.', failCriteria: 'The simulated user invents facts, breaks role or pushes unnaturally.' },
+    ],
+  };
+}
+
 export const createInputSchema = z.strictObject({
   task: text.max(8000),
   materials: z.array(materialSchema).min(1).max(12),
@@ -287,7 +328,7 @@ export const userTurnSchema = z.strictObject({ message: z.string().max(6000), do
 export type UserTurn = z.infer<typeof userTurnSchema>;
 export interface PrepareInput {
   task: string; sources: Source[]; existingAgent?: AgentSpec; workflow?: 'evaluate' | 'compare'; scenarioCount?: number;
-  profiles?: Profile[]; goldenCases?: GoldenCase[]; notes?: string;
+  profiles?: Profile[]; goldenCases?: GoldenCase[]; notes?: string; observedGoals?: ObservedGoal[];
 }
 export interface ImproveInput {
   task: string; sources: Source[]; requirements: Requirement[]; agent: AgentSpec;
@@ -301,6 +342,7 @@ export interface Runtime {
   userTurn(input: { user: Scenario['user']; messages: DialogueMessage[]; turn: number }, ctx: CallContext): Promise<UserTurn>;
   assess?(input: { scenario: Scenario; sources: Source[]; trial: Trial }, ctx: CallContext): Promise<MetricAssessment[]>;
   profiles?(input: { task: string; sources: Source[]; dialogues: Dialogue[] }, ctx: CallContext): Promise<Profile[]>;
+  goals?(input: { task: string; sources: Source[]; dialogues: Dialogue[]; profiles: Profile[] }, ctx: CallContext): Promise<ObservedGoal[]>;
 }
 
 /** Stable JSON content identity; array order remains significant. */

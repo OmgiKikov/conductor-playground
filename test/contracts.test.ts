@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  createInputSchema, emptyUsage, experimentSchema, goldenCaseSchema, goldenToScenario, profileSchema, settingsSchema, targetSchema, validatePreparation,
+  createInputSchema, emptyUsage, experimentSchema, goalToScenario, goldenCaseSchema, goldenToScenario, observedGoalSchema, profileSchema, settingsSchema, targetSchema, validatePreparation,
   type Profile,
 } from '../src/contracts.js';
 
@@ -128,4 +128,20 @@ test('command targets run a local process: executable plus arguments, optional a
   assert.equal(targetSchema.safeParse({ kind: 'command', command: '' }).success, false);
   assert.equal(targetSchema.safeParse({ kind: 'command', command: 'python3', cwd: 'relative/dir' }).success, false);
   assert.ok(targetSchema.safeParse({ kind: 'command', command: 'python3', cwd: '/abs/dir' }).success);
+});
+
+test('observed goals become production cards with a verbatim real opening and the matching profile', () => {
+  const profile: Profile = { id: 'observed_1', persona: 'Observed customer', characteristics: ['Short messages'], observedStyle: 's', evidenceDialogueIds: ['d1'], source: 'observed' };
+  const goal = observedGoalSchema.parse({ id: 'goal_move', goal: 'Move appointment A101 to 14:00', opening: 'move A101 to 14:00 pls', profileId: 'observed_1', evidenceDialogueIds: ['d1'], successCriteria: 'The appointment is moved to 14:00 or the user is told why not' });
+  const scenario = goalToScenario(goal, profile);
+  assert.equal(scenario.provenance, 'production');
+  assert.equal(scenario.profileId, 'observed_1');
+  assert.equal(scenario.user.opening, 'move A101 to 14:00 pls');
+  assert.equal(scenario.user.persona, 'Observed customer');
+  assert.deepEqual(scenario.user.characteristics, ['Short messages']);
+  assert.equal(scenario.user.maxFollowUps, 2);
+  assert.deepEqual(scenario.requirementIds, []);
+  assert.ok(scenario.metrics!.some(m => m.subject === 'agent') && scenario.metrics!.some(m => m.subject === 'simulator'));
+  assert.ok(scenario.assumptions!.some(a => /real dialogue/i.test(a)));
+  assert.equal(goal.outcome, 'unknown');
 });

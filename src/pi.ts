@@ -5,11 +5,11 @@ import {
 import { Type } from 'typebox';
 import { z } from 'zod';
 import {
-  agentSchema, metricAssessmentSchema, preparationSchema, profileSchema, proposalSchema, requirementSchema, scenarioSchema,
-  TOOL_NAMES, userTurnSchema,
+  agentSchema, metricAssessmentSchema, observedGoalSchema, preparationSchema, profileSchema, proposalSchema, requirementSchema, scenarioSchema,
+  TOOL_NAMES, userTurnSchema, validateObservedGoals,
   type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
-import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, FAMILY_PLAN_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
+import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
 const groundingSchema = z.strictObject({
@@ -269,13 +269,15 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
         const batchSize = Math.min(batchLimit, total - offset);
         const batchLabel = `Scenario cards batch ${Math.floor(offset / batchLimit) + 1}${requestedFamilies ? ` (${requestedFamilies.map(f => f.familyId).join(', ')})` : ''}`;
         const profiles = input.profiles ?? [];
+        const observedGoals = input.observedGoals ?? [];
         const cards = await ask(
           batchLabel,
-          cardsRole(compare, profiles.length > 0),
+          cardsRole(compare, profiles.length > 0, observedGoals.length > 0),
           {
             ...evidence,
             ...(input.notes ? { ownerNotes: input.notes } : {}),
             ...(profiles.length ? { observedProfiles: profiles } : {}),
+            ...(observedGoals.length ? { observedGoals: observedGoals.map(g => ({ id: g.id, goal: g.goal, profileId: g.profileId })) } : {}),
             ...(plan ? { familyPlan: plan.families, requestedFamilies } : {
               scenarioCount: total, requestedCount: batchSize,
               earlierGoals: scenarios.map(s => ({ id: s.id, familyId: s.familyId, goal: s.user.goal })),
@@ -303,6 +305,21 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
         evidence, agentSchema, ctx,
       );
       return preparationSchema.parse({ ...grounding, scenarios, agent });
+    },
+    async goals(input, ctx) {
+      const result = await ask(
+        'Observed goals',
+        GOALS_ROLE,
+        {
+          task: input.task,
+          profiles: input.profiles.map(({ id, persona, characteristics }) => ({ id, persona, characteristics })),
+          dialogues: input.dialogues.map(d => ({ id: d.id, outcome: d.outcome, userMessages: d.messages.filter(m => m.role === 'user').map(m => m.content) })),
+        },
+        z.strictObject({ goals: z.array(observedGoalSchema).min(1).max(20) }), ctx,
+      );
+      try { validateObservedGoals(result.goals, input.dialogues, input.profiles); }
+      catch (error) { throw new Error(`Observed goals: ${error instanceof Error ? error.message : String(error)}`); }
+      return result.goals;
     },
     async profiles(input, ctx) {
       const supplied = new Set(input.dialogues.map(d => d.id));

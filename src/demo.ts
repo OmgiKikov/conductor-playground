@@ -125,6 +125,22 @@ export function createDemoRuntime(): Runtime {
         evidenceDialogueIds: dialogues.slice(0, 50).map(d => d.id),
       }];
     },
+    async goals({ dialogues, profiles }, ctx) {
+      call(ctx);
+      // Deterministic stand-in for the model role: a goal per dialogue that names an appointment, opening copied verbatim.
+      const profileId = profiles[0]?.id ?? 'observed_1';
+      return dialogues.flatMap(dialogue => {
+        const opening = dialogue.messages.find(m => m.role === 'user')?.content;
+        const id = opening?.match(/\bA\d{3}\b/)?.[0];
+        if (!opening || !id) return [];
+        const time = opening.match(/\b(?:[01]\d|2[0-3]):[0-5]\d\b/)?.[0];
+        return [{
+          id: `goal_${dialogue.id}`, goal: time ? `Move appointment ${id} to ${time}` : `Learn the current time of appointment ${id}`, opening, profileId,
+          evidenceDialogueIds: [dialogue.id], facts: `Appointment ID ${id}${time ? `, desired time ${time}` : ''}.`, outcome: dialogue.outcome,
+          successCriteria: time ? `Appointment ${id} ends at ${time}, or the user learns clearly why it cannot be moved.` : `The user learns the current time of appointment ${id}.`,
+        }];
+      });
+    },
     async assess({ scenario, trial }, ctx) {
       call(ctx);
       return (scenario.metrics ?? []).map((metric): MetricAssessment => {

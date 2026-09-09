@@ -450,3 +450,33 @@ test('owner notes reach the card generator as owner-supplied hints, not as busin
     assert.match(f.requests[1]?.systemPrompt ?? '', /not business rules/);
   } finally { await f.close(); }
 });
+
+test('observed goals are extracted from user turns, must quote a real opening and a known profile', async () => {
+  const dialogues = [{ id: 'd1', messages: [{ role: 'user' as const, content: 'move A101 to 14:00 pls' }, { role: 'assistant' as const, content: 'ASSISTANT_PRIVATE' }], outcome: 'success' as const }];
+  const profile = { id: 'observed_1', persona: 'Observed', characteristics: ['Short'], observedStyle: 's', evidenceDialogueIds: ['d1'], source: 'observed' as const };
+  const good = { id: 'goal_move', goal: 'Move appointment A101 to 14:00', opening: 'move A101 to 14:00 pls', profileId: 'observed_1', evidenceDialogueIds: ['d1'], successCriteria: 'Moved or told why not' };
+  const replies = [{ goals: [good] }, { goals: [{ ...good, opening: 'invented opening' }] }, { goals: [{ ...good, profileId: 'nope' }] }];
+  const f = await fixture((_request, index) => JSON.stringify(replies[index]));
+  try {
+    const goals = await f.adapter.goals!({ task: 'Manage appointments', sources: [], dialogues, profiles: [profile] }, callContext().ctx);
+    assert.equal(goals[0]?.opening, 'move A101 to 14:00 pls');
+    assert.match(f.requests[0]?.systemPrompt ?? '', /verbatim/);
+    assert.doesNotMatch(JSON.stringify(f.requests[0]?.messages), /ASSISTANT_PRIVATE/);
+    await assert.rejects(f.adapter.goals!({ task: 'Manage appointments', sources: [], dialogues, profiles: [profile] }, callContext().ctx), /opening/i);
+    await assert.rejects(f.adapter.goals!({ task: 'Manage appointments', sources: [], dialogues, profiles: [profile] }, callContext().ctx), /profileId/);
+  } finally { await f.close(); }
+});
+
+test('card generation receives observed goals so synthetic cards add new situations instead of repeating the logs', async () => {
+  const quote = 'Support is available by email.';
+  const outputs = [{ requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] }, { scenarios: [plainCard(0)] }];
+  const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+  try {
+    await f.adapter.prepare({
+      task: 'Evaluate support answers', sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }], existingAgent: { name: 'A', instructions: 'Help.', tools: [] }, scenarioCount: 1,
+      observedGoals: [{ id: 'goal_1', goal: 'OBSERVED_GOAL_SENTINEL', opening: 'how do I email support?', profileId: 'p', evidenceDialogueIds: ['d1'], successCriteria: 's', facts: 'f', outcome: 'unknown' }],
+    }, callContext().ctx);
+    assert.match(JSON.stringify(f.requests[1]?.messages), /OBSERVED_GOAL_SENTINEL/);
+    assert.match(f.requests[1]?.systemPrompt ?? '', /observedGoals/);
+  } finally { await f.close(); }
+});

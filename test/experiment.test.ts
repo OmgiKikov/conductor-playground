@@ -398,3 +398,37 @@ test('owner notes and owner profiles are first-class inputs: cards may cite an o
   assert.equal(draft.scenarios[0]!.profileId, 'hurried_owner');
   assert.equal(draft.scenarios[0]!.user.persona, 'A customer in a hurry');
 });
+
+test('real dialogues also yield production cards: observed goals with verbatim openings that cite supplied dialogues', async t => {
+  const { lab } = await setup(t);
+  const input = createInputSchema.parse({
+    ...demoInput(), workflow: 'evaluate', scenarioCount: 1, settings: { ...demoInput().settings, repeats: 1 },
+    dialogues: [
+      { id: 'd1', messages: [{ role: 'user', content: 'move A101 to 14:00 pls' }, { role: 'assistant', content: 'Done.' }], outcome: 'success' },
+      { id: 'd2', messages: [{ role: 'user', content: 'hi, what time is my appointment A102?' }, { role: 'assistant', content: '09:00.' }], outcome: 'success' },
+    ],
+  });
+  const created = await lab.create(input); await lab.waitForIdle();
+  const draft = await lab.get(created.id);
+  assert.equal(draft.phase, 'review', draft.error ?? '');
+  const production = draft.scenarios.filter(s => s.provenance === 'production');
+  assert.equal(production.length, 2);
+  assert.deepEqual(production.map(s => s.user.opening).sort(), ['hi, what time is my appointment A102?', 'move A101 to 14:00 pls']);
+  assert.ok(production.every(s => s.profileId === 'observed_1' && s.user.persona === draft.profiles[0]!.persona));
+  assert.equal(draft.scenarios.filter(s => s.provenance === 'synthetic').length, 1);
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }); await lab.waitForIdle();
+  const result = await lab.get(draft.id);
+  assert.equal(result.phase, 'results_review', result.error ?? '');
+  assert.equal(result.trials.filter(tr => production.some(s => s.id === tr.scenarioId)).length, 2);
+});
+
+test('an observed goal whose opening is not a real user message fails preparation', async t => {
+  const runtime = createDemoRuntime();
+  runtime.goals = async () => [{ id: 'g', goal: 'x', opening: 'never said this', profileId: 'observed_1', evidenceDialogueIds: ['d1'], successCriteria: 'y', facts: 'f', outcome: 'unknown' }];
+  const { lab } = await setup(t, runtime);
+  const input = createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1, dialogues: [{ id: 'd1', messages: [{ role: 'user', content: 'hello' }] }] });
+  const created = await lab.create(input); await lab.waitForIdle();
+  const failed = await lab.get(created.id);
+  assert.equal(failed.phase, 'error');
+  assert.match(failed.error ?? '', /opening/i);
+});

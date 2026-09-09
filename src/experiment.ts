@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, fingerprint, goldenToScenario, humanReviewInputSchema, proposalSchema, settingsSchema, validatePreparation,
+  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, fingerprint, goalToScenario, goldenToScenario, humanReviewInputSchema, proposalSchema, settingsSchema, validateObservedGoals, validatePreparation,
   type CallContext, type CreateInput, type DraftPatch, type Experiment, type HumanReviewInput, type Revision, type Runtime,
 } from './contracts.js';
 import { ExperimentStore } from './store.js';
@@ -111,12 +111,18 @@ export class ExperimentLab {
         record.profiles = [...record.profiles, ...observed];
       }
       if (new Set(record.profiles.map(p => p.id)).size !== record.profiles.length) throw new Error('Profiles have duplicate IDs');
+      // Real dialogues become production cards: the goal a real user pursued, opened with their own words.
+      const observedGoals = record.dialogues.length && record.profiles.length && runtime.goals
+        ? await runtime.goals({ task: record.task, sources: structuredClone(record.sources), dialogues: structuredClone(record.dialogues), profiles: structuredClone(record.profiles) }, ctx)
+        : [];
+      validateObservedGoals(observedGoals, record.dialogues, record.profiles);
       const generated = await runtime.prepare({
         task: record.task, sources: record.sources, existingAgent: input.existingAgent, workflow: input.workflow, scenarioCount: input.scenarioCount,
-        profiles: structuredClone(record.profiles), goldenCases: structuredClone(record.goldenCases), notes: record.notes,
+        profiles: structuredClone(record.profiles), goldenCases: structuredClone(record.goldenCases), notes: record.notes, observedGoals: structuredClone(observedGoals),
       }, ctx);
+      const production = observedGoals.map(goal => goalToScenario(goal, record.profiles.find(p => p.id === goal.profileId)));
       const golden = record.goldenCases.map(goldenToScenario);
-      const prepared = validatePreparation({ ...generated, scenarios: [...generated.scenarios, ...golden] }, record.sources, input.workflow, record.profiles);
+      const prepared = validatePreparation({ ...generated, scenarios: [...generated.scenarios, ...production, ...golden] }, record.sources, input.workflow, record.profiles);
       Object.assign(record, { requirements: prepared.requirements, questions: prepared.questions, scenarios: prepared.scenarios });
       const baseline = revision(input.existingAgent ?? prepared.agent, null, input.workflow === 'evaluate' ? 'Agent configuration selected for dialogue evaluation.' : 'Original agent before measured improvements.');
       record.revisions.push(baseline); record.selectedRevisionId = baseline.id;
