@@ -19,10 +19,14 @@ def handle(request):
     match = re.search(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", message)
     if records and match:
         record_id = next(iter(records))
+        before = dict(records[record_id])
         records[record_id]["time"] = match.group(0)
         return {
             "reply": f"Moved {record_id} to {match.group(0)}.",
-            "events": [{"tool": "update_record", "args": {"recordId": record_id, "changes": {"time": match.group(0)}}, "result": {"ok": True, "recordId": record_id}}],
+            "events": [
+                {"tool": "lookup_record", "args": {"recordId": record_id}, "result": {"ok": True, "recordId": record_id, "record": before}},
+                {"tool": "update_record", "args": {"recordId": record_id, "changes": {"time": match.group(0)}}, "result": {"ok": True, "recordId": record_id, "record": records[record_id]}},
+            ],
             "records": records,
         }
     return {"reply": f"You said: {message}", "events": [], "records": records}
