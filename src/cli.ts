@@ -34,7 +34,8 @@ async function main() {
       if (current.phase !== 'review') throw new Error(current.error ?? 'Preparation failed');
       if (command === 'prepare' || command === 'build') { process.stdout.write(`${JSON.stringify(current, null, 2)}\n`); return; }
     }
-    if (!id) throw new Error('Provide --id EXPERIMENT_ID');
+    if (!id && command !== 'diff') throw new Error('Укажите прогон: --id EXPERIMENT_ID');
+    id ??= '';
     if (command === 'run' || command === 'demo') {
       await lab.start(id, { approved: true, reviewer: command === 'run' ? 'human' : 'automated' }); await lab.waitForIdle();
       const result = await lab.get(id);
