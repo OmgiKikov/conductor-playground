@@ -204,22 +204,45 @@ function parseJsonOutput(output: string): unknown {
   return JSON.parse(fenced[1].trim());
 }
 
+/**
+ * Repairing a nearly correct object is a much easier task for a model than writing one
+ * from scratch, so a rejected answer goes back into the same session with the exact
+ * reason. Attempts are bounded: after the third the run fails out loud instead of
+ * spinning and spending the owner's budget. Rejection text is model-facing and stays
+ * English, like the roles; what the owner reads is translated at the throw site.
+ */
+const REPAIR_ATTEMPTS = 3;
+
 async function jsonResponse<S extends z.ZodType>(
   modelRuntime: ModelRuntime, model: Model, label: string, role: string, input: unknown, schema: S, ctx: CallContext,
+  review?: (value: z.infer<S>) => string | undefined,
 ): Promise<z.infer<S>> {
   const prompt = `${role}\n${DATA_BOUNDARY}\nReturn exactly one compact JSON object, without markdown fences or pretty-printing whitespace, matching this JSON schema:\n${JSON.stringify(z.toJSONSchema(schema))}`;
   // Only target sessions contribute target trace events; simulator/planner events cannot affect target grades.
   const session = await controlledSession(modelRuntime, model, prompt, [], { ...ctx, onTargetEvent: undefined });
   try {
-    const output = await session.respond(JSON.stringify(input));
-    let parsed: unknown;
-    try { parsed = parseJsonOutput(output); }
-    catch { throw new Error('Pi returned malformed JSON; the run is invalid. Inspect the role configuration and retry.'); }
-    const validated = schema.safeParse(parsed);
-    if (!validated.success) throw new Error(`Pi returned an invalid structured response: ${validated.error.issues.map(i => i.path.join('.') || 'root').join(', ')}`);
-    return validated.data;
+    let message = JSON.stringify(input);
+    let rejection = '';
+    for (let attempt = 1; attempt <= REPAIR_ATTEMPTS; attempt++) {
+      const output = await session.respond(message);
+      let parsed: unknown;
+      try { parsed = parseJsonOutput(output); rejection = ''; }
+      catch { rejection = 'The reply was not a single JSON object.'; }
+      if (!rejection) {
+        const validated = schema.safeParse(parsed);
+        if (!validated.success) {
+          rejection = `These fields do not match the schema: ${validated.error.issues.map(i => `${i.path.join('.') || 'root'} (${i.message})`).join('; ')}.`;
+        } else {
+          const problem = review?.(validated.data);
+          if (!problem) return validated.data;
+          rejection = problem;
+        }
+      }
+      message = `Your previous answer was rejected. ${rejection}\nReturn the corrected object in full, as one compact JSON object and nothing else.`;
+    }
+    throw new Error(`модель ${REPAIR_ATTEMPTS} раза подряд вернула ответ, который не проходит проверку. Последняя причина: ${rejection}`);
   } catch (error) {
-    throw new Error(`${label}: ${error instanceof Error ? error.message : 'Pi role failed'}`);
+    throw new Error(`${label}: ${error instanceof Error ? error.message : 'шаг не удался'}`);
   } finally { await session.close(); }
 }
 
@@ -250,29 +273,45 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
   try { available = await modelRuntime.getAvailable(settings.provider, { signal }); }
   catch { throw new Error(`Cannot check Pi authentication. ${authHelp}`); }
   if (!available.some(m => m.id === model.id)) throw new Error(authHelp);
-  const ask = <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext) =>
-    jsonResponse(modelRuntime, model, label, role, input, schema, ctx);
+  const ask = <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext,
+    review?: (value: z.infer<S>) => string | undefined) =>
+    jsonResponse(modelRuntime, model, label, role, input, schema, ctx, review);
   return {
     async prepare(input, ctx) {
       const grounding = await ask(
-        'Requirements',
+        'Требования',
         REQUIREMENTS_ROLE,
         { task: input.task, sources: input.sources.map(({ id, name, content }) => ({ id, name, content })) },
         groundingSchema, ctx,
+        value => {
+          for (const requirement of value.requirements) {
+            const source = input.sources.find(s => s.id === requirement.sourceId);
+            if (!source) return `Requirement ${requirement.id} cites source ${requirement.sourceId}, which was not supplied.`;
+            if (!source.content.includes(requirement.quote)) {
+              return `Requirement ${requirement.id}: the quote is not a verbatim substring of "${source.name}". Copy the exact characters from that source instead of paraphrasing.`;
+            }
+          }
+          return undefined;
+        },
       );
       const evidence = { task: input.task, requirements: grounding.requirements, questions: grounding.questions };
       const requirementIds = new Set(grounding.requirements.map(r => r.id));
       if (requirementIds.size !== grounding.requirements.length) throw new Error('Requirements: duplicate requirement IDs');
       const compare = input.workflow === 'compare';
       const plan = compare ? await ask(
-        'Scenario family plan',
+        'План семейств сценариев',
         FAMILY_PLAN_ROLE,
         evidence, familyPlanSchema, ctx,
+        value => {
+          if (new Set(value.families.map(f => f.familyId)).size !== value.families.length) return 'Two families share the same familyId; each family must be distinct.';
+          for (const family of value.families) {
+            if (new Set(family.requirementIds).size !== family.requirementIds.length) return `Family "${family.familyId}" lists the same requirement twice.`;
+            const unknown = family.requirementIds.filter(id => !requirementIds.has(id));
+            if (unknown.length) return `Family "${family.familyId}" references requirements that do not exist: ${unknown.join(', ')}.`;
+          }
+          return undefined;
+        },
       ) : undefined;
-      if (plan && new Set(plan.families.map(f => f.familyId)).size !== plan.families.length) throw new Error('Scenario family plan: duplicate family IDs');
-      if (plan?.families.some(f => new Set(f.requirementIds).size !== f.requirementIds.length || f.requirementIds.some(id => !requirementIds.has(id)))) {
-        throw new Error('Scenario family plan: unknown or duplicate requirement references');
-      }
       const scenarios: z.infer<typeof scenarioSchema>[] = [];
       const scenarioIds = new Set<string>();
       const total = plan?.families.length ?? input.scenarioCount ?? 5;
@@ -281,7 +320,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       for (let offset = 0; offset < total; offset += batchLimit) {
         const requestedFamilies = plan?.families.slice(offset, offset + batchLimit);
         const batchSize = Math.min(batchLimit, total - offset);
-        const batchLabel = `Scenario cards batch ${Math.floor(offset / batchLimit) + 1}${requestedFamilies ? ` (${requestedFamilies.map(f => f.familyId).join(', ')})` : ''}`;
+        const batchLabel = `Карточки, партия ${Math.floor(offset / batchLimit) + 1}${requestedFamilies ? ` (${requestedFamilies.map(f => f.familyId).join(', ')})` : ''}`;
         const profiles = input.profiles ?? [];
         const observedGoals = input.observedGoals ?? [];
         const cards = await ask(
@@ -298,32 +337,41 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
             }),
           },
           z.strictObject({ scenarios: z.array(generatedScenarioSchema(profiles.length > 0)).length(batchSize) }), ctx,
+          // Pure review: attribution problems are a reason for the model to rewrite the
+          // batch, not a reason to lose the whole run. Nothing is recorded until it passes.
+          value => {
+            const seen = new Set<string>();
+            for (const scenario of value.scenarios) {
+              const family = requestedFamilies?.find(f => f.familyId === scenario.familyId);
+              if (requestedFamilies && !family) return `Card ${scenario.id} claims family "${scenario.familyId}", which was not requested in this batch.`;
+              if (requestedFamilies && seen.has(scenario.familyId)) return `Family "${scenario.familyId}" is used by two cards in this batch; each requested family needs exactly one card.`;
+              if (scenarioIds.has(scenario.id)) return `Card id "${scenario.id}" was already used by an earlier card; ids must be unique across the suite.`;
+              if (scenario.profileId !== undefined && !profiles.some(p => p.id === scenario.profileId)) {
+                return `Card ${scenario.id} references profile "${scenario.profileId}", which does not exist. Choose one of: ${profiles.map(p => p.id).join(', ') || 'none supplied'}.`;
+              }
+              if (new Set(scenario.requirementIds).size !== scenario.requirementIds.length) return `Card ${scenario.id} lists the same requirement twice.`;
+              const unknown = scenario.requirementIds.filter(id => !requirementIds.has(id));
+              if (unknown.length) return `Card ${scenario.id} references requirements that do not exist: ${unknown.join(', ')}.`;
+              const missing = family?.requirementIds.filter(id => !scenario.requirementIds.includes(id)) ?? [];
+              if (missing.length) return `Card ${scenario.id} must cover the requirements of its family: ${missing.join(', ')}.`;
+              seen.add(scenario.familyId);
+            }
+            return undefined;
+          },
         );
-        const seenFamilies = new Set<string>();
-        for (const scenario of cards.scenarios) {
-          const family = requestedFamilies?.find(f => f.familyId === scenario.familyId);
-          if (requestedFamilies && (!family || seenFamilies.has(scenario.familyId))) throw new Error(`${batchLabel}: missing, duplicate or unrequested family`);
-          if (scenarioIds.has(scenario.id)) throw new Error(`${batchLabel}: duplicate scenario ID`);
-          if (scenario.profileId !== undefined && !profiles.some(p => p.id === scenario.profileId)) throw new Error(`${batchLabel}: unknown profileId ${scenario.profileId}`);
-          if (new Set(scenario.requirementIds).size !== scenario.requirementIds.length
-            || scenario.requirementIds.some(id => !requirementIds.has(id))
-            || family?.requirementIds.some(id => !scenario.requirementIds.includes(id))) {
-            throw new Error(`${batchLabel}: unknown, duplicate or missing requirement reference`);
-          }
-          seenFamilies.add(scenario.familyId); scenarioIds.add(scenario.id); scenarios.push(scenario);
-        }
+        for (const scenario of cards.scenarios) { scenarioIds.add(scenario.id); scenarios.push(scenario); }
       }
       // An external target answers with its own agent, so a sandbox AgentSpec would be
       // built, paid for and never used.
       const agent = input.existingAgent
         ?? (input.targetKind && input.targetKind !== 'sandbox'
           ? { name: 'External agent', instructions: 'The agent under evaluation runs outside Agent Lab and keeps its own instructions and tools.', tools: [] }
-          : await ask('Agent construction', AGENT_ROLE, evidence, agentSchema, ctx));
+          : await ask('Сборка агента', AGENT_ROLE, evidence, agentSchema, ctx));
       return preparationSchema.parse({ ...grounding, scenarios, agent });
     },
     async goals(input, ctx) {
       const result = await ask(
-        'Observed goals',
+        'Цели из реальных диалогов',
         GOALS_ROLE,
         {
           task: input.task,
@@ -339,7 +387,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
     async profiles(input, ctx) {
       const supplied = new Set(input.dialogues.map(d => d.id));
       const result = await ask(
-        'User profiles',
+        'Профили пользователей',
         PROFILES_ROLE,
         // Assistant turns stay out: a profile describes how the user writes, not what the business answered.
         { task: input.task, dialogues: input.dialogues.map(d => ({ id: d.id, outcome: d.outcome, userMessages: d.messages.filter(m => m.role === 'user').map(m => m.content) })) },
@@ -353,7 +401,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
         throw new Error('Builder input must contain development evidence only');
       }
       return ask(
-        'Agent improvement',
+        'Улучшение агента',
         IMPROVE_ROLE,
         { task: input.task, requirements: input.requirements, agent: input.agent, feedback: input.feedback },
         proposalSchema, ctx,
@@ -363,7 +411,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       const metrics = input.scenario.metrics ?? [];
       if (!metrics.length) return [];
       const result = await ask(
-        'Dialogue assessment',
+        'Оценка диалога',
         ASSESS_ROLE,
         {
           scenario: input.scenario,
@@ -385,7 +433,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
     },
     async userTurn(input, ctx) {
       return ask(
-        'User simulation',
+        'Реплика пользователя',
         SIMULATOR_ROLE,
         {
           user: {

@@ -27,6 +27,16 @@ function plainCard(index: number): Omit<Scenario, 'split'> {
   };
 }
 
+/** Scripted replies by step. A repair attempt replays the same answer, so a rejected
+ * output stays rejected until the attempt bound is reached. */
+function scripted(outputs: unknown[]): (request: Request, index: number, options?: Options) => Reply {
+  let step = -1;
+  return request => {
+    if (!/Your previous answer was rejected/.test(JSON.stringify(request.messages ?? []))) step += 1;
+    return JSON.stringify(outputs[step]);
+  };
+}
+
 function callContext(options: { timeoutMs?: number; signal?: AbortSignal; limit?: number } = {}) {
   const usage = emptyUsage();
   const ctx: CallContext = {
@@ -188,7 +198,7 @@ test('provider continuations respect call budget and malformed structured output
   } finally { await f.close(); }
   const malformed = await fixture(() => 'This is not JSON');
   try {
-    await assert.rejects(malformed.adapter.userTurn({ user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 }, callContext().ctx), /malformed JSON/);
+    await assert.rejects(malformed.adapter.userTurn({ user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 }, callContext().ctx), /не проходит проверку.*not a single JSON object/s);
   } finally { await malformed.close(); }
 });
 
@@ -206,7 +216,7 @@ test('a structured answer wrapped in a markdown fence is still the model answer'
 
   const prose = await fixture(() => 'Here you go: {"message":"hi","done":false}');
   try {
-    await assert.rejects(prose.adapter.userTurn({ user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 }, callContext().ctx), /malformed JSON/);
+    await assert.rejects(prose.adapter.userTurn({ user: { goal: 'A', facts: 'A', behavior: 'A', opening: 'A' }, messages: [], turn: 0 }, callContext().ctx), /не проходит проверку.*not a single JSON object/s);
   } finally { await prose.close(); }
 });
 
@@ -324,7 +334,7 @@ test('default evaluation prepares exactly five cards and also supports one plain
       { requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] },
       ...Array.from({ length: Math.ceil(count / 3) }, (_, index) => ({ scenarios: cards.slice(index * 3, index * 3 + 3) })),
     ];
-    const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+    const f = await fixture(scripted(outputs));
     try {
       const result = await f.adapter.prepare({
         task: 'Evaluate support answers', sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }],
@@ -423,14 +433,18 @@ test('scenario batches reject invalid attribution and incomplete human-review ca
     if (issue === 'missing success criteria') delete (scenarios[0]! as { successCriteria?: string }).successCriteria;
     if (issue === 'missing simulator rubric') scenarios[0]!.metrics = scenarios[0]!.metrics.filter(m => m.subject === 'agent');
     const outputs = [{ requirements, questions: [] }, { families: plan }, { scenarios: scenarios.slice(0, 4) }, { scenarios: scenarios.slice(4) }];
-    const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+    const f = await fixture(scripted(outputs));
     try {
       await assert.rejects(f.adapter.prepare({
         task: 'Reschedule', sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }],
         workflow: 'compare',
         existingAgent: { name: 'Original', instructions: quote, tools: ['update_record'] },
-      }, callContext().ctx), issue.startsWith('missing ') ? /Scenario.*invalid structured response/ : /Scenario.*(duplicate|unknown|unrequested)/, issue);
-      assert.ok(f.requests.length <= 4, 'Invalid family/card output must stop before any candidate construction');
+      }, callContext().ctx), issue.startsWith('missing ') ? /не проходит проверку.*schema/s : /не проходит проверку.*(family|requirement|id)/s, issue);
+      // Requirements, then three bounded repair attempts on the first bad step, and nothing after it.
+      // Bounded repair: at most three attempts on the first bad step, and nothing after it.
+      assert.ok(f.requests.length <= 6, `${issue}: repair attempts must stay bounded`);
+      assert.ok(!f.requests.some(r => /You build a declarative conversational agent/.test(r.systemPrompt ?? '')),
+        'Invalid family/card output must stop before any candidate construction');
     } finally { await f.close(); }
   }
 });
@@ -456,12 +470,40 @@ test('profile extraction cites only supplied dialogues, sees user turns only, an
   } finally { await f.close(); }
 });
 
+test('a rejected answer is repaired from the stated reason instead of losing the run', async () => {
+  const quote = 'Support is available by email.';
+  const source = { id: 'source_1', name: 'Policy', content: quote, hash: 'hash' };
+  // First the model paraphrases the source, which is the most common real rejection.
+  const outputs = [
+    { requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote: 'Support can be reached by email.', critical: true }], questions: [] },
+    { requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] },
+    { scenarios: [plainCard(0)] },
+  ];
+  let step = -1;
+  const f = await fixture(request => {
+    if (!/Your previous answer was rejected/.test(JSON.stringify(request.messages ?? []))) step += 1;
+    else step += 1; // the repaired answer is the next scripted output
+    return JSON.stringify(outputs[step]);
+  });
+  try {
+    const prepared = await f.adapter.prepare({
+      task: 'Evaluate support answers', sources: [source], scenarioCount: 1,
+      existingAgent: { name: 'A', instructions: 'Help.', tools: [] },
+    }, callContext().ctx);
+    assert.equal(prepared.requirements[0]?.quote, quote);
+    assert.equal(f.requests.length, 3, 'one rejected answer, one repair, one card batch');
+    const repair = JSON.stringify(f.requests[1]?.messages ?? []);
+    assert.match(repair, /Your previous answer was rejected/);
+    assert.match(repair, /verbatim substring/, 'the model is told exactly what to fix');
+  } finally { await f.close(); }
+});
+
 test('card generation with observed profiles requires a profileId and passes the profiles as evidence', async () => {
   const quote = 'Support is available by email.';
   const profile = { id: 'observed_1', persona: 'Observed customer', characteristics: ['Writes short messages'], observedStyle: 'short', evidenceDialogueIds: ['d1'] };
   const requirements = [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }];
   const outputs = [{ requirements, questions: [] }, { scenarios: [plainCard(0)] }, { requirements, questions: [] }, { scenarios: [{ ...plainCard(1), profileId: 'observed_1' }] }];
-  const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+  const f = await fixture(scripted(outputs));
   try {
     const input = { task: 'Evaluate support answers', sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }], existingAgent: { name: 'A', instructions: 'Help.', tools: [] }, scenarioCount: 1, profiles: [profile] };
     await assert.rejects(f.adapter.prepare(input, callContext().ctx), /profileId/);
