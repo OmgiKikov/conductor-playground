@@ -200,6 +200,10 @@ test('preparation rejects invented sources, uncovered critical requirements, and
   check(p => { p.scenarios[0]!.checks.push({ id: 'no_update', kind: 'tool_not_called', description: 'conflict', tool: 'update_record' }); }, /Contradictory update/);
   check(p => { p.scenarios[0]!.checks.push({ id: 'bad_count', kind: 'tool_count', description: 'conflict', tool: 'lookup_record', min: 3, max: 2 }); }, /Contradictory tool/);
   check(p => { p.scenarios[0]!.checks.push({ id: 'zero_lookups', kind: 'tool_count', description: 'conflict', tool: 'lookup_record', min: 0, max: 0 }); }, /Contradictory tool/);
+  check(p => {
+    p.scenarios[0]!.checks.push({ id: 'wants_time', kind: 'answer_contains', description: 'conflict', value: '14:00' });
+    p.scenarios[0]!.checks.push({ id: 'forbids_time', kind: 'answer_omits', description: 'conflict', value: '14:00' });
+  }, /Contradictory answer/);
   check(p => { p.scenarios[0]!.checks.push({ id: 'forbidden', kind: 'state_equals', description: 'unreachable', recordId: 'A101', field: 'owner', value: 'Other' }); p.scenarios[0]!.checks = p.scenarios[0]!.checks.filter(c => c.id !== 'owner'); }, /Unreachable/);
   check(p => { p.scenarios.forEach(s => { s.familyId = 'same'; }); }, /four distinct/);
 });

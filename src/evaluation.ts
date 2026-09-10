@@ -66,9 +66,10 @@ function grade(scenario: Scenario, trial: Trial): CheckResult[] {
       const actual = trial.finalState.records[check.recordId]?.[check.field];
       passed = Object.is(actual, check.value);
       evidence = `${check.recordId}.${check.field}: expected ${JSON.stringify(check.value)}, observed ${JSON.stringify(actual)}`;
-    } else if (check.kind === 'answer_contains') {
-      passed = answers.includes(check.value.toLocaleLowerCase());
-      evidence = `Assistant transcript ${passed ? 'contains' : 'does not contain'} ${JSON.stringify(check.value)}. This is an exact text check, not a semantic judgment.`;
+    } else if (check.kind === 'answer_contains' || check.kind === 'answer_omits') {
+      const present = answers.includes(check.value.toLocaleLowerCase());
+      passed = check.kind === 'answer_contains' ? present : !present;
+      evidence = `Assistant transcript ${present ? 'contains' : 'does not contain'} ${JSON.stringify(check.value)}. This is an exact text check, not a semantic judgment.`;
     } else if (check.kind === 'fresh_read_before_update') {
       ({ passed, evidence } = freshReadEvidence(trial.events));
     } else {

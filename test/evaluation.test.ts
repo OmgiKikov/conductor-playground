@@ -176,6 +176,23 @@ test('tool_count includes rejected SDK attempts and ordering does not invent act
   assert.match(rejected.checks[0]!.evidence, /attempted 1/);
 });
 
+test('forbidden wording in a reply fails its check while the same phrase elsewhere does not', async () => {
+  const f = await fixture();
+  // Дефект, ради которого проверка и нужна: клиенту уходит текст, написанный для оператора.
+  const scenario = structuredClone(f.preparation.scenarios[0]!);
+  scenario.checks = [
+    { id: 'no_staff_text', kind: 'answer_omits', description: 'В ответе клиенту нет инструкций для оператора', value: 'Оператору необходимо' },
+  ];
+  const leaking = targetRuntime(f.runtime, async () => 'Оператору необходимо осуществить ручной поиск.');
+  const leaked = await f.evaluate(scenario, f.candidate, leaking);
+  assert.equal(leaked.checks[0]!.passed, false);
+  assert.match(leaked.checks[0]!.evidence, /contains/);
+
+  const clean = targetRuntime(f.runtime, async () => 'Посмотрите тариф в разделе «Мои точки продаж».');
+  const kept = await f.evaluate(scenario, f.candidate, clean);
+  assert.equal(kept.checks[0]!.passed, true);
+});
+
 test('simulator protocol/provider errors are invalid; exhausting target turns is a valid failure', async () => {
   const f = await fixture();
   const legacy = structuredClone(f.preparation.scenarios[0]!);

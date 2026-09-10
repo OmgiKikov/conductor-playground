@@ -81,6 +81,8 @@ export const checkSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...checkBase, kind: z.literal('tool_count'), tool: z.enum(TOOL_NAMES), min: z.number().int().min(0).max(1000), max: z.number().int().min(0).max(1000) }),
   z.strictObject({ ...checkBase, kind: z.literal('fresh_read_before_update') }),
   z.strictObject({ ...checkBase, kind: z.literal('answer_contains'), value: text.max(1000) }),
+  /** Wording that must never reach the user: internal instructions, staff-only phrasing, forbidden promises. */
+  z.strictObject({ ...checkBase, kind: z.literal('answer_omits'), value: text.max(1000) }),
 ]);
 export type Check = z.infer<typeof checkSchema>;
 export const rubricSchema = z.strictObject({
@@ -393,11 +395,17 @@ export function validatePreparation(raw: unknown, sources: Source[], workflow: '
     if (s.requirementIds.some(id => !p.requirements.some(r => r.id === id))) throw new Error(`Unknown requirement in ${s.id}`);
     const states = new Map<string, unknown>();
     const calls = new Map<string, { min: number; max: number }>();
+    const phrases = new Map<string, boolean>();
     for (const c of s.checks) {
       if (c.kind === 'state_equals') {
         const key = `${c.recordId}.${c.field}`;
         if (states.has(key) && !Object.is(states.get(key), c.value)) throw new Error(`Contradictory state checks in ${s.id}`);
         states.set(key, c.value);
+      } else if (c.kind === 'answer_contains' || c.kind === 'answer_omits') {
+        const required = c.kind === 'answer_contains';
+        const seen = phrases.get(c.value.toLocaleLowerCase());
+        if (seen !== undefined && seen !== required) throw new Error(`Contradictory answer checks in ${s.id}`);
+        phrases.set(c.value.toLocaleLowerCase(), required);
       } else if (c.kind === 'tool_called' || c.kind === 'tool_not_called' || c.kind === 'tool_count') {
         const before = calls.get(c.tool) ?? { min: 0, max: Infinity };
         const min = Math.max(before.min, c.kind === 'tool_count' ? c.min : c.kind === 'tool_called' ? 1 : 0);
