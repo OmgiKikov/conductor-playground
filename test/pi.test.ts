@@ -260,7 +260,7 @@ test('deadline and external cancellation reach the actual SDK provider stream', 
 });
 
 test('missing model selection fails without demo fallback and builder rejects control feedback', async () => {
-  await assert.rejects(createPiRuntime(settingsSchema.parse({})), /Select a provider and model/);
+  await assert.rejects(createPiRuntime(settingsSchema.parse({})), /Выберите провайдера и модель/);
   const f = await fixture(() => 'unused');
   try {
     await assert.rejects(f.adapter.improve({ feedback: [{ scenario: { split: 'control' }, trials: [] }] } as never, callContext().ctx), /development evidence only/);

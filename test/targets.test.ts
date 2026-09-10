@@ -171,7 +171,7 @@ test('command adapter reports a crashed process with its stderr and kills a hang
   await assert.rejects(hanging.respond('hi'), /exceeded/);
   assert.ok(performance.now() - started < 4000);
   await hanging.close();
-  await assert.rejects(hanging.respond('again'), /closed/);
+  await assert.rejects(hanging.respond('again'), /закрыта/);
 });
 
 test('command adapter refuses a missing executable before any dialogue', async () => {

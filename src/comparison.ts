@@ -250,12 +250,40 @@ export interface VerdictSummary {
   confidence: 'low' | 'medium' | 'high'; confidenceReasons: VerdictNote[]; nextSteps: VerdictNote[];
 }
 /**
+ * Dialogues whose failure still needs a person: failed objectively or by an agent rubric,
+ * and without a decisive (pass/fail) verdict from the owner. The board reviews these first,
+ * and the confidence rule counts exactly the same set, so the two can never disagree.
+ */
+export function awaitingVerdict(record: Experiment): Set<string> {
+  const latest = latestHumanReviews(record);
+  const decided = new Set<string>();
+  for (const review of latest.values()) if (review.verdict === 'pass' || review.verdict === 'fail') decided.add(review.trialId);
+  const pending = new Set<string>();
+  for (const trial of record.trials) {
+    if (decided.has(trial.id)) continue;
+    const agentRubrics = record.scenarios.find(s => s.id === trial.scenarioId)?.metrics?.filter(m => m.subject === 'agent') ?? [];
+    const rubricFailed = (trial.assessments ?? []).some(a => a.result === 'fail' && agentRubrics.some(m => m.id === a.metricId));
+    if (trial.outcome === 'fail' || rubricFailed) pending.add(trial.id);
+  }
+  return pending;
+}
+
+/** Fewer graded dialogues than this cannot say anything about an agent at all. */
+const MIN_GRADED = 5;
+/**
+ * Error analysis works on tens of traces, not units: the established practice is to start
+ * from about a hundred and label at least the first thirty by hand. A run smaller than this
+ * can be right, but it cannot be called trusted.
+ */
+const TRUSTED_SAMPLE = 30;
+/**
  * The plain-language layer: "is my agent good, and how much should I trust that?"
  * Confidence rules are deliberately simple and stated in the reasons:
- *   low     – fewer than 5 objectively graded dialogues (rubric-only runs included), or every card is synthetic, or more than a quarter of dialogues were invalid
- *   medium  – real or golden cards exist but human review is missing, not finalized, or some failed dialogues lack a decisive (pass/fail) verdict
- *   high    – review finalized, every failed dialogue carries a decisive human verdict, at least one non-synthetic card, 10+ graded dialogues, no invalid ones
+ *   low     – fewer than MIN_GRADED objectively graded dialogues (rubric-only runs included), or every card is synthetic, or more than a quarter of dialogues were invalid
+ *   medium  – real or golden cards exist but human review is missing, not finalized, some failed dialogues lack a decisive (pass/fail) verdict, or the sample is below TRUSTED_SAMPLE
+ *   high    – review finalized, every failed dialogue carries a decisive human verdict, at least one non-synthetic card, TRUSTED_SAMPLE+ graded dialogues, no invalid ones
  *   unknown/invalid human verdicts never decide anything; they stay listed as undecided
+ * Wording lives here, in the owner's language: the board, the report and the CLI all read these notes.
  */
 export function verdictSummary(record: Experiment): VerdictSummary {
   const gradedTrials = record.trials.filter(graded);
@@ -311,34 +339,39 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   const unreviewed = failedTrials.filter(t => reviewsFor(t.id).length === 0).length;
   const undecided = failedTrials.filter(t => { const reviews = reviewsFor(t.id); return reviews.length > 0 && !reviews.some(decisive); }).length;
   const reasons: VerdictNote[] = [];
-  if (gradedCount === 0 && rubric.assessed === 0) reasons.push({ code: 'none_graded', text: 'No graded dialogues yet.' });
-  else if (gradedCount === 0) reasons.push({ code: 'rubric_only', text: 'Only model rubric estimates, no objective checks; nothing here is verified by code.' });
-  else if (gradedCount < 5) reasons.push({ code: 'few_graded', text: `Only ${gradedCount} graded dialogue(s); too few to judge the agent.`, count: gradedCount });
-  if (invalid) reasons.push({ code: 'invalid', text: `${invalid} dialogue(s) were invalid and could not measure the agent.`, count: invalid });
-  if (allSynthetic) reasons.push({ code: 'all_synthetic', text: 'All cards are synthetic; nothing here comes from real users or a reviewed golden set.' });
-  if (simulatorFlagged) reasons.push({ code: 'simulator_flagged', text: `The model flagged ${simulatorFlagged} dialogue(s) where the simulated user may have broken role.`, count: simulatorFlagged });
-  if (!humanVerdicts) reasons.push({ code: 'no_human', text: 'No human verdicts yet; model estimates are unchecked.' });
-  else if (!decisiveVerdicts) reasons.push({ code: 'no_decisive_verdicts', text: 'Human verdicts so far are all unknown or invalid; nothing has been confirmed or refuted.' });
-  else if (!finalized) reasons.push({ code: 'not_finalized', text: 'Human review of the results is not finalized.' });
+  if (gradedCount === 0 && rubric.assessed === 0) reasons.push({ code: 'none_graded', text: 'Диалогов с оценкой ещё нет.' });
+  else if (gradedCount === 0) reasons.push({ code: 'rubric_only', text: 'Только оценки модели по рубрикам, объективных проверок нет: кодом ничего не подтверждено.' });
+  else if (gradedCount < MIN_GRADED) reasons.push({ code: 'few_graded', text: `Оценено ${gradedCount} диалог(ов) — слишком мало, чтобы судить об агенте.`, count: gradedCount });
+  if (invalid) reasons.push({ code: 'invalid', text: `${invalid} диалог(ов) не удалось измерить: сломалась симуляция или инфраструктура.`, count: invalid });
+  if (allSynthetic) reasons.push({ code: 'all_synthetic', text: 'Все карточки синтетические: ни реальных пользователей, ни проверенного golden set.' });
+  if (simulatorFlagged) reasons.push({ code: 'simulator_flagged', text: `Модель отметила ${simulatorFlagged} диалог(ов), где симулированный пользователь мог выйти из роли.`, count: simulatorFlagged });
+  if (!humanVerdicts) reasons.push({ code: 'no_human', text: 'Ни одного вердикта человека: оценки модели никем не проверены.' });
+  else if (!decisiveVerdicts) reasons.push({ code: 'no_decisive_verdicts', text: 'Все вердикты человека пока «неясно» или «невалидно»: ничего не подтверждено и не опровергнуто.' });
+  else if (!finalized) reasons.push({ code: 'not_finalized', text: 'Аудит результатов человеком не завершён.' });
   else {
-    if (unreviewed) reasons.push({ code: 'unreviewed_failures', text: `${unreviewed} failed dialogue(s) have no human verdict.`, count: unreviewed });
-    if (undecided) reasons.push({ code: 'undecided_failures', text: `${undecided} failed dialogue(s) carry only unknown or invalid human verdicts.`, count: undecided });
+    if (unreviewed) reasons.push({ code: 'unreviewed_failures', text: `${unreviewed} провалившихся диалог(ов) без вердикта человека.`, count: unreviewed });
+    if (undecided) reasons.push({ code: 'undecided_failures', text: `${undecided} провалившихся диалог(ов) только с вердиктами «неясно» или «невалидно».`, count: undecided });
   }
   const invalidShare = record.trials.length ? invalid / record.trials.length : 0;
-  const confidence: VerdictSummary['confidence'] = gradedCount < 5 || allSynthetic || invalidShare > 0.25 ? 'low'
-    : finalized && decisiveVerdicts && unreviewed === 0 && undecided === 0 && gradedCount >= 10 && invalid === 0 ? 'high' : 'medium';
+  const reviewComplete = finalized && decisiveVerdicts && unreviewed === 0 && undecided === 0 && invalid === 0;
+  if (reviewComplete && gradedCount >= MIN_GRADED && gradedCount < TRUSTED_SAMPLE) {
+    reasons.push({ code: 'small_sample', text: `Разобрано ${gradedCount} диалог(ов) из ${TRUSTED_SAMPLE}, с которых выборка перестаёт быть случайной.`, count: gradedCount });
+  }
+  const confidence: VerdictSummary['confidence'] = gradedCount < MIN_GRADED || allSynthetic || invalidShare > 0.25 ? 'low'
+    : reviewComplete && gradedCount >= TRUSTED_SAMPLE ? 'high' : 'medium';
   const nextSteps: VerdictNote[] = [];
-  if (gradedCount === 0 && rubric.assessed === 0) nextSteps.push({ code: 'approve_and_run', text: 'Approve the cards in /agent-lab and run the dialogues.' });
-  if (allSynthetic) nextSteps.push({ code: 'add_real_data', text: 'Add golden cases or real dialogues so the result does not rest on synthetic cards alone.' });
+  if (gradedCount === 0 && rubric.assessed === 0) nextSteps.push({ code: 'approve_and_run', text: 'Утвердите карточки в /agent-lab и запустите диалоги.' });
+  if (allSynthetic) nextSteps.push({ code: 'add_real_data', text: 'Добавьте golden set или реальные диалоги, чтобы результат не держался на одной синтетике.' });
   const awaiting = unreviewed + undecided;
-  if (awaiting) nextSteps.push({ code: 'record_verdicts', text: `Open the ${awaiting} failed dialogue(s) without a decisive human verdict (pass or fail) in /agent-lab and record your verdicts.`, count: awaiting });
-  if (record.target.kind === 'sandbox') nextSteps.push({ code: 'connect_agent', text: 'Point target at your own agent (http or module) to test the agent you ship.' });
-  if (weakSpots[0]) nextSteps.push({ code: 'fix_weakest', text: `Start with the weakest spot: ${weakSpots[0].description} (${weakSpots[0].failures} failures).`, detail: weakSpots[0].description, count: weakSpots[0].failures });
-  if (gradedCount > 0 && gradedCount < 10) nextSteps.push({ code: 'run_more', text: `Run more cards or repeats; ${gradedCount} graded dialogue(s) is a small sample.`, count: gradedCount });
+  if (awaiting) nextSteps.push({ code: 'record_verdicts', text: `Разберите ${awaiting} провалившихся диалог(ов) без решающего вердикта: в /agent-lab клавиши p — пройдено, n — не пройдено.`, count: awaiting });
+  if (record.target.kind === 'sandbox') nextSteps.push({ code: 'connect_agent', text: 'Подключите своего агента вместо песочницы, чтобы проверять то, что реально работает.' });
+  if (weakSpots[0]) nextSteps.push({ code: 'fix_weakest', text: `Начните с самого слабого места: ${weakSpots[0].description} (${weakSpots[0].failures} провал(ов)).`, detail: weakSpots[0].description, count: weakSpots[0].failures });
+  if (gradedCount > 0 && gradedCount < TRUSTED_SAMPLE) nextSteps.push({ code: 'run_more', text: `Прогоните больше карточек: ${gradedCount} диалог(ов) против ${TRUSTED_SAMPLE}, с которых результату можно верить.`, count: gradedCount });
   const passRate = gradedCount ? passed / gradedCount : null;
-  const estimates = rubric.assessed ? ` ${record.mode === 'demo' ? 'Scripted demo estimates' : 'Model estimates'} (unverified): ${rubric.passed} of ${rubric.assessed} dialogues passed all agent rubrics.` : '';
-  const headline = gradedCount ? `${passed} of ${gradedCount} graded dialogues passed (${Math.round((passRate ?? 0) * 100)}%). Confidence ${confidence}.${estimates}`
-    : rubric.assessed ? `No objective checks.${estimates} Confidence ${confidence}.` : 'No graded dialogues yet.';
+  const confidenceWord: Record<VerdictSummary['confidence'], string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
+  const estimates = rubric.assessed ? ` ${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} (не проверена): ${rubric.passed} из ${rubric.assessed} диалогов без замечаний по рубрикам агента.` : '';
+  const headline = gradedCount ? `Пройдено ${passed} из ${gradedCount} диалогов (${Math.round((passRate ?? 0) * 100)}%). Доверие ${confidenceWord[confidence]}.${estimates}`
+    : rubric.assessed ? `Объективных проверок нет.${estimates} Доверие ${confidenceWord[confidence]}.` : 'Диалогов с оценкой ещё нет.';
   return { headline, passed, graded: gradedCount, invalid, passRate, rubric, simulatorFlagged, provenance, weakSpots, confidence, confidenceReasons: reasons, nextSteps };
 }
 

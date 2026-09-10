@@ -28,7 +28,7 @@ const generatedScenarioSchema = (hasProfiles: boolean) => scenarioSchema.require
   .refine(s => s.metrics.some(m => m.subject === 'agent') && s.metrics.some(m => m.subject === 'simulator'), 'Agent-goal and simulator-fidelity metrics are both required')
   .refine(s => !hasProfiles || s.profileId !== undefined, { message: 'profileId must reference an observed profile', path: ['profileId'] });
 const simulatorReplySchema = userTurnSchema.describe('A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
-const authHelp = 'Configure Pi with /login or set the selected provider API key, then select an authenticated model. Live mode never falls back to the demo.';
+const authHelp = 'Войдите в Pi через /login или задайте ключ выбранного провайдера, затем выберите доступную модель. Живой прогон никогда не подменяется демо.';
 
 /** Explicit resources avoid global/project extensions, skills, AGENTS files and prompt discovery. */
 function resources(systemPrompt: string): ResourceLoader {
@@ -159,17 +159,17 @@ async function controlledSession(
         if (boundaryError) throw boundaryError;
         const last = session.messages.slice(start).findLast(m => m.role === 'assistant');
         if (!last || last.role !== 'assistant' || last.stopReason !== 'stop') {
-          throw new Error(`Pi did not finish a valid response (${last?.role === 'assistant' ? last.stopReason : 'missing response'}). Check provider access or raise the call limits.`);
+          throw new Error(`Модель не довела ответ до конца (${last?.role === 'assistant' ? last.stopReason : 'ответа нет'}). Проверьте доступ к провайдеру и лимиты вызовов.`);
         }
         const output = last.content.filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
-        if (!output) throw new Error('Pi returned an empty response');
+        if (!output) throw new Error('Модель вернула пустой ответ.');
         return output;
       } catch (error) {
         if (activeSignal.aborted) throw activeSignal.reason;
         if (boundaryError) throw boundaryError;
         // Provider errors may contain request headers or secret-bearing URLs. Do not persist their raw text.
         if (error instanceof Error && error.message.startsWith('Pi ')) throw error;
-        throw new Error(`Pi request failed for ${model.provider}/${model.id}. Check authentication, model access and provider availability.`);
+        throw new Error(`Запрос к ${model.provider}/${model.id} не прошёл. Проверьте доступ, права на модель и доступность провайдера.`);
       } finally {
         clearTimeout(timer);
         activeSignal.removeEventListener('abort', onAbort);
@@ -257,21 +257,21 @@ export async function getPiStatus(injectedRuntime?: ModelRuntime): Promise<{
       models: available.map(m => ({ provider: m.provider, id: m.id, name: m.name })),
       ...(available.length ? {} : { error: authHelp }),
     };
-  } catch { return { models: [], error: `Cannot read Pi model availability. ${authHelp}` }; }
+  } catch { return { models: [], error: `Не удалось прочитать список доступных моделей. ${authHelp}` }; }
 }
 
 /** The optional SDK runtime is the integration seam for custom providers and offline SDK checks. */
 export async function createPiRuntime(settings: Settings, injectedRuntime?: ModelRuntime): Promise<Runtime> {
-  if (!settings.provider || !settings.model) throw new Error(`Select a provider and model. ${authHelp}`);
+  if (!settings.provider || !settings.model) throw new Error(`Выберите провайдера и модель. ${authHelp}`);
   const signal = AbortSignal.timeout(settings.timeoutMs);
   let modelRuntime: ModelRuntime;
   try { modelRuntime = injectedRuntime ?? await ModelRuntime.create({ allowModelNetwork: false, signal }); }
-  catch { throw new Error(`Pi initialization failed. ${authHelp}`); }
+  catch { throw new Error(`Не удалось инициализировать Pi. ${authHelp}`); }
   const model = modelRuntime.getModel(settings.provider, settings.model);
-  if (!model) throw new Error(`Selected Pi model is unavailable: ${settings.provider}/${settings.model}. ${authHelp}`);
+  if (!model) throw new Error(`Выбранная модель недоступна: ${settings.provider}/${settings.model}. ${authHelp}`);
   let available: Awaited<ReturnType<ModelRuntime['getAvailable']>>;
   try { available = await modelRuntime.getAvailable(settings.provider, { signal }); }
-  catch { throw new Error(`Cannot check Pi authentication. ${authHelp}`); }
+  catch { throw new Error(`Не удалось проверить доступ к моделям. ${authHelp}`); }
   if (!available.some(m => m.id === model.id)) throw new Error(authHelp);
   const ask = <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext,
     review?: (value: z.infer<S>) => string | undefined) =>

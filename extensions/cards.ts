@@ -1,7 +1,7 @@
 import type { ExtensionContext, Theme, ThemeColor } from '@earendil-works/pi-coding-agent';
 import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from '@earendil-works/pi-tui';
 import type { Experiment, Scenario, Trial } from '../dist/contracts.js';
-import { evidenceSummary, verdictSummary, type VerdictNote } from '../dist/comparison.js';
+import { awaitingVerdict, evidenceSummary, verdictSummary, type VerdictNote } from '../dist/comparison.js';
 
 /** All material, model and persisted text crosses this boundary before terminal rendering. */
 export function safeText(value: unknown): string {
@@ -19,12 +19,24 @@ export const verdicts: Record<string, string> = {
   pass: 'ПРОЙДЕНО', fail: 'НЕ ПРОЙДЕНО', unknown: 'НЕЯСНО', invalid: 'НЕВАЛИДНО', cancelled: 'ОСТАНОВЛЕНО', ungraded: 'БЕЗ ОЦЕНКИ',
 };
 
+/**
+ * Review order: dialogues still waiting for a decisive verdict come first, then the rest.
+ * Reviewing one moves it out of the queue, so the same position lands on the next case
+ * and a person can go through failures without navigating.
+ */
+export function reviewOrder(record: Experiment): Trial[] {
+  const pending = awaitingVerdict(record);
+  const rank = (trial: Trial) => pending.has(trial.id) ? 0 : trial.outcome === 'fail' || trial.outcome === 'invalid' ? 1 : 2;
+  return record.trials.map((trial, index) => ({ trial, index })).sort((a, b) => rank(a.trial) - rank(b.trial) || a.index - b.index).map(v => v.trial);
+}
+
 type Section = 'agent' | 'cards' | 'results' | 'stats';
 export type BoardAction =
   | { type: 'close' }
   | { type: 'back' }
   | { type: 'open'; id: string }
-  | { type: 'edit' | 'settings' | 'run' | 'annotate' | 'finalize' | 'export' | 'cancel'; record: Experiment; section: Section; selected: number };
+  | { type: 'edit' | 'settings' | 'run' | 'annotate' | 'finalize' | 'export' | 'cancel'; record: Experiment; section: Section; selected: number }
+  | { type: 'verdict'; verdict: 'pass' | 'fail'; record: Experiment; section: Section; selected: number };
 export interface BoardOptions {
   records?: Experiment[];
   record?: Experiment;
@@ -96,8 +108,8 @@ function trialLines(trial: Trial, record: Experiment, expanded: boolean): Line[]
     ]) ?? []),
   ];
   if (!record.humanReviews?.some(r => r.trialId === trial.id)) rows.push(line(
-    record.resultsReviewedAt ? 'Набор проверен человеком. Для этого диалога отдельной заметки нет; n — добавить.'
-      : 'Для этого диалога отдельной заметки нет. Нажмите n, чтобы добавить вердикт и пояснение.', 'muted'));
+    record.resultsReviewedAt ? 'Набор проверен человеком, но у этого диалога вердикта нет: p — пройдено, n — не пройдено, v — подробно.'
+      : 'Вердикта человека нет. p — пройдено, n — не пройдено, v — подробно с пояснением.', 'muted'));
   rows.push(line(''), line('ДИАЛОГ И ИНСТРУМЕНТЫ', 'accent'));
   const roles = { user: 'ПОЛЬЗОВАТЕЛЬ', assistant: 'АГЕНТ', simulator: 'СИМУЛЯТОР', tool_call: 'ВЫЗОВ', tool_result: 'РЕЗУЛЬТАТ', error: 'ОШИБКА' };
   for (const event of trial.events) {
@@ -113,29 +125,9 @@ function trialLines(trial: Trial, record: Experiment, expanded: boolean): Line[]
 }
 
 const confidenceLabels: Record<string, string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
-/** Structured verdict notes rendered in the owner's language; unknown codes fall back to the core text. */
-function noteText(note: VerdictNote): string {
-  switch (note.code) {
-    case 'none_graded': return 'Диалогов с оценкой ещё нет.';
-    case 'rubric_only': return 'Только оценки модели по рубрикам, объективных проверок нет: кодом ничего не подтверждено.';
-    case 'few_graded': return `Оценено только ${note.count} диалог(ов), этого мало для вывода.`;
-    case 'invalid': return `${note.count} диалог(ов) не удалось измерить (невалидны).`;
-    case 'all_synthetic': return 'Все карточки синтетические: нет ни golden set, ни реальных диалогов.';
-    case 'simulator_flagged': return `Модель отметила ${note.count} диалог(ов), где симулированный пользователь мог выйти из роли.`;
-    case 'no_human': return 'Ни одного человеческого вердикта: оценки модели не проверены.';
-    case 'no_decisive_verdicts': return 'Все вердикты человека пока «неясно» или «невалидно»: ничего не подтверждено и не опровергнуто.';
-    case 'not_finalized': return 'Аудит результатов человеком не завершён.';
-    case 'unreviewed_failures': return `${note.count} провалившихся диалог(ов) без вердикта человека.`;
-    case 'undecided_failures': return `${note.count} провалившихся диалог(ов) только с вердиктами «неясно» или «невалидно».`;
-    case 'approve_and_run': return 'Утвердите карточки и запустите диалоги.';
-    case 'add_real_data': return 'Добавьте golden set или реальные диалоги, чтобы результат не держался только на синтетике.';
-    case 'record_verdicts': return `Откройте ${note.count} провалившихся диалог(ов) без решающего вердикта (пройдено или не пройдено) и поставьте свои.`;
-    case 'connect_agent': return 'Подключите своего агента (http или module), чтобы проверять то, что реально работает.';
-    case 'fix_weakest': return `Начните с самого слабого места: ${note.detail} (${note.count} провал(ов)).`;
-    case 'run_more': return `Прогоните больше карточек или повторов: ${note.count} диалог(ов) это маленькая выборка.`;
-    default: return note.text;
-  }
-}
+/** Verdict wording comes from the record itself, so the board, the report and the CLI never disagree. */
+const noteText = (note: VerdictNote): string => note.text;
+
 /** The simple layer: what passed, where it is weak, how much to trust it, what to do next. Research statistics live in section 4. */
 function verdictLines(record: Experiment): Line[] {
   const v = verdictSummary(record);
@@ -226,7 +218,10 @@ export class LabBoard implements Component {
   private finish(action: BoardAction) { this.dispose(); this.done(action); }
   private items() {
     if (!this.record) return (this.options.records ?? []).map(r => `${phases[r.phase] ?? r.phase} · ${r.task}`);
-    if (this.section === 'results') return this.record.trials.map(t => `${verdicts[t.outcome]}${this.record!.workflow !== 'evaluate' ? ` · v${t.revisionId.slice(0, 8)}` : ''} · ${this.record!.scenarios.find(s => s.id === t.scenarioId)?.title ?? t.scenarioId} · #${t.repeat + 1}`);
+    if (this.section === 'results') {
+      const pending = awaitingVerdict(this.record);
+      return reviewOrder(this.record).map(t => `${pending.has(t.id) ? '● ' : ''}${verdicts[t.outcome]}${this.record!.workflow !== 'evaluate' ? ` · v${t.revisionId.slice(0, 8)}` : ''} · ${this.record!.scenarios.find(s => s.id === t.scenarioId)?.title ?? t.scenarioId} · #${t.repeat + 1}`);
+    }
     if (this.section === 'cards') return this.record.scenarios.map(s => s.title);
     return [];
   }
@@ -239,10 +234,16 @@ export class LabBoard implements Component {
       const section = key('1') ? 'agent' : key('2') ? 'cards' : key('3') ? 'results' : key('4') ? 'stats' : undefined;
       if (section) { this.section = section; this.selected = 0; this.scroll = 0; }
       const editable = this.record.workflow === 'evaluate' && this.record.phase === 'review';
+      const reviewable = this.record.workflow === 'evaluate' && this.section === 'results'
+        && ['results_review', 'complete'].includes(this.record.phase) && this.record.trials.length > 0;
+      // One key, one verdict on the whole dialogue: the common case must not cost three screens.
+      if (reviewable && (key('p') || key('n'))) {
+        return this.finish({ type: 'verdict', verdict: key('p') ? 'pass' : 'fail', record: this.record, section: this.section, selected: this.selected });
+      }
       const type = key('e') && editable ? 'edit'
         : key('s') && editable ? 'settings'
         : key('r') && editable && !this.record.questions.length ? 'run'
-        : key('n') && this.record.workflow === 'evaluate' && this.section === 'results' && ['results_review', 'complete'].includes(this.record.phase) && this.record.trials.length ? 'annotate'
+        : key('v') && reviewable ? 'annotate'
         : key('f') && this.record.phase === 'results_review' ? 'finalize'
         : key('x') ? 'export'
         : key('c') && activePhases.has(this.record.phase) ? 'cancel' : undefined;
@@ -278,6 +279,13 @@ export class LabBoard implements Component {
       header.push(line(`${phases[record.phase] ?? record.phase} · ${record.mode === 'demo' ? 'СЦЕНАРНЫЙ ДЕМО' : 'LIVE'} · ${record.id}`, activePhases.has(record.phase) ? 'accent' : 'warning'));
       header.push(line([['agent', '1 Агент'], ['cards', `2 Карточки (${record.scenarios.length})`], ['results', `3 Диалоги (${record.trials.length})`], ['stats', '4 Статистика']]
         .map(([id, label]) => this.section === id ? `[${label}]` : label).join('   '), 'muted'));
+      if (this.section === 'results' && record.trials.length) {
+        const pending = awaitingVerdict(record).size;
+        const failures = record.trials.filter(t => t.outcome === 'fail').length;
+        header.push(line(pending
+          ? `Разбор: осталось ${pending} провал(ов) из ${failures}. Отмечены точкой.`
+          : failures ? `Разбор: все ${failures} провал(ов) разобраны.` : 'Разбор: провалов нет.', pending ? 'warning' : 'success'));
+      }
       header.push(line(`${record.trials.some(t => t.outcome === 'pass' || t.outcome === 'fail') && !activePhases.has(record.phase) ? verdictHeadline(record) : record.message}${this.loadError ? ` · ${this.loadError}` : ''}`));
     } else header.push(line('Выберите эксперимент. Новую задачу и материалы дайте Pi в разговоре.', 'muted'));
     const items = this.items();
@@ -297,7 +305,7 @@ export class LabBoard implements Component {
       const scenario = record.scenarios[this.selected];
       detail = scenario ? scenarioLines(scenario, record, this.expanded) : [line('Карточки появятся после подготовки.', 'muted')];
     } else if (this.section === 'results') {
-      const trial = record.trials[this.selected];
+      const trial = reviewOrder(record)[this.selected];
       detail = trial ? trialLines(trial, record, this.expanded) : [line('Диалогов ещё нет.', 'text', true), line('Сначала проверьте карточки, агента и лимиты. Затем нажмите r для запуска.')];
     } else if (this.section === 'stats') {
       detail = statsLines(record);
@@ -325,8 +333,8 @@ export class LabBoard implements Component {
       record.workflow !== 'evaluate' ? 'Сравнительный эксперимент · только просмотр и экспорт'
         : record.phase === 'review' ? `e Править · s Лимиты · ${record.questions.length ? 'Запуск: нужны уточнения' : 'r Проверить и запустить'}`
         : activePhases.has(record.phase) ? 'c Остановить · обновляется автоматически'
-        : record.phase === 'results_review' ? 'n Вердикт человека · f Завершить аудит'
-        : record.phase === 'complete' ? 'n Добавить вердикт · результат сохранён' : 'Результат сохранён',
+        : record.phase === 'results_review' ? 'p Пройдено · n Не пройдено · v Подробный вердикт · f Завершить аудит'
+        : record.phase === 'complete' ? 'p Пройдено · n Не пройдено · v Подробный вердикт · результат сохранён' : 'Результат сохранён',
       inner < 80 ? '↑↓ Выбор · ←→ Текст · Enter Детали · x Экспорт · Esc Назад'
         : `↑↓ Выбор · PgUp/PgDn Текст · Enter ${this.expanded ? 'Свернуть' : 'Подробнее'} · x Экспорт · Esc Назад`,
     ] : ['↑↓ Выбор · Enter Открыть · Esc Закрыть'];

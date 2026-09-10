@@ -36,19 +36,19 @@ test('headless model tools prepare and edit only; approvals and human assessment
     assert.equal(report.phase, 'review'); assert.equal(report.workflow, 'evaluate');
     assert.equal(report.reviewMode, null); assert.equal(report.trialCount, 0);
     assert.equal(report.comparison, undefined); assert.equal(report.scenarioCount, 2);
-    assert.ok(updates.length >= 1); assert.match(report.nextStep, /human|Human/);
+    assert.ok(updates.length >= 1); assert.match(report.nextStep, /Человеку/);
     const evidence = JSON.parse(await readFile(report.artifacts.evidence, 'utf8'));
     assert.equal(evidence.settings.repeats, 1); assert.equal(evidence.trials.length, 0);
     assert.equal(evidence.controlConsumedAt, null);
     assert.deepEqual(JSON.parse(await readFile(report.artifacts.agent, 'utf8')), evidence.revisions[0].spec);
-    assert.match(await readFile(report.artifacts.report, 'utf8'), /Draft review: pending/);
+    assert.match(await readFile(report.artifacts.report, 'utf8'), /Проверка карточек: ожидается/);
     const inspect = output(await tools.get('agent_lab_inspect')!.execute('inspect-1', { id: report.id }, undefined, undefined, ctx));
     assert.equal(inspect.scenarios.length, 2); assert.equal(inspect.draftHash, report.draftHash);
     const scenarios = inspect.scenarios;
     scenarios[0].user.persona = 'Пользователь отредактирован в черновике';
     const edited = output(await tools.get('agent_lab_edit')!.execute('edit-1', { id: report.id, expectedHash: report.draftHash, patch: { scenarios } }, undefined, undefined, ctx));
     assert.notEqual(edited.draftHash, report.draftHash); assert.equal(edited.reviewMode, null); assert.equal(edited.trialCount, 0);
-    await assert.rejects(tools.get('agent_lab_edit')!.execute('edit-stale', { id: report.id, expectedHash: report.draftHash, patch: { settings: { repeats: 2 } } }, undefined, undefined, ctx), /changed/);
+    await assert.rejects(tools.get('agent_lab_edit')!.execute('edit-stale', { id: report.id, expectedHash: report.draftHash, patch: { settings: { repeats: 2 } } }, undefined, undefined, ctx), /изменился/);
     await assert.rejects(tools.get('agent_lab_edit')!.execute('edit-approval', { id: report.id, expectedHash: edited.draftHash, patch: { approved: true, reviewMode: 'human' } }, undefined, undefined, ctx));
     await assert.rejects(command(report.id, ctx as ExtensionCommandContext), /native Pi terminal/);
     const unchanged = JSON.parse(await readFile(report.artifacts.evidence, 'utf8'));
@@ -67,7 +67,7 @@ test('native command demo fixture requires two separate confirmations and preser
     const confirmations: string[] = [];
     let screen = 0;
     let selection = 0;
-    const keys = ['r', 'r', 'n', 'f', 'f', 'q'];
+    const keys = ['r', 'r', 'v', 'f', 'f', 'q'];
     ctx.ui = {
       custom: (factory: (tui: unknown, theme: unknown, keys: unknown, done: (value: unknown) => void) => Component & { dispose?(): void }) => new Promise((resolve, reject) => {
         let component: Component & { dispose?(): void };
@@ -112,7 +112,7 @@ test('native command demo fixture requires two separate confirmations and preser
     assert.deepEqual(trial.assessments, evidence.trials[0].assessments);
     const exported = output(await tools.get('agent_lab_inspect')!.execute('export-reviewed', { id: report.id, export: true }, undefined, undefined, ctx));
     const markdown = await readFile(exported.artifacts.report, 'utf8');
-    assert.match(markdown, /Scripted demo assessment/); assert.doesNotMatch(markdown, /Model estimate/);
+    assert.match(markdown, /Сценарная оценка демо/); assert.doesNotMatch(markdown, /Оценка модели/);
     await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
   } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -180,8 +180,8 @@ test('build accepts an external module target, real dialogues and golden cases; 
     assert.equal(inspect.evidence.fidelity.realDialogues, 1);
     assert.equal(inspect.scenarios.filter((s: { provenance: string }) => s.provenance === 'curated').length, 1);
     const markdown = await readFile(inspect.artifacts.report, 'utf8');
-    assert.match(markdown, /Observed result/); assert.match(markdown, /User modes/); assert.match(markdown, /Judge calibration/); assert.match(markdown, /Simulator fidelity/);
-    assert.match(markdown, /module/);
+    assert.match(markdown, /Наблюдаемый результат/); assert.match(markdown, /Режимы пользователя/); assert.match(markdown, /Калибровка судьи/); assert.match(markdown, /Верность симулятора/);
+    assert.match(markdown, /Испытуемый: модуль/);
     await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
   } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -194,16 +194,16 @@ test('the plain verdict leads every surface and the thorough preset widens the r
     const quick = output(await tools.get('agent_lab_build')!.execute('build-quick', { mode: 'demo', scenarioCount: 1, notes: 'Users rarely know their ID.' }, undefined, undefined, ctx));
     assert.equal(quick.phase, 'review');
     assert.deepEqual(quick.evidence.verdict.provenance.synthetic.cards, 1);
-    assert.match(quick.evidence.verdict.headline, /No graded dialogues/);
+    assert.match(quick.evidence.verdict.headline, /Диалогов с оценкой ещё нет/);
     assert.ok(quick.evidence.verdict.nextSteps.length >= 1);
     const thorough = output(await tools.get('agent_lab_build')!.execute('build-thorough', { mode: 'demo', scenarioCount: 1, preset: 'thorough' }, undefined, undefined, ctx));
     const evidence = JSON.parse(await readFile(thorough.artifacts.evidence, 'utf8'));
     assert.deepEqual(evidence.settings.userModes, ['static', 'scripted', 'reactive']);
     assert.equal(evidence.settings.repeats, 2);
     const markdown = await readFile(thorough.artifacts.report, 'utf8');
-    assert.ok(markdown.indexOf('## Verdict') < markdown.indexOf('## Observed result'));
-    assert.match(markdown, /Confidence: low/);
-    assert.match(markdown, /Cards: 1 synthetic, 0 curated, 0 production/);
+    assert.ok(markdown.indexOf('## Итог') < markdown.indexOf('## Наблюдаемый результат'));
+    assert.match(markdown, /Доверие: низкое/);
+    assert.match(markdown, /Карточки: синтетических 1, golden 0, из продакшна 0/);
     await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
   } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
 });

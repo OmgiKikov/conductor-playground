@@ -57,6 +57,14 @@ function freshReadEvidence(events: TraceEvent[]): { passed: boolean; evidence: s
   };
 }
 
+/** Where a failed dialogue broke, in the owner's words. */
+const stages: Record<string, string> = {
+  'target session': 'открытие сессии с испытуемым',
+  'target response': 'ответ испытуемого',
+  'user simulation': 'реплика симулированного пользователя',
+  assessment: 'оценка по рубрикам',
+};
+
 function grade(scenario: Scenario, trial: Trial): CheckResult[] {
   const answers = trial.events.filter(e => e.type === 'assistant').map(e => e.text ?? '').join('\n').toLocaleLowerCase();
   return scenario.checks.map(check => {
@@ -119,7 +127,7 @@ export async function evaluateTrial(input: {
     emit({ type: role, text: content });
   };
   let session: TargetSession | undefined;
-  let stage = 'target initialization';
+  let stage = 'target session';
   let stopped = false;
   let finalUserReply = false;
   let reportedState = false;
@@ -141,7 +149,7 @@ export async function evaluateTrial(input: {
       ctx.signal.throwIfAborted();
       if (typeof response !== 'string') throw new Error('Target returned a non-text response');
       append('assistant', response);
-      if (!response.trim()) { trial.reason = 'Target produced an empty response'; break; }
+      if (!response.trim()) { trial.reason = 'Испытуемый вернул пустой ответ.'; break; }
       if (userMode === 'static' || finalUserReply || (scenario.user.maxFollowUps !== undefined && turn >= scenario.user.maxFollowUps)) { stopped = true; break; }
       if (userMode === 'scripted') {
         const next = scenario.user.script?.[turn];
@@ -163,21 +171,26 @@ export async function evaluateTrial(input: {
     trial.checks = grade(scenario, trial);
     const allPassed = trial.checks.length > 0 && trial.checks.every(check => check.passed);
     trial.outcome = !stopped ? 'fail' : trial.checks.length === 0 ? 'ungraded' : allPassed ? 'pass' : 'fail';
-    trial.reason ||= !stopped ? 'Conversation did not complete within the target turn limit' : trial.checks.length === 0
-      ? 'Dialogue completed without objective checks; rubric assessments are separate' : allPassed ? 'All objective checks passed' : 'One or more objective checks failed';
-    if (target.kind !== 'sandbox') trial.reason += reportedState ? '; state was reported by the external agent harness, not observed by trusted code' : '; external state was not reported';
+    trial.reason ||= !stopped ? 'Разговор не завершился в отведённое число реплик.' : trial.checks.length === 0
+      ? 'Диалог дошёл до конца, но объективных проверок в карточке нет: оценки по рубрикам считаются отдельно.'
+      : allPassed ? 'Все объективные проверки пройдены.' : 'Часть объективных проверок провалена.';
+    if (target.kind !== 'sandbox') {
+      trial.reason += reportedState
+        ? ' Состояние сообщил сам агент, доверенный код его не наблюдал.'
+        : ' Состояние внешний агент не сообщил.';
+    }
   } catch (error) {
     if (persistenceFailed) throw persistenceError;
     trial.outcome = ctx.signal.aborted ? 'cancelled' : 'invalid';
-    trial.reason = ctx.signal.aborted ? 'Trial cancelled' : `${stage}: ${error instanceof Error ? error.message : 'Unknown failure'}`;
+    trial.reason = ctx.signal.aborted ? 'Диалог остановлен.' : `${stages[stage] ?? stage}: ${error instanceof Error ? error.message : 'неизвестный сбой'}`;
     emit({ type: 'error', text: trial.reason });
   } finally {
     try { await session?.close(); }
     catch {
       emit({ type: 'error', text: 'Target session cleanup failed' });
-      if (trial.outcome !== 'cancelled') { trial.outcome = 'invalid'; trial.reason = 'Target session cleanup failed'; }
+      if (trial.outcome !== 'cancelled') { trial.outcome = 'invalid'; trial.reason = 'Не удалось корректно закрыть сессию испытуемого.'; }
     }
-    if (ctx.signal.aborted) { trial.outcome = 'cancelled'; trial.reason = 'Trial cancelled'; }
+    if (ctx.signal.aborted) { trial.outcome = 'cancelled'; trial.reason = 'Диалог остановлен.'; }
     trial.finalState = structuredClone(state);
     trial.elapsedMs = Math.round(performance.now() - started);
     if (persistenceFailed) throw persistenceError;

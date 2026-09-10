@@ -8,7 +8,17 @@ import { ExperimentLab, draftHash, resultHash } from '../dist/experiment.js';
 import { agentSchema, createInputSchema, dialogueSchema, draftPatchSchema, goldenCaseSchema, ownerProfileSchema, settingsSchema, targetSchema, type DraftPatch, type Experiment, type HumanReviewInput } from '../dist/contracts.js';
 import { evidenceSummary } from '../dist/comparison.js';
 import { demoInput } from '../dist/demo.js';
-import { activePhases, safeText, showBoard, verdicts, type BoardAction } from './cards.ts';
+import { activePhases, reviewOrder, safeText, showBoard, verdicts, type BoardAction } from './cards.ts';
+
+const confidenceWord: Record<string, string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
+const outcomeWord: Record<string, string> = {
+  pass: 'пройден', fail: 'не пройден', ungraded: 'без объективной оценки', invalid: 'невалиден', cancelled: 'остановлен',
+};
+const verdictWord: Record<string, string> = { pass: 'пройдено', fail: 'не пройдено', unknown: 'неясно', invalid: 'невалидно' };
+const fidelityNames: Record<string, string> = {
+  userTurns: 'реплик пользователя на диалог', userMessageLength: 'длина реплики, символов',
+  questionRate: 'доля реплик с вопросом', disengagementRate: 'доля ушедших пользователей',
+};
 
 function summary(record: Experiment, directory: string) {
   const comparison = record.comparisons.findLast(c => c.split === 'control');
@@ -28,8 +38,8 @@ function summary(record: Experiment, directory: string) {
       scenarioFamilies: comparison.families, delta: comparison.delta, interval: comparison.interval, reasons: comparison.reasons,
     },
     limitations: record.limitations,
-    nextStep: record.phase === 'review' ? 'Human: open /agent-lab to review cards, edit the draft and approve its exact version.'
-      : record.phase === 'results_review' ? 'Human: open /agent-lab to inspect dialogues and audit model assessments.' : undefined,
+    nextStep: record.phase === 'review' ? 'Человеку: откройте /agent-lab, проверьте карточки, поправьте черновик и подтвердите его точную версию.'
+      : record.phase === 'results_review' ? 'Человеку: откройте /agent-lab, разберите диалоги и поставьте вердикты по провалам.' : undefined,
     artifacts: { evidence: resolve(directory, `${record.id}.json`),
       ...(record.trials.length ? { traceJournal: resolve(directory, `${record.id}.trace.jsonl`) } : {}) },
   };
@@ -37,34 +47,34 @@ function summary(record: Experiment, directory: string) {
 
 function evidenceSection(record: Experiment): string[] {
   const e = evidenceSummary(record);
-  const pct = (v: number | null) => v === null ? 'n/a' : `${Math.round(v * 100)}%`;
-  const num = (v: number | null) => v === null ? 'n/a' : v.toFixed(2);
-  const target = record.target.kind === 'http' ? `http ${safeText(record.target.url)}` : record.target.kind === 'module' ? `module ${safeText(record.target.path)}`
-    : record.target.kind === 'command' ? `command ${safeText([record.target.command, ...record.target.args].join(' '))}` : 'sandbox (trusted record tools)';
+  const pct = (v: number | null) => v === null ? 'нет данных' : `${Math.round(v * 100)}%`;
+  const num = (v: number | null) => v === null ? 'нет данных' : v.toFixed(2);
+  const target = record.target.kind === 'http' ? `http ${safeText(record.target.url)}` : record.target.kind === 'module' ? `модуль ${safeText(record.target.path)}`
+    : record.target.kind === 'command' ? `процесс ${safeText([record.target.command, ...record.target.args].join(' '))}` : 'песочница (доверенные инструменты записи)';
   const v = e.verdict;
   return [
-    '## Verdict', '',
+    '## Итог', '',
     safeText(v.headline), '',
-    `Cards: ${v.provenance.synthetic.cards} synthetic, ${v.provenance.curated.cards} curated, ${v.provenance.production.cards} production.`,
-    ...(v.rubric.assessed ? [`${record.mode === 'demo' ? 'Scripted demo rubric estimates' : 'Model rubric estimates'} (unverified): ${v.rubric.passed} of ${v.rubric.assessed} dialogues passed all agent rubrics; ${v.rubric.failed} failed, ${v.rubric.unknown} unknown.`] : []),
-    `Weak spots: ${v.weakSpots.length ? v.weakSpots.map(w => `${safeText(w.description)} (${w.failures})`).join('; ') : 'none found'}.`,
-    `Confidence: ${v.confidence}. ${v.confidenceReasons.map(r => safeText(r.text)).join(' ')}`, '',
-    'Next steps:', ...v.nextSteps.map(step => `- ${safeText(step.text)}`), '',
-    `Target: ${target}. Real dialogues: ${record.dialogues.length}. Golden cases: ${record.goldenCases.length}. Profiles: ${record.profiles.length} (${record.profiles.filter(p => p.source === 'owner').length} owner-written). User modes: ${record.settings.userModes.join(', ')}.`, '',
-    '## Observed result', '',
-    ...(e.comparison ? [safeText(e.comparison.observed), safeText(e.comparison.status)] : ['No baseline/candidate comparison in this workflow. Per-mode pass rates below are observations on the approved cards, not confirmed improvements.']), '',
-    '## User modes', '', '| Mode | Passed / valid | Trials | Avg user turns | Calls | Cost | Failures only this mode found |', '|---|---|---|---|---|---|---|',
-    ...e.modes.map(m => `| ${m.userMode} | ${m.passed} / ${m.valid} (${pct(m.passRate)}) | ${m.trials} | ${num(m.avgUserTurns)} | ${m.calls} | ${m.costUsd === null ? 'unknown' : `$${m.costUsd.toFixed(4)}`} | ${m.uniqueFailedChecks.map(safeText).join(', ') || 'none'} |`), '',
-    '## Judge calibration', '', 'Positive class is "fail". TPR: human-confirmed failures the judge also flagged. TNR: human-confirmed passes the judge also passed.', '',
-    '| Key | Subject | n | TPR | TNR | Agreement | Enough data |', '|---|---|---|---|---|---|---|',
-    ...e.calibration.map(c => `| ${safeText(c.key)} | ${c.subject} | ${c.n} | ${pct(c.tpr)} | ${pct(c.tnr)} | ${pct(c.agreement)} | ${c.sufficient ? 'yes' : 'no (n<60)'} |`), '',
-    '## Simulator fidelity', '',
+    `Карточки: синтетических ${v.provenance.synthetic.cards}, golden ${v.provenance.curated.cards}, из продакшна ${v.provenance.production.cards}.`,
+    ...(v.rubric.assessed ? [`${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} по рубрикам (не проверена): ${v.rubric.passed} из ${v.rubric.assessed} диалогов без замечаний; провалов ${v.rubric.failed}, неясно ${v.rubric.unknown}.`] : []),
+    `Слабые места: ${v.weakSpots.length ? v.weakSpots.map(w => `${safeText(w.description)} (${w.failures})`).join('; ') : 'не выявлены'}.`,
+    `Доверие: ${confidenceWord[v.confidence]}. ${v.confidenceReasons.map(r => safeText(r.text)).join(' ')}`, '',
+    'Что дальше:', ...v.nextSteps.map(step => `- ${safeText(step.text)}`), '',
+    `Испытуемый: ${target}. Реальных диалогов: ${record.dialogues.length}. Golden-кейсов: ${record.goldenCases.length}. Профилей: ${record.profiles.length} (написано владельцем: ${record.profiles.filter(p => p.source === 'owner').length}). Режимы пользователя: ${record.settings.userModes.join(', ')}.`, '',
+    '## Наблюдаемый результат', '',
+    ...(e.comparison ? [safeText(e.comparison.observed), safeText(e.comparison.status)] : ['Сравнения версий в этом прогоне не было. Доли пройденных ниже — наблюдения на утверждённых карточках, а не доказанное улучшение.']), '',
+    '## Режимы пользователя', '', '| Режим | Пройдено / валидных | Диалогов | Реплик в среднем | Вызовов | Стоимость | Провалы, найденные только здесь |', '|---|---|---|---|---|---|---|',
+    ...e.modes.map(m => `| ${m.userMode} | ${m.passed} / ${m.valid} (${pct(m.passRate)}) | ${m.trials} | ${num(m.avgUserTurns)} | ${m.calls} | ${m.costUsd === null ? 'неизвестна' : `$${m.costUsd.toFixed(4)}`} | ${m.uniqueFailedChecks.map(safeText).join(', ') || 'нет'} |`), '',
+    '## Калибровка судьи', '', 'Положительный класс — «не пройдено». TPR: доля подтверждённых человеком провалов, которые судья тоже отметил. TNR: доля подтверждённых человеком прохождений, которые судья тоже пропустил.', '',
+    '| Что оценивалось | Сторона | n | TPR | TNR | Согласие | Данных хватает |', '|---|---|---|---|---|---|---|',
+    ...e.calibration.map(c => `| ${safeText(c.key)} | ${c.subject === 'simulator' ? 'симулятор' : 'агент'} | ${c.n} | ${pct(c.tpr)} | ${pct(c.tnr)} | ${pct(c.agreement)} | ${c.sufficient ? 'да' : 'нет (n<60)'} |`), '',
+    '## Верность симулятора', '',
     ...(e.fidelity ? [
-      `Real dialogues: ${e.fidelity.realDialogues}. Reactive simulated dialogues: ${e.fidelity.simulatedDialogues}. Human fidelity verdicts: ${e.fidelity.humanFidelity.passed} of ${e.fidelity.humanFidelity.reviewed} passed.`, '',
-      '| Metric | Real | Simulated | Gap |', '|---|---|---|---|',
-      ...e.fidelity.metrics.map(m => `| ${m.metric} | ${num(m.real)} | ${num(m.simulated)} | ${m.gap === null ? 'n/a' : m.gap.toFixed(2)} |`),
-    ] : ['No real dialogues supplied; fidelity cannot be estimated.']), '',
-    '## Evidence limits', '', ...e.notes.map(n => `- ${safeText(n)}`), '',
+      `Реальных диалогов: ${e.fidelity.realDialogues}. Реактивных симуляций: ${e.fidelity.simulatedDialogues}. Вердикты человека о верности: ${e.fidelity.humanFidelity.passed} из ${e.fidelity.humanFidelity.reviewed} пройдено.`, '',
+      '| Показатель | Реальные | Симуляция | Разрыв |', '|---|---|---|---|',
+      ...e.fidelity.metrics.map(m => `| ${fidelityNames[m.metric] ?? m.metric} | ${num(m.real)} | ${num(m.simulated)} | ${m.gap === null ? 'нет данных' : m.gap.toFixed(2)} |`),
+    ] : ['Реальные диалоги не загружены, верность симулятора оценить нечем.']), '',
+    '## Границы доказательств', '', ...e.notes.map(n => `- ${safeText(n)}`), '',
   ];
 }
 
@@ -77,23 +87,23 @@ async function exportArtifacts(record: Experiment, directory: string) {
   const agent = selected ? resolve(exportDir, `${stem}.agent.json`) : undefined;
   const text = [
     `# Agent Lab: ${record.id}`, '', safeText(record.task), '',
-    `Phase: ${record.phase}. Mode: ${record.mode}. Workflow: ${record.workflow ?? 'compare'}.`,
-    `Draft review: ${record.reviewMode ?? 'pending'}. Result review: ${record.resultsReviewedAt ?? 'pending'}.`, '',
+    `Фаза: ${record.phase}. Режим: ${record.mode === 'demo' ? 'сценарное демо' : 'живой прогон'}. Рабочий процесс: ${record.workflow ?? 'compare'}.`,
+    `Проверка карточек: ${record.reviewMode === 'human' ? 'человеком' : record.reviewMode === 'automated' ? 'автоматическая' : 'ожидается'}. Аудит результатов: ${record.resultsReviewedAt ?? 'не завершён'}.`, '',
     safeText(record.message), '',
-    `Scenarios: ${record.scenarios.length}. Trials: ${record.trials.length}. Human annotations: ${record.humanReviews?.length ?? 0}.`,
-    `${record.mode === 'demo' ? 'Scripted role calls' : 'Model calls'}: ${record.usage.calls}. Observed cost: ${record.usage.costUsd === null ? 'unknown' : `$${record.usage.costUsd.toFixed(4)}`}.`, '',
+    `Карточек: ${record.scenarios.length}. Диалогов: ${record.trials.length}. Вердиктов человека: ${record.humanReviews?.length ?? 0}.`,
+    `${record.mode === 'demo' ? 'Сценарных вызовов' : 'Вызовов модели'}: ${record.usage.calls}. Наблюдаемая стоимость: ${record.usage.costUsd === null ? 'неизвестна' : `$${record.usage.costUsd.toFixed(4)}`}.`, '',
     ...evidenceSection(record),
     ...record.trials.flatMap(t => [
       `## ${t.id} · ${safeText(record.scenarios.find(s => s.id === t.scenarioId)?.title ?? t.scenarioId)}`, '',
-      `Objective outcome: ${t.outcome}. ${safeText(t.reason)}`,
-      ...t.checks.map(c => `- ${c.passed ? 'PASS' : 'FAIL'} ${safeText(c.description)}: ${safeText(c.evidence)}`),
-      ...(t.assessments ?? []).map(a => `- ${record.mode === 'demo' ? 'Scripted demo assessment' : 'Model estimate'} [${a.metricId}]: ${a.result}. ${safeText(a.rationale)}. Evidence: ${a.evidence.map(n => `#${n}`).join(', ') || 'none'}`),
-      ...(t.assessmentError ? [`- Assessment error: ${safeText(t.assessmentError)}`] : []),
-      ...(record.humanReviews ?? []).filter(r => r.trialId === t.id).map(r => `- Human [${r.metricId ?? r.checkId ?? 'dialogue'}]: ${r.verdict}. ${safeText(r.note)}`), '',
+      `Объективный исход: ${outcomeWord[t.outcome] ?? t.outcome}. ${safeText(t.reason)}`,
+      ...t.checks.map(c => `- ${c.passed ? 'ПРОЙДЕНА' : 'ПРОВАЛЕНА'} ${safeText(c.description)}: ${safeText(c.evidence)}`),
+      ...(t.assessments ?? []).map(a => `- ${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} [${a.metricId}]: ${verdictWord[a.result] ?? a.result}. ${safeText(a.rationale)}. Основания: ${a.evidence.map(n => `#${n}`).join(', ') || 'не указаны'}`),
+      ...(t.assessmentError ? [`- Ошибка оценщика: ${safeText(t.assessmentError)}`] : []),
+      ...(record.humanReviews ?? []).filter(r => r.trialId === t.id).map(r => `- Человек [${r.metricId ?? r.checkId ?? 'весь диалог'}]: ${verdictWord[r.verdict] ?? r.verdict}. ${safeText(r.note)}`), '',
     ]),
     ...record.limitations.map(v => `- ${safeText(v)}`), '',
-    'Full transcripts, states and original assessments are in the evidence JSON and trace journal.',
-    'The exported AgentSpec is a configuration for this trusted record sandbox; it is not a separately installed production agent.', '',
+    'Полные трассы, состояния и исходные оценки лежат в JSON доказательств и журнале трасс.',
+    'Экспортированный AgentSpec — конфигурация песочного агента, а не отдельно установленный продовый агент.', '',
   ].join('\n');
   await writeFile(report, text, { mode: 0o600, flag: 'wx' });
   if (agent && selected) await writeFile(agent, JSON.stringify(selected, null, 2), { mode: 0o600, flag: 'wx' });
@@ -162,7 +172,7 @@ async function editDraft(ctx: ExtensionContext, action: Extract<BoardAction, { r
 }
 
 async function humanAnnotation(ctx: ExtensionContext, record: Experiment, selected: number): Promise<HumanReviewInput | undefined> {
-  const trial = record.trials[selected];
+  const trial = reviewOrder(record)[selected];
   if (!trial) return;
   const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
   const targets = [
@@ -333,6 +343,13 @@ export default function agentLab(pi: ExtensionAPI) {
               }
             } else if (action.type === 'cancel') {
               await lab.cancel(action.record.id); await lab.waitForIdle();
+            } else if (action.type === 'verdict') {
+              const trial = reviewOrder(action.record)[action.selected];
+              if (!trial) throw new Error('Диалог не выбран.');
+              await lab.addHumanReview(action.record.id, {
+                trialId: trial.id, verdict: action.verdict,
+                note: `Быстрый вердикт с доски, без пояснения. Первый провал в диалоге: ${safeText(trial.checks.find((c: { passed: boolean }) => !c.passed)?.description ?? trial.reason).slice(0, 200)}`,
+              });
             } else if (action.type === 'annotate') {
               const review = await humanAnnotation(ctx, action.record, action.selected);
               if (review) await lab.addHumanReview(action.record.id, review);

@@ -200,12 +200,12 @@ test('simulator protocol/provider errors are invalid; exhausting target turns is
   const malformed = { ...f.runtime, async userTurn() { return { message: '', done: false }; } };
   const invalid = await f.evaluate(legacy, f.candidate, malformed);
   assert.equal(invalid.outcome, 'invalid');
-  assert.match(invalid.reason, /user simulation/);
+  assert.match(invalid.reason, /реплика симулированного пользователя/);
   const failed = await f.evaluate(legacy, f.candidate, { ...f.runtime, async userTurn() { throw new Error('Provider offline'); } });
   assert.equal(failed.outcome, 'invalid');
   const neverDone = await f.evaluate(legacy, f.candidate, { ...f.runtime, async userTurn() { return { message: 'Please confirm again.', done: false }; } });
   assert.equal(neverDone.outcome, 'fail');
-  assert.match(neverDone.reason, /turn limit/);
+  assert.match(neverDone.reason, /не завершился в отведённое число реплик/);
 });
 
 test('a card follow-up budget bounds an adversarial retrying simulator without passing an unchanged task', async () => {
@@ -222,7 +222,7 @@ test('a card follow-up budget bounds an adversarial retrying simulator without p
     assert.equal(received.length, budget + 1);
     if (budget) assert.equal(received[1], 'Please retry the same change.');
     assert.equal(trial.outcome, 'fail');
-    assert.equal(trial.reason, 'One or more objective checks failed');
+    assert.equal(trial.reason, 'Часть объективных проверок провалена.');
     assert.equal(trial.finalState.records.A101!.time, '09:00');
   }
 });
@@ -514,11 +514,11 @@ test('external module targets bypass the sandbox and are graded on reported reco
   await writeFile(silent, 'export function createSession() { return { async respond() { return "Done, moved it."; } }; }\n');
   const unreported = await run(direct, silent);
   assert.equal(unreported.outcome, 'fail');
-  assert.match(unreported.reason, /external state was not reported/);
+  assert.match(unreported.reason, /Состояние внешний агент не сообщил/);
   assert.equal(unreported.finalState.records.A101!.time, '09:00');
   const broken = join(directory, 'broken.mjs');
   await writeFile(broken, 'export function createSession() { return { async respond() { throw new Error("adapter boom"); } }; }\n');
   const invalid = await run(direct, broken);
   assert.equal(invalid.outcome, 'invalid');
-  assert.match(invalid.reason, /target response: .*adapter boom/);
+  assert.match(invalid.reason, /ответ испытуемого: .*adapter boom/);
 });

@@ -40,7 +40,7 @@ test('complete experiment freezes measurement, restricts builder feedback, persi
   await lab.waitForIdle();
   const ready = await lab.get(created.id);
   assert.equal(ready.phase, 'review');
-  await assert.rejects(lab.start(ready.id, { approved: false }), /approval/);
+  await assert.rejects(lab.start(ready.id, { approved: false }), /после вашего подтверждения/);
   await lab.start(ready.id, { approved: true });
   await lab.waitForIdle();
   const result = await lab.get(ready.id);
@@ -63,7 +63,7 @@ test('complete experiment freezes measurement, restricts builder feedback, persi
   const changed = structuredClone(result);
   changed.revisions[0]!.spec.instructions += ' changed';
   assert.notEqual(measurementHash(changed), result.manifestHash);
-  await assert.rejects(lab.start(result.id, { approved: true }), /Only an experiment awaiting review/);
+  await assert.rejects(lab.start(result.id, { approved: true }), /только эксперимент, ожидающий проверки/);
 });
 
 test('candidate infrastructure failures retain the baseline and remain visible rather than becoming improvement', async t => {
@@ -124,7 +124,7 @@ test('shutdown during the initial checkpoint waits, keeps the lock, and never st
   };
   const creating = lab.create(demoInput());
   await entered.promise;
-  await assert.rejects(lab.create(demoInput()), /Another experiment/);
+  await assert.rejects(lab.create(demoInput()), /другая операция/);
   let closed = false;
   const closing = lab.close().then(() => { closed = true; });
   try {
@@ -135,7 +135,7 @@ test('shutdown during the initial checkpoint waits, keeps the lock, and never st
   await closing;
   assert.equal(calls, 0);
   assert.equal((await lab.store.get(record.id)).phase, 'cancelled');
-  await assert.rejects(lab.create(demoInput()), /not open/);
+  await assert.rejects(lab.create(demoInput()), /не открыта/);
   const next = new ExperimentStore(directory); await next.init(); await next.close();
 });
 
@@ -179,7 +179,7 @@ test('shutdown waits for in-flight initialization and cannot reopen a closed lab
   assert.equal(closed, false);
   release.resolve();
   await opening; await closing;
-  await assert.rejects(lab.create(demoInput()), /not open/);
+  await assert.rejects(lab.create(demoInput()), /не открыта/);
   await assert.rejects(lab.init(), /closing/);
   await assert.rejects(readFile(join(directory, '.lock')), { code: 'ENOENT' });
 });
@@ -213,7 +213,7 @@ test('unresolved business questions block approval until new materials produce a
   runtime.prepare = async (...args) => ({ ...await prepare(...args), questions: ['Which timezone applies?'] });
   const { lab } = await setup(t, runtime);
   const record = await lab.create(demoInput()); await lab.waitForIdle();
-  await assert.rejects(lab.start(record.id, { approved: true }), /Resolve the listed business questions/);
+  await assert.rejects(lab.start(record.id, { approved: true }), /ответьте на бизнес-вопросы/);
   assert.equal((await lab.get(record.id)).phase, 'review');
 });
 
@@ -230,30 +230,30 @@ test('one user card requires exact human approval, runs one unchanged agent, the
   assert.equal(draft.phase, 'review'); assert.equal(draft.scenarios.length, 1); assert.equal(targets, 0);
   assert.ok(draft.scenarios[0]!.user.persona); assert.ok(draft.scenarios[0]!.metrics?.length);
   const originalHash = draftHash(draft);
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'automated', expectedHash: originalHash }), /Human confirmation/);
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: 'stale' }), /Human confirmation/);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'automated', expectedHash: originalHash }), /подтверждение человека/);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: 'stale' }), /подтверждение человека/);
   const cards = structuredClone(draft.scenarios);
   cards[0]!.user.persona = 'A busy customer with one appointment';
   const edited = await lab.updateDraft(draft.id, originalHash, { scenarios: cards });
   assert.notEqual(draftHash(edited), originalHash); assert.equal(edited.reviewedAt, null);
-  await assert.rejects(lab.updateDraft(draft.id, originalHash, { scenarios: cards }), /draft changed/);
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: originalHash }), /Human confirmation/);
+  await assert.rejects(lab.updateDraft(draft.id, originalHash, { scenarios: cards }), /Черновик изменился/);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: originalHash }), /подтверждение человека/);
   await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(edited) }); await lab.waitForIdle();
   const result = await lab.get(draft.id);
   assert.equal(result.phase, 'results_review', result.error ?? ''); assert.equal(result.reviewMode, 'human');
   assert.equal(result.revisions.length, 1); assert.equal(result.comparisons.length, 0); assert.equal(improvements, 0);
   assert.equal(targets, 1); assert.equal(result.trials.length, 1); assert.ok(result.trials[0]!.assessments?.length);
   assert.equal(result.manifestHash, measurementHash(result));
-  await assert.rejects(lab.updateDraft(draft.id, draftHash(result), { scenarios: cards }), /unstarted draft/);
+  await assert.rejects(lab.updateDraft(draft.id, draftHash(result), { scenarios: cards }), /незапущенный черновик/);
   const originalTrial = structuredClone(result.trials[0]!);
   const priorResultHash = resultHash(result);
-  await assert.rejects(lab.addHumanReview(result.id, { trialId: 'missing', verdict: 'invalid', note: 'Wrong user.' }), /Trial not found/);
+  await assert.rejects(lab.addHumanReview(result.id, { trialId: 'missing', verdict: 'invalid', note: 'Wrong user.' }), /Такого диалога/);
   await assert.rejects(lab.addHumanReview(result.id, { trialId: originalTrial.id, metricId: 'missing', verdict: 'fail', note: 'Wrong metric.' }), /Metric not found/);
   const annotated = await lab.addHumanReview(result.id, {
     trialId: originalTrial.id, metricId: result.scenarios[0]!.metrics![0]!.id, verdict: 'unknown', note: 'Need the real pilot before accepting this estimate.',
   });
   assert.deepEqual(annotated.trials[0], originalTrial); assert.equal(annotated.humanReviews!.length, 1);
-  await assert.rejects(lab.reviewResults(result.id, priorResultHash), /results changed/);
+  await assert.rejects(lab.reviewResults(result.id, priorResultHash), /Результаты изменились/);
   const reviewed = await lab.reviewResults(result.id, resultHash(annotated));
   assert.equal(reviewed.phase, 'complete'); assert.ok(reviewed.resultsReviewedAt); assert.equal(reviewed.resultsReviewHash, resultHash(annotated));
   const reopened = await lab.addHumanReview(result.id, { trialId: originalTrial.id, verdict: 'pass', note: 'Checked the stored action and transcript.' });
@@ -269,7 +269,7 @@ test('closing during a draft edit keeps the writer lock until the edit checkpoin
   lab.store.save = async record => { entered.resolve(); await release.promise; await save(record); };
   const editing = lab.updateDraft(draft.id, draftHash(draft), { settings: { repeats: 1 } });
   await entered.promise;
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }), /Another experiment operation/);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }), /другая операция/);
   let closed = false; const closing = lab.close().then(() => { closed = true; });
   await assert.rejects(new ExperimentStore(directory).init(), /already open/); assert.equal(closed, false);
   release.resolve(); await editing; await closing;
@@ -294,7 +294,7 @@ test('approval reserves its draft while reading so a concurrent edit cannot be o
   const scenarios = structuredClone(draft.scenarios);
   scenarios[0]!.user.persona = 'A newer draft that has not been approved';
   try {
-    await assert.rejects(lab.updateDraft(draft.id, draftHash(draft), { scenarios }), /Another experiment operation/);
+    await assert.rejects(lab.updateDraft(draft.id, draftHash(draft), { scenarios }), /другая операция/);
   } finally { release.resolve(); }
   await starting; await lab.waitForIdle();
   const result = await lab.get(draft.id);
@@ -337,7 +337,7 @@ test('evaluation runs every user mode, skips scripted cards without a script, an
   assert.ok(result.limitations.some(l => /Scripted mode skipped/.test(l)));
   assert.ok(result.trials.filter(tr => tr.userMode === 'static').every(tr => tr.events.filter(e => e.type === 'user').length === 1));
   const compare = demoInput(); compare.settings.userModes = ['static', 'reactive'];
-  await assert.rejects(lab.create(compare), /exactly one user mode/);
+  await assert.rejects(lab.create(compare), /в одном режиме пользователя/);
 });
 
 test('golden cases and real dialogues enter the draft as curated cards and grounded profiles', async t => {

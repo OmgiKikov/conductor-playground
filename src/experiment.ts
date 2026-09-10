@@ -69,9 +69,9 @@ export class ExperimentLab {
     return records.map(r => this.active?.record.id === r.id ? structuredClone(this.active.record) : r);
   }
   private ensureIdle(ownsMutation = false): void {
-    if (this.closed) throw new Error('Experiment Lab is not open.');
+    if (this.closed) throw new Error('Лаборатория не открыта.');
     // ponytail: one active local experiment; use per-experiment workers when concurrent runs are needed.
-    if (this.active || (!ownsMutation && this.mutation)) throw new Error('Another experiment operation is active. Finish or cancel it first.');
+    if (this.active || (!ownsMutation && this.mutation)) throw new Error('Уже идёт другая операция над экспериментом. Дождитесь её или остановите.');
   }
   private async change<T>(work: () => Promise<T>): Promise<T> {
     this.ensureIdle();
@@ -82,7 +82,7 @@ export class ExperimentLab {
   async create(raw: CreateInput): Promise<Experiment> {
     this.ensureIdle();
     const input = createInputSchema.parse(raw);
-    if (input.workflow === 'compare' && input.settings.userModes.length !== 1) throw new Error('A comparison experiment runs exactly one user mode; choose static, scripted or reactive.');
+    if (input.workflow === 'compare' && input.settings.userModes.length !== 1) throw new Error('Сравнительный эксперимент идёт в одном режиме пользователя: выберите static, scripted или reactive.');
     const now = new Date().toISOString();
     const record: Experiment = {
       schemaVersion: '1', id: randomUUID(), task: input.task, mode: input.mode, createdAt: now, updatedAt: now,
@@ -110,7 +110,7 @@ export class ExperimentLab {
         for (const profile of observed) for (const id of profile.evidenceDialogueIds) if (!supplied.has(id)) throw new Error(`Profile ${profile.id} cites evidence dialogue ${id} that was not supplied`);
         record.profiles = [...record.profiles, ...observed];
       }
-      if (new Set(record.profiles.map(p => p.id)).size !== record.profiles.length) throw new Error('Profiles have duplicate IDs');
+      if (new Set(record.profiles.map(p => p.id)).size !== record.profiles.length) throw new Error('У профилей повторяются идентификаторы.');
       // Real dialogues become production cards: the goal a real user pursued, opened with their own words.
       const observedGoals = record.dialogues.length && record.profiles.length && runtime.goals
         ? await runtime.goals({ task: record.task, sources: structuredClone(record.sources), dialogues: structuredClone(record.dialogues), profiles: structuredClone(record.profiles) }, ctx)
@@ -134,8 +134,8 @@ export class ExperimentLab {
   async updateDraft(id: string, expectedHash: string, raw: DraftPatch): Promise<Experiment> {
     return this.change(async () => {
       const record = await this.store.get(id);
-      if (record.phase !== 'review') throw new Error('Only an unstarted draft can be edited. Keep completed evidence and create a new experiment.');
-      if (draftHash(record) !== expectedHash) throw new Error('The draft changed. Reopen the current cards before editing.');
+      if (record.phase !== 'review') throw new Error('Править можно только незапущенный черновик. Готовые доказательства остаются как есть, для изменений создайте новый эксперимент.');
+      if (draftHash(record) !== expectedHash) throw new Error('Черновик изменился. Откройте карточки заново, прежде чем править.');
       const patch = draftPatchSchema.parse(raw);
       const agent = patch.agent ?? record.revisions[0]?.spec;
       const scenarios = (patch.scenarios ?? record.scenarios).map(({ split: _split, ...s }) => s);
@@ -152,13 +152,13 @@ export class ExperimentLab {
   async addHumanReview(id: string, raw: HumanReviewInput): Promise<Experiment> {
     return this.change(async () => {
       const record = await this.store.get(id);
-      if (record.workflow !== 'evaluate' || !['results_review', 'complete'].includes(record.phase)) throw new Error('Human result review requires finished evaluation dialogues.');
+      if (record.workflow !== 'evaluate' || !['results_review', 'complete'].includes(record.phase)) throw new Error('Вердикты человека можно ставить только по завершённым диалогам.');
       const input = humanReviewInputSchema.parse(raw);
       const trial = record.trials.find(t => t.id === input.trialId);
-      if (!trial) throw new Error('Trial not found in this experiment.');
-      if (input.checkId && !trial.checks.some(c => c.id === input.checkId)) throw new Error('Objective check not found in this trial.');
+      if (!trial) throw new Error('Такого диалога в этом эксперименте нет.');
+      if (input.checkId && !trial.checks.some(c => c.id === input.checkId)) throw new Error('Такой объективной проверки в этом диалоге нет.');
       const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
-      if (input.metricId && !scenario?.metrics?.some(m => m.id === input.metricId)) throw new Error('Metric not found in this scenario.');
+      if (input.metricId && !scenario?.metrics?.some(m => m.id === input.metricId)) throw new Error('Такой рубрики в этой карточке нет.');
       (record.humanReviews ??= []).push({ ...input, id: randomUUID(), createdAt: new Date().toISOString() });
       delete record.resultsReviewedAt; delete record.resultsReviewHash;
       await this.checkpoint(record, 'results_review', 'Human annotation saved separately from the original assessment.');
@@ -168,8 +168,8 @@ export class ExperimentLab {
   async reviewResults(id: string, expectedHash: string): Promise<Experiment> {
     return this.change(async () => {
       const record = await this.store.get(id);
-      if (record.workflow !== 'evaluate' || record.phase !== 'results_review') throw new Error('No completed dialogue set is awaiting human review.');
-      if (resultHash(record) !== expectedHash) throw new Error('The results changed. Reopen the current evidence before confirming.');
+      if (record.workflow !== 'evaluate' || record.phase !== 'results_review') throw new Error('Нет завершённого набора диалогов, ожидающего аудита.');
+      if (resultHash(record) !== expectedHash) throw new Error('Результаты изменились. Откройте их заново, прежде чем подтверждать аудит.');
       record.resultsReviewedAt = new Date().toISOString(); record.resultsReviewHash = expectedHash;
       await this.checkpoint(record, 'complete', 'Human review complete. Original checks, model estimates and human annotations remain separate.');
       return structuredClone(record);
@@ -178,12 +178,12 @@ export class ExperimentLab {
   async start(id: string, options: { approved: boolean; reviewer?: 'human' | 'automated'; expectedHash?: string }): Promise<Experiment> {
     return this.change(async () => {
       const record = await this.store.get(id);
-      if (record.phase !== 'review') throw new Error('Only an experiment awaiting review can start. Create a new experiment to change the suite.');
-      if (!options.approved) throw new Error('Review approval is required before freezing the scenario suite.');
+      if (record.phase !== 'review') throw new Error('Запустить можно только эксперимент, ожидающий проверки. Чтобы поменять набор карточек, создайте новый.');
+      if (!options.approved) throw new Error('Набор карточек замораживается только после вашего подтверждения.');
       if (record.workflow === 'evaluate' && (options.reviewer !== 'human' || options.expectedHash !== draftHash(record))) {
-        throw new Error('Human confirmation of the current draft is required. Open the cards in Pi and approve their exact version.');
+        throw new Error('Нужно подтверждение человека. Откройте карточки в Pi и утвердите именно эту версию черновика.');
       }
-      if (record.questions.length) throw new Error('Resolve the listed business questions in your materials and create a new experiment first.');
+      if (record.questions.length) throw new Error('Сначала ответьте на бизнес-вопросы из черновика: добавьте ответы в материалы и подготовьте новый эксперимент.');
       record.reviewedAt = new Date().toISOString();
       record.reviewMode = options.reviewer ?? 'human';
       if (record.reviewMode === 'automated') record.limitations.push('Generated scenario expectations were checked automatically, without human validation. Results are provisional synthetic evidence.');
@@ -195,7 +195,7 @@ export class ExperimentLab {
     });
   }
   async cancel(id: string): Promise<Experiment> {
-    if (this.active?.record.id !== id) throw new Error('This experiment is not running.');
+    if (this.active?.record.id !== id) throw new Error('Этот эксперимент сейчас не идёт.');
     this.active.controller.abort(new Error('Cancelled by the user.'));
     this.active.record.message = 'Cancelling; preserving recorded evidence.';
     return structuredClone(this.active.record);

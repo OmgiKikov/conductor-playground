@@ -58,7 +58,7 @@ async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> 
   let closed = false;
   return {
     async respond(message) {
-      if (closed) throw new Error('External session is closed');
+      if (closed) throw new Error('Сессия с внешним агентом закрыта.');
       ctx.signal.throwIfAborted();
       const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(target.timeoutMs)]);
       let response: Response;
@@ -74,9 +74,9 @@ async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> 
       }
       if (!response.ok) throw new Error(`External agent responded ${response.status}`);
       const text = await response.text();
-      if (text.length > 200000) throw new Error('External agent reply exceeds 200,000 characters');
+      if (text.length > 200000) throw new Error('Ответ внешнего агента длиннее 200 000 символов.');
       let body: unknown;
-      try { body = JSON.parse(text); } catch { throw new Error('External agent reply is not valid JSON'); }
+      try { body = JSON.parse(text); } catch { throw new Error('Ответ внешнего агента не является корректным JSON.'); }
       return applyReply(body, state, ctx, input.onRecords);
     },
     async close() { closed = true; },
@@ -92,13 +92,13 @@ async function moduleSession(input: SessionInput<'module'>): Promise<TargetSessi
   if (typeof factory !== 'function') throw new Error(`Module adapter ${target.path} has no function export named ${target.exportName}`);
   const created: unknown = await factory({ sessionId, scenarioId, initialState: structuredClone(state) });
   if (!created || typeof created !== 'object' || typeof (created as { respond?: unknown }).respond !== 'function') {
-    throw new Error('Module adapter session must expose respond(message, messages)');
+    throw new Error('Адаптер-модуль должен вернуть сессию с методом respond(message, messages).');
   }
   const session = created as { respond(message: string, messages: DialogueMessage[]): unknown; close?(): unknown };
   let closed = false;
   return {
     async respond(message) {
-      if (closed) throw new Error('External session is closed');
+      if (closed) throw new Error('Сессия с внешним агентом закрыта.');
       ctx.signal.throwIfAborted();
       const raw = await session.respond(message, history());
       ctx.signal.throwIfAborted();
@@ -137,7 +137,7 @@ async function commandSession(input: SessionInput<'command'>): Promise<TargetSes
   let closed = false;
   return {
     async respond(message) {
-      if (closed) throw new Error('External session is closed');
+      if (closed) throw new Error('Сессия с внешним агентом закрыта.');
       ctx.signal.throwIfAborted();
       if (exit) throw exited();
       const reply = new Promise<string>((resolve, reject) => { pending = { resolve, reject }; });
@@ -148,7 +148,7 @@ async function commandSession(input: SessionInput<'command'>): Promise<TargetSes
         await send({ type: 'respond', sessionId, scenarioId, initialState, messages: history(), message }).catch(error => { throw exit ? exited() : new Error(`Cannot write to external agent: ${error instanceof Error ? error.message : String(error)}`); });
         const line = await reply;
         let body: unknown;
-        try { body = JSON.parse(line); } catch { throw new Error('External agent reply is not valid JSON'); }
+        try { body = JSON.parse(line); } catch { throw new Error('Ответ внешнего агента не является корректным JSON.'); }
         return applyReply(body, state, ctx, input.onRecords);
       } finally { clearTimeout(timer); ctx.signal.removeEventListener('abort', onAbort); }
     },

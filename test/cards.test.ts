@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { visibleWidth, stripTerminalSequences } from '@earendil-works/pi-tui';
-import { LabBoard, safeText, type BoardAction } from '../extensions/cards.ts';
+import { LabBoard, reviewOrder, safeText, type BoardAction } from '../extensions/cards.ts';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
 import { emptyUsage, fingerprint, type Experiment } from '../src/contracts.js';
 
@@ -88,8 +88,53 @@ test('result cards keep model grades, missing grades, traces and human annotatio
   board.dispose();
   record.phase = 'complete'; record.resultsReviewedAt = record.updatedAt; record.humanReviews = [];
   const reviewed = new LabBoard({ record }, theme, () => {}, () => {}, () => 120);
-  assert.match(reviewed.render(120).join('\n'), /Набор проверен человеком.*отдельной заметки нет/);
+  assert.match(reviewed.render(120).join('\n'), /Набор проверен человеком.*вердикта нет/);
   reviewed.dispose();
+});
+
+test('разбор начинается с провалов без вердикта, счётчик их считает, вердикт ставится одной клавишей', async () => {
+  const record = await fixture();
+  record.phase = 'results_review';
+  const scenario = record.scenarios[0]!;
+  const trial = (id: string, outcome: 'pass' | 'fail') => ({
+    id, revisionId: 'revision-1', scenarioId: scenario.id, familyId: scenario.familyId, repeat: 0, split: 'dev' as const,
+    manifestHash: 'hash', outcome, reason: outcome === 'pass' ? 'Все объективные проверки пройдены.' : 'Часть объективных проверок провалена.',
+    checks: [{ id: 'time', description: 'Запись переставлена', passed: outcome === 'pass', evidence: 'e' }],
+    events: [], initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 1,
+  });
+  // Порядок в записи нарочно неудобный: пройденный первым, неразобранный провал последним.
+  record.trials = [trial('t_pass', 'pass'), trial('t_done', 'fail'), trial('t_pending', 'fail')];
+  record.humanReviews = [{ id: 'h1', trialId: 't_done', verdict: 'fail', note: 'разобрано', createdAt: record.createdAt }];
+
+  const actions: BoardAction[] = [];
+  const board = new LabBoard({ record, section: 'results' }, theme, a => actions.push(a), () => {}, () => 40);
+  const text = stripTerminalSequences(board.render(120).join('\n'));
+  assert.match(text, /Разбор: осталось 1 провал\(ов\) из 2/);
+  assert.match(text, /Запись переставлена/, 'первым открыт тот диалог, который ждёт человека');
+
+  board.handleInput('p');
+  const verdict = actions[0];
+  assert.equal(verdict?.type, 'verdict');
+  assert.equal(verdict.type === 'verdict' && verdict.verdict, 'pass');
+  assert.equal(verdict.type === 'verdict' && reviewOrder(record)[verdict.selected]?.id, 't_pending');
+  board.dispose();
+
+  const failing: BoardAction[] = [];
+  const second = new LabBoard({ record, section: 'results' }, theme, a => failing.push(a), () => {}, () => 40);
+  second.handleInput('n');
+  assert.equal(failing[0]?.type === 'verdict' && failing[0].verdict, 'fail');
+  second.dispose();
+
+  // Пока диалоги идут, вердикт ставить не по чему.
+  const running: BoardAction[] = [];
+  const active = new LabBoard({ record: { ...record, phase: 'evaluating' }, section: 'results' }, theme, a => running.push(a), () => {}, () => 40);
+  active.handleInput('p');
+  assert.deepEqual(running, []);
+  active.dispose();
+
+  const reviewed = { ...record, humanReviews: [...record.humanReviews, { id: 'h2', trialId: 't_pending', verdict: 'pass' as const, note: 'ok', createdAt: record.createdAt }] };
+  assert.match(stripTerminalSequences(new LabBoard({ record: reviewed, section: 'results' }, theme, () => {}, () => {}, () => 40).render(120).join('\n')),
+    /Разбор: все 2 провал\(ов\) разобраны/);
 });
 
 test('live polling stops on dispose and never applies a late response to a closed board', async () => {
