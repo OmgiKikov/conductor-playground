@@ -187,6 +187,44 @@ test('the verdict says how many dialogues passed, where the agent is weak, how m
   assert.equal(evidenceSummary(synthetic).verdict.confidence, 'low');
 });
 
+test('этапы показывают, какое звено сломалось, а провал дымовой карточки роняет доверие', () => {
+  const staged = (id: string): Scenario => ({
+    ...scenario(id), tier: id === 'smoke_card' ? 'smoke' : 'frontier',
+    checks: [{ id: 'time', description: 'Клиент получил ответ', kind: 'answer_contains', value: 'ответ', stage: 'сборка ответа' }],
+    metrics: [
+      { id: 'compose', name: 'Ответ собран по базе знаний', subject: 'agent', description: 'd', passCriteria: 'p', failCriteria: 'f', stage: 'сборка ответа' },
+      { id: 'guard', name: 'Ответ дошёл до клиента', subject: 'agent', description: 'd', passCriteria: 'p', failCriteria: 'f', stage: 'валидация' },
+    ],
+  });
+  // Агент собрал верный ответ и сам его убил валидатором: сквозной вердикт этого не различает.
+  const composed = (id: string, scenarioId: string, guard: 'pass' | 'fail'): Trial => trial(id, scenarioId, 'reactive', guard === 'pass' ? 'pass' : 'fail', {
+    failed: guard === 'pass' ? [] : ['time'],
+    assessments: [{ metricId: 'compose', result: 'pass', rationale: 'r', evidence: [1] }, { metricId: 'guard', result: guard, rationale: 'r', evidence: [2] }],
+  });
+  const r = record({
+    scenarios: [staged('frontier_card'), staged('smoke_card')],
+    trials: [composed('t1', 'frontier_card', 'fail'), composed('t2', 'frontier_card', 'fail'), composed('t3', 'smoke_card', 'pass')],
+  });
+  const v = verdictSummary(r);
+  assert.deepEqual(v.stages, [
+    { stage: 'валидация', passed: 1, evaluated: 3 },
+    { stage: 'сборка ответа', passed: 4, evaluated: 6 },
+  ]);
+  assert.ok(v.weakSpots.every(w => w.stage), 'каждое слабое место названо этапом');
+  assert.ok(v.weakSpots.some(w => w.stage === 'валидация' && w.kind === 'metric'));
+  assert.ok(v.nextSteps.some(n => n.code === 'fix_weakest' && /на этапе «/.test(n.text)));
+  assert.deepEqual(v.tiers.filter(t => t.cards), [
+    { tier: 'smoke', cards: 1, passed: 1, graded: 1 },
+    { tier: 'frontier', cards: 1, passed: 0, graded: 2 },
+  ]);
+
+  // Дымовая карточка — пол продукта: её провал держит доверие низким, что бы ни было выше.
+  const broken = verdictSummary({ ...r, trials: [...r.trials, composed('t4', 'smoke_card', 'fail')] });
+  assert.equal(broken.confidence, 'low');
+  assert.ok(broken.confidenceReasons.some(n => n.code === 'smoke_failed' && n.count === 1));
+  assert.equal(broken.confidenceReasons[0]?.code, 'smoke_failed', 'самое важное сказано первым');
+});
+
 test('rubric failures in dialogues without objective checks still count as weak spots and never earn high confidence', () => {
   const rubricOnly = (id: string, goal: 'pass' | 'fail', fidelity: 'pass' | 'fail' = 'pass'): Trial => ({
     ...trial(id, 's1', 'reactive', 'ungraded', { assessments: [{ metricId: 'goal', result: goal, rationale: 'r', evidence: [1] }, { metricId: 'fidelity', result: fidelity, rationale: 'r', evidence: [1] }] }), checks: [],

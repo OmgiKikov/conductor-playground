@@ -1,4 +1,4 @@
-import { fingerprint, type Comparison, type Experiment, type HumanReview, type Scenario, type Trial, type UserMode } from './contracts.js';
+import { fingerprint, type Comparison, type Experiment, type HumanReview, type Scenario, type Tier, type Trial, type UserMode } from './contracts.js';
 
 /*
  * Pure statistics over persisted records. Nothing here performs I/O or model calls,
@@ -246,7 +246,11 @@ export interface VerdictSummary {
   /** Completed dialogues where the model flagged the simulated user as breaking role. */
   simulatorFlagged: number;
   provenance: Record<Scenario['provenance'], { cards: number; passed: number; graded: number }>;
-  weakSpots: { kind: 'check' | 'metric'; description: string; failures: number }[];
+  /** Per job of the agent: which link of the chain broke, not just whether the chain broke. */
+  stages: { stage: string; passed: number; evaluated: number }[];
+  /** Per rung: smoke must never fail, regression must not get worse, frontier is where failures teach. */
+  tiers: { tier: Tier; cards: number; passed: number; graded: number }[];
+  weakSpots: { kind: 'check' | 'metric'; description: string; failures: number; stage?: string }[];
   confidence: 'low' | 'medium' | 'high'; confidenceReasons: VerdictNote[]; nextSteps: VerdictNote[];
 }
 /**
@@ -298,16 +302,53 @@ export function verdictSummary(record: Experiment): VerdictSummary {
     provenance[scenario.provenance].graded += 1;
     if (trial.outcome === 'pass') provenance[scenario.provenance].passed += 1;
   }
+  const tiers: VerdictSummary['tiers'] = (['smoke', 'regression', 'frontier'] as const)
+    .map(tier => ({ tier, cards: record.scenarios.filter(s => s.tier === tier).length, passed: 0, graded: 0 }));
+  const tierOf = (scenarioId: string) => record.scenarios.find(s => s.id === scenarioId)?.tier ?? 'regression';
+  for (const trial of gradedTrials) {
+    const row = tiers.find(t => t.tier === tierOf(trial.scenarioId))!;
+    row.graded += 1;
+    if (trial.outcome === 'pass') row.passed += 1;
+  }
+  // A smoke card is the floor of the product: if it fails, nothing above it is worth reading yet.
+  const smokeFailures = gradedTrials.filter(t => t.outcome === 'fail' && tierOf(t.scenarioId) === 'smoke').length;
+
+  // Per stage: every criterion that named a job of the agent, counted where it was evaluated.
+  const stageTally = new Map<string, { passed: number; evaluated: number }>();
+  const countStage = (stage: string | undefined, ok: boolean) => {
+    if (!stage) return;
+    const row = stageTally.get(stage) ?? { passed: 0, evaluated: 0 };
+    row.evaluated += 1;
+    if (ok) row.passed += 1;
+    stageTally.set(stage, row);
+  };
+  for (const trial of record.trials) {
+    const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
+    if (!scenario) continue;
+    for (const result of trial.checks) countStage(scenario.checks.find(c => c.id === result.id)?.stage, result.passed);
+    for (const assessment of trial.assessments ?? []) {
+      const metric = scenario.metrics?.find(m => m.id === assessment.metricId);
+      if (metric?.subject === 'agent' && assessment.result !== 'unknown') countStage(metric.stage, assessment.result === 'pass');
+    }
+  }
+  const stages = [...stageTally.entries()].map(([stage, row]) => ({ stage, ...row }))
+    .sort((a, b) => (a.passed / a.evaluated) - (b.passed / b.evaluated) || a.stage.localeCompare(b.stage));
+
   // Rubric estimates cover every completed dialogue, including those without objective checks. They are model estimates, never verified results.
   const completed = record.trials.filter(t => graded(t) || t.outcome === 'ungraded');
   const checkFailures = new Map<string, number>();
   const metricFailures = new Map<string, number>();
   const rubric = { assessed: 0, passed: 0, failed: 0, unknown: 0 };
   const rubricFailed = new Set<string>();
+  const failureStage = new Map<string, string>();
   let simulatorFlagged = 0;
   for (const trial of completed) {
-    for (const check of trial.checks) if (!check.passed) checkFailures.set(check.description, (checkFailures.get(check.description) ?? 0) + 1);
     const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
+    for (const check of trial.checks) if (!check.passed) {
+      checkFailures.set(check.description, (checkFailures.get(check.description) ?? 0) + 1);
+      const at = scenario?.checks.find(c => c.id === check.id)?.stage;
+      if (at) failureStage.set(check.description, at);
+    }
     const subjectOf = (metricId: string) => scenario?.metrics?.find(m => m.id === metricId)?.subject ?? 'agent';
     const agentResults = (trial.assessments ?? []).filter(a => subjectOf(a.metricId) === 'agent');
     if (agentResults.length) {
@@ -318,14 +359,19 @@ export function verdictSummary(record: Experiment): VerdictSummary {
     }
     if ((trial.assessments ?? []).some(a => subjectOf(a.metricId) === 'simulator' && a.result === 'fail')) simulatorFlagged += 1;
     for (const assessment of agentResults) if (assessment.result === 'fail') {
-      const name = scenario?.metrics?.find(m => m.id === assessment.metricId)?.name ?? assessment.metricId;
+      const metric = scenario?.metrics?.find(m => m.id === assessment.metricId);
+      const name = metric?.name ?? assessment.metricId;
       metricFailures.set(name, (metricFailures.get(name) ?? 0) + 1);
+      if (metric?.stage) failureStage.set(name, metric.stage);
     }
   }
   const weakSpots = [
     ...[...checkFailures].map(([description, failures]) => ({ kind: 'check' as const, description, failures })),
     ...[...metricFailures].map(([description, failures]) => ({ kind: 'metric' as const, description, failures })),
-  ].sort((a, b) => b.failures - a.failures).slice(0, 3);
+  ].map((spot): VerdictSummary['weakSpots'][number] => {
+    const at = failureStage.get(spot.description);
+    return at ? { ...spot, stage: at } : spot;
+  }).sort((a, b) => b.failures - a.failures).slice(0, 3);
   const allSynthetic = provenance.curated.cards + provenance.production.cards === 0;
   const humanVerdicts = record.humanReviews.length > 0;
   // Only the latest verdict per target counts, and only pass/fail decides anything; unknown and invalid record that a person looked and could not confirm the result.
@@ -357,7 +403,8 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   if (reviewComplete && gradedCount >= MIN_GRADED && gradedCount < TRUSTED_SAMPLE) {
     reasons.push({ code: 'small_sample', text: `Разобрано ${gradedCount} диалог(ов) из ${TRUSTED_SAMPLE}, с которых выборка перестаёт быть случайной.`, count: gradedCount });
   }
-  const confidence: VerdictSummary['confidence'] = gradedCount < MIN_GRADED || allSynthetic || invalidShare > 0.25 ? 'low'
+  if (smokeFailures) reasons.unshift({ code: 'smoke_failed', text: `Провалено ${smokeFailures} дымовых карточек: базовое поведение сломано, остальное читать рано.`, count: smokeFailures });
+  const confidence: VerdictSummary['confidence'] = gradedCount < MIN_GRADED || allSynthetic || invalidShare > 0.25 || smokeFailures ? 'low'
     : reviewComplete && gradedCount >= TRUSTED_SAMPLE ? 'high' : 'medium';
   const nextSteps: VerdictNote[] = [];
   if (gradedCount === 0 && rubric.assessed === 0) nextSteps.push({ code: 'approve_and_run', text: 'Утвердите карточки в /agent-lab и запустите диалоги.' });
@@ -365,14 +412,14 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   const awaiting = unreviewed + undecided;
   if (awaiting) nextSteps.push({ code: 'record_verdicts', text: `Разберите ${awaiting} провалившихся диалог(ов) без решающего вердикта: в /agent-lab клавиши p — пройдено, n — не пройдено.`, count: awaiting });
   if (record.target.kind === 'sandbox') nextSteps.push({ code: 'connect_agent', text: 'Подключите своего агента вместо песочницы, чтобы проверять то, что реально работает.' });
-  if (weakSpots[0]) nextSteps.push({ code: 'fix_weakest', text: `Начните с самого слабого места: ${weakSpots[0].description} (${weakSpots[0].failures} провал(ов)).`, detail: weakSpots[0].description, count: weakSpots[0].failures });
+  if (weakSpots[0]) nextSteps.push({ code: 'fix_weakest', text: `Начните с самого слабого места${weakSpots[0].stage ? ` на этапе «${weakSpots[0].stage}»` : ''}: ${weakSpots[0].description} (${weakSpots[0].failures} провал(ов)).`, detail: weakSpots[0].description, count: weakSpots[0].failures });
   if (gradedCount > 0 && gradedCount < TRUSTED_SAMPLE) nextSteps.push({ code: 'run_more', text: `Прогоните больше карточек: ${gradedCount} диалог(ов) против ${TRUSTED_SAMPLE}, с которых результату можно верить.`, count: gradedCount });
   const passRate = gradedCount ? passed / gradedCount : null;
   const confidenceWord: Record<VerdictSummary['confidence'], string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
   const estimates = rubric.assessed ? ` ${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} (не проверена): ${rubric.passed} из ${rubric.assessed} диалогов без замечаний по рубрикам агента.` : '';
   const headline = gradedCount ? `Пройдено ${passed} из ${gradedCount} диалогов (${Math.round((passRate ?? 0) * 100)}%). Доверие ${confidenceWord[confidence]}.${estimates}`
     : rubric.assessed ? `Объективных проверок нет.${estimates} Доверие ${confidenceWord[confidence]}.` : 'Диалогов с оценкой ещё нет.';
-  return { headline, passed, graded: gradedCount, invalid, passRate, rubric, simulatorFlagged, provenance, weakSpots, confidence, confidenceReasons: reasons, nextSteps };
+  return { headline, passed, graded: gradedCount, invalid, passRate, rubric, simulatorFlagged, provenance, stages, tiers, weakSpots, confidence, confidenceReasons: reasons, nextSteps };
 }
 
 export interface EvidenceSummary {

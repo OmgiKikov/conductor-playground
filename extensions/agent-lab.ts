@@ -11,6 +11,7 @@ import { demoInput } from '../dist/demo.js';
 import { activePhases, reviewOrder, safeText, showBoard, verdicts, type BoardAction } from './cards.ts';
 
 const confidenceWord: Record<string, string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
+const tierWord: Record<string, string> = { smoke: 'дымовые', regression: 'регрессия', frontier: 'фронтир' };
 const outcomeWord: Record<string, string> = {
   pass: 'пройден', fail: 'не пройден', ungraded: 'без объективной оценки', invalid: 'невалиден', cancelled: 'остановлен',
 };
@@ -57,7 +58,9 @@ function evidenceSection(record: Experiment): string[] {
     safeText(v.headline), '',
     `Карточки: синтетических ${v.provenance.synthetic.cards}, golden ${v.provenance.curated.cards}, из продакшна ${v.provenance.production.cards}.`,
     ...(v.rubric.assessed ? [`${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} по рубрикам (не проверена): ${v.rubric.passed} из ${v.rubric.assessed} диалогов без замечаний; провалов ${v.rubric.failed}, неясно ${v.rubric.unknown}.`] : []),
-    `Слабые места: ${v.weakSpots.length ? v.weakSpots.map(w => `${safeText(w.description)} (${w.failures})`).join('; ') : 'не выявлены'}.`,
+    `Слабые места: ${v.weakSpots.length ? v.weakSpots.map(w => `${w.stage ? `[${safeText(w.stage)}] ` : ''}${safeText(w.description)} (${w.failures})`).join('; ') : 'не выявлены'}.`,
+    ...(v.stages.length ? ['', 'По этапам работы агента:', ...v.stages.map(st => `- ${safeText(st.stage)}: ${st.passed} из ${st.evaluated}`)] : []),
+    ...(v.tiers.some(t => t.cards) ? ['', `По ступеням: ${v.tiers.filter(t => t.cards).map(t => `${tierWord[t.tier]} ${t.passed}/${t.graded}`).join(' · ')}.`] : []),
     `Доверие: ${confidenceWord[v.confidence]}. ${v.confidenceReasons.map(r => safeText(r.text)).join(' ')}`, '',
     'Что дальше:', ...v.nextSteps.map(step => `- ${safeText(step.text)}`), '',
     `Испытуемый: ${target}. Реальных диалогов: ${record.dialogues.length}. Golden-кейсов: ${record.goldenCases.length}. Профилей: ${record.profiles.length} (написано владельцем: ${record.profiles.filter(p => p.source === 'owner').length}). Режимы пользователя: ${record.settings.userModes.join(', ')}.`, '',

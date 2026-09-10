@@ -53,7 +53,7 @@ const outcomeColor = (value: string): ThemeColor => value === 'pass' ? 'success'
 function scenarioLines(scenario: Scenario, record: Experiment, expanded: boolean): Line[] {
   const rows = [
     line(scenario.title, 'accent', true),
-    line(`${scenario.id} · ${scenario.provenance === 'synthetic' ? 'Синтетический пользователь' : 'Курированный пример'}${record.workflow !== 'evaluate' ? ` · ${scenario.split === 'control' ? 'Контроль: скрыт от билдера' : 'Разработка'}` : ''}`, 'muted'),
+    line(`${scenario.id} · ${tierLabels[scenario.tier] ?? scenario.tier} · ${scenario.provenance === 'synthetic' ? 'Синтетический пользователь' : 'Курированный пример'}${record.workflow !== 'evaluate' ? ` · ${scenario.split === 'control' ? 'Контроль: скрыт от билдера' : 'Разработка'}` : ''}`, 'muted'),
     line(''), line('ПОЛЬЗОВАТЕЛЬ', 'accent'),
     line(scenario.user.persona || 'Персона не задана'),
     ...(scenario.user.characteristics ?? []).map(v => line(`• ${v}`)),
@@ -61,9 +61,9 @@ function scenarioLines(scenario: Scenario, record: Experiment, expanded: boolean
     line(`Знает: ${scenario.user.facts}`), line(`Первая реплика: «${scenario.user.opening}»`),
     line(`Лимит: ${scenario.user.maxFollowUps ?? Math.max(0, record.settings.maxTurns - 1)} ответов после первой реплики`, 'muted'),
     line(''), line('УСПЕХ', 'accent'), line(scenario.successCriteria || 'Описан проверками и метриками ниже.'),
-    ...scenario.checks.map(c => line(`□ ${c.description} [${c.id}]`)),
+    ...scenario.checks.map(c => line(`□ ${c.stage ? `[${c.stage}] ` : ''}${c.description} [${c.id}]`)),
     ...(scenario.metrics ?? []).flatMap(m => [
-      line(`${m.subject === 'simulator' ? 'Симулятор' : 'Агент'} · ${m.name} [${m.id}]`, 'text', true),
+      line(`${m.subject === 'simulator' ? 'Симулятор' : 'Агент'} · ${m.stage ? `[${m.stage}] ` : ''}${m.name} [${m.id}]`, 'text', true),
       line(m.description), line(`Прошёл: ${m.passCriteria}`), line(`Не прошёл: ${m.failCriteria}`),
     ]),
     line(''), line('ДОПУЩЕНИЯ', 'accent'),
@@ -125,6 +125,7 @@ function trialLines(trial: Trial, record: Experiment, expanded: boolean): Line[]
 }
 
 const confidenceLabels: Record<string, string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
+const tierLabels: Record<string, string> = { smoke: 'дымовые', regression: 'регрессия', frontier: 'фронтир' };
 /** Verdict wording comes from the record itself, so the board, the report and the CLI never disagree. */
 const noteText = (note: VerdictNote): string => note.text;
 
@@ -137,7 +138,10 @@ function verdictLines(record: Experiment): Line[] {
     line(v.graded ? `Пройдено ${v.passed} из ${v.graded} диалогов (${Math.round((v.passRate ?? 0) * 100)}%).` : v.rubric.assessed ? 'Объективных проверок нет.' : 'Диалогов с оценкой ещё нет.', 'text', true),
     ...(v.rubric.assessed ? [line(`${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} по рубрикам (не проверена): ${v.rubric.passed} из ${v.rubric.assessed} диалогов без замечаний.`, 'muted')] : []),
     line(`Карточки: синтетических ${p.synthetic.cards}, golden ${p.curated.cards}, из продакшна ${p.production.cards}.`, 'muted'),
-    line(v.weakSpots.length ? `Слабые места: ${v.weakSpots.map(w => `${w.description} (${w.failures} провал(ов))`).join('; ')}.` : 'Слабые места: не выявлены.'),
+    line(v.weakSpots.length ? `Слабые места: ${v.weakSpots.map(w => `${w.stage ? `[${w.stage}] ` : ''}${w.description} (${w.failures} провал(ов))`).join('; ')}.` : 'Слабые места: не выявлены.'),
+    ...(v.stages.length ? [line('По этапам работы агента:', 'accent'),
+      ...v.stages.map(st => line(`  ${st.stage}: ${st.passed} из ${st.evaluated}`, st.passed === st.evaluated ? 'success' : 'warning'))] : []),
+    ...(v.tiers.some(t => t.cards) ? [line(`По ступеням: ${v.tiers.filter(t => t.cards).map(t => `${tierLabels[t.tier]} ${t.passed}/${t.graded || 0}`).join(' · ')}.`, 'muted')] : []),
     line(`Доверие к результату: ${confidenceLabels[v.confidence] ?? v.confidence}. ${v.confidenceReasons.map(noteText).join(' ')}`, v.confidence === 'high' ? 'success' : 'warning'),
     line('Что дальше:', 'accent'), ...v.nextSteps.map(step => line(`• ${noteText(step)}`)),
   ];

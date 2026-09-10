@@ -52,7 +52,7 @@ function sampleScenarios(): ReturnType<typeof preparationSchema.parse>['scenario
     { familyId: 'j_preference_control', title: 'Revise a different requested time', opening: 'Move appointment A110 to 13:00.', time: '19:00', id: 'A110', behavior: 'After the first complete response, change preference once to 19:00.', failures: 0, requirementIds: ['change', 'preference'] },
   ];
   return variants.map((v, index) => ({
-    id: v.familyId, familyId: ['a_direct', 'b_clarification', 'c_retry', 'd_read_only', 'e_preference'][Math.floor(index / 2)]!, title: v.title, requirementIds: v.requirementIds, provenance: 'curated' as const,
+    id: v.familyId, familyId: ['a_direct', 'b_clarification', 'c_retry', 'd_read_only', 'e_preference'][Math.floor(index / 2)]!, title: v.title, requirementIds: v.requirementIds, provenance: 'curated' as const, tier: 'regression' as const,
     user: { goal: v.requirementIds.includes('read') ? `Learn the time of appointment ${v.id} without changing it.` : `Move appointment ${v.id} to ${v.time}.`, facts: `Your appointment ID is ${v.id}. Your desired time is ${v.time}.`, behavior: v.behavior, opening: v.opening,
       maxFollowUps: v.requirementIds.includes('clarify') || v.requirementIds.includes('preference') ? 1 : 0,
       // Scripted-mode lines mirror what the reactive simulator would say; direct and read-only cards have no follow-up to script.

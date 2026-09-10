@@ -73,7 +73,14 @@ export const worldSchema = z.strictObject({
   transientFailures: z.number().int().min(0).max(2).default(0),
 });
 export type World = z.infer<typeof worldSchema>;
-const checkBase = { id: identifier, description: text.max(1000) };
+/**
+ * Which job of the agent this criterion is about. A dialogue is a chain of jobs — understand
+ * the request, look things up, act, compose the answer, validate it — and a single end-to-end
+ * verdict cannot say which link broke. The label changes nothing in measurement and everything
+ * in diagnosis: results are grouped by it. Optional, because a one-step agent has one job.
+ */
+const stage = { stage: text.max(80).optional() };
+const checkBase = { id: identifier, description: text.max(1000), ...stage };
 export const checkSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...checkBase, kind: z.literal('state_equals'), recordId: identifier, field: identifier, value: scalarSchema }),
   z.strictObject({ ...checkBase, kind: z.literal('tool_called'), tool: z.enum(TOOL_NAMES) }),
@@ -87,7 +94,7 @@ export const checkSchema = z.discriminatedUnion('kind', [
 export type Check = z.infer<typeof checkSchema>;
 export const rubricSchema = z.strictObject({
   id: identifier, name: text.max(120), subject: z.enum(['agent', 'simulator']),
-  description: text.max(2000), passCriteria: text.max(2000), failCriteria: text.max(2000),
+  description: text.max(2000), passCriteria: text.max(2000), failCriteria: text.max(2000), ...stage,
 });
 export type Rubric = z.infer<typeof rubricSchema>;
 export const metricAssessmentSchema = z.strictObject({
@@ -101,10 +108,19 @@ export const userSchema = z.strictObject({
   persona: text.max(2000).optional(), characteristics: z.array(text.max(300)).max(12).optional(),
   script: z.array(text.max(3000)).max(15).optional(),
 });
+/**
+ * The rung a card occupies. smoke: the basics that must never break, whatever else changes.
+ * regression: behaviour that already works and must not get worse. frontier: what the product
+ * is still climbing towards, where failures are expected and informative. One flat suite hides
+ * the difference between "we broke the product" and "we have not got there yet".
+ */
+export const tierSchema = z.enum(['smoke', 'regression', 'frontier']);
+export type Tier = z.infer<typeof tierSchema>;
 export const scenarioSchema = z.strictObject({
   id: identifier, familyId: identifier, title: text.max(200),
   requirementIds: z.array(identifier).max(20),
   provenance: z.enum(['synthetic', 'curated', 'production']),
+  tier: tierSchema.default('regression'),
   profileId: identifier.optional(),
   user: userSchema, initialState: worldSchema,
   checks: z.array(checkSchema).max(12),
@@ -135,7 +151,8 @@ export type Profile = z.infer<typeof profileSchema>;
 /** Profiles the owner writes by hand: a legitimate way to describe users when no dialogues exist. Synthetic, and labelled so. */
 export const ownerProfileSchema = z.strictObject({ ...profileFields, source: z.literal('owner').default('owner') });
 export const goldenCaseSchema = z.strictObject({
-  id: identifier, familyId: identifier.optional(), title: text.max(200).optional(), goal: text.max(3000), opening: text.max(3000),
+  id: identifier, familyId: identifier.optional(), title: text.max(200).optional(), tier: tierSchema.default('regression'),
+  goal: text.max(3000), opening: text.max(3000),
   facts: text.max(5000).default('No additional facts beyond the opening request.'), persona: text.max(2000).optional(),
   characteristics: z.array(text.max(300)).max(12).default([]),
   behavior: text.max(2000).default('Ask once; answer clarifications from the known facts; finish when the request is answered.'),
@@ -146,7 +163,7 @@ export const goldenCaseSchema = z.strictObject({
 export type GoldenCase = z.infer<typeof goldenCaseSchema>;
 export function goldenToScenario(c: GoldenCase): Omit<Scenario, 'split'> {
   return {
-    id: c.id, familyId: c.familyId ?? c.id, title: c.title ?? c.goal.slice(0, 200), requirementIds: [], provenance: 'curated',
+    id: c.id, familyId: c.familyId ?? c.id, title: c.title ?? c.goal.slice(0, 200), requirementIds: [], provenance: 'curated', tier: c.tier,
     user: {
       goal: c.goal, facts: c.facts, behavior: c.behavior, opening: c.opening, maxFollowUps: c.maxFollowUps,
       ...(c.persona ? { persona: c.persona } : {}), ...(c.characteristics.length ? { characteristics: c.characteristics } : {}), ...(c.script ? { script: c.script } : {}),
@@ -181,7 +198,7 @@ export function validateObservedGoals(goals: ObservedGoal[], dialogues: Dialogue
 }
 export function goalToScenario(goal: ObservedGoal, profile?: Profile): Omit<Scenario, 'split'> {
   return {
-    id: goal.id, familyId: goal.id, title: goal.goal.slice(0, 200), requirementIds: [], provenance: 'production', profileId: goal.profileId,
+    id: goal.id, familyId: goal.id, title: goal.goal.slice(0, 200), requirementIds: [], provenance: 'production', tier: 'regression', profileId: goal.profileId,
     user: {
       goal: goal.goal, facts: goal.facts, opening: goal.opening, maxFollowUps: 2,
       behavior: 'Behave like the real user in the evidence dialogues: answer clarifications from the known facts, stop when the goal is reached or clearly blocked.',
