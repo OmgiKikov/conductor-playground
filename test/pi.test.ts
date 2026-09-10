@@ -470,6 +470,28 @@ test('profile extraction cites only supplied dialogues, sees user turns only, an
   } finally { await f.close(); }
 });
 
+test('расплывчатое имя типа провала отклоняется и переписывается, ссылки проверяются', async () => {
+  const failures = [
+    { trialId: 't1', card: 'Тариф', reason: 'Часть проверок провалена.', failed: ['Клиент получил ответ'], trace: 'Агент: оператору необходимо осуществить ручной поиск' },
+    { trialId: 't2', card: 'Возврат', reason: 'Часть проверок провалена.', failed: ['Клиент получил ответ'], trace: 'Агент: обратитесь на горячую линию' },
+  ];
+  const vague = { modes: [{ id: 'bad', name: 'Bad answer', description: 'd', trialIds: ['t1', 't2'] }] };
+  const invented = { modes: [{ id: 'hotline', name: 'Отправил на горячую линию вместо ответа', description: 'd', trialIds: ['t1', 't9'] }] };
+  const good = { modes: [{ id: 'hotline', name: 'Отправил на горячую линию вместо ответа', description: 'Нашёл статью и всё равно перевёл клиента.', stage: 'сборка ответа', trialIds: ['t1', 't2'] }] };
+  // Каждая попытка получает следующий ответ: проверяем, что отказ доходит и правка принимается.
+  const replies = [vague, invented, good];
+  let step = -1;
+  const f = await fixture(() => { step += 1; return JSON.stringify(replies[step]); });
+  try {
+    const modes = await f.adapter.failureModes!({ task: 'Проверить агента', failures }, callContext().ctx);
+    assert.deepEqual(modes, good.modes);
+    assert.equal(f.requests.length, 3, 'две попытки отклонены, третья принята');
+    const rejections = JSON.stringify(f.requests.slice(1).map(r => r.messages));
+    assert.match(rejections, /does not say what went wrong/);
+    assert.match(rejections, /not in the supplied failures/);
+  } finally { await f.close(); }
+});
+
 test('a rejected answer is repaired from the stated reason instead of losing the run', async () => {
   const quote = 'Support is available by email.';
   const source = { id: 'source_1', name: 'Policy', content: quote, hash: 'hash' };

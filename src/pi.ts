@@ -5,11 +5,11 @@ import {
 import { Type } from 'typebox';
 import { z } from 'zod';
 import {
-  agentSchema, metricAssessmentSchema, observedGoalSchema, preparationSchema, profileSchema, proposalSchema, requirementSchema, scenarioSchema,
+  agentSchema, failureModeSchema, metricAssessmentSchema, observedGoalSchema, preparationSchema, profileSchema, proposalSchema, requirementSchema, scenarioSchema,
   TOOL_NAMES, userTurnSchema, validateObservedGoals,
   type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
-import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
+import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
 const groundingSchema = z.strictObject({
@@ -383,6 +383,26 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       try { validateObservedGoals(result.goals, input.dialogues, input.profiles); }
       catch (error) { throw new Error(`Observed goals: ${error instanceof Error ? error.message : String(error)}`); }
       return result.goals;
+    },
+    async failureModes(input, ctx) {
+      const known = new Set(input.failures.map(f => f.trialId));
+      const result = await ask(
+        'Разбор провалов',
+        FAILURE_MODES_ROLE,
+        { task: input.task, failures: input.failures },
+        z.strictObject({ modes: z.array(failureModeSchema).min(1).max(12) }), ctx,
+        value => {
+          for (const mode of value.modes) {
+            const unknown = mode.trialIds.filter(id => !known.has(id));
+            if (unknown.length) return `Cluster ${mode.id} cites dialogues that are not in the supplied failures: ${unknown.join(', ')}.`;
+            if (/^(bad|poor|wrong|incorrect|quality|agent failed|плохой|неверный)/i.test(mode.name.trim())) {
+              return `Cluster ${mode.id} is named "${mode.name}", which does not say what went wrong. Name the specific behaviour visible in the traces.`;
+            }
+          }
+          return undefined;
+        },
+      );
+      return result.modes;
     },
     async profiles(input, ctx) {
       const supplied = new Set(input.dialogues.map(d => d.id));

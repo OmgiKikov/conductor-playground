@@ -296,6 +296,8 @@ export interface Experiment {
   trials: Trial[]; comparisons: Comparison[]; iterations: { revisionId: string; accepted: boolean; reason: string }[];
   usage: Usage; error: string | null; limitations: string[];
   humanReviews: HumanReview[]; resultsReviewedAt?: string; resultsReviewHash?: string;
+  /** Named clusters over the failed dialogues of this run; the bridge from evaluation to fixing. */
+  failureModes?: FailureMode[];
 }
 const usageSchema = z.strictObject({ calls: z.number().int().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), costUsd: z.number().finite().nonnegative().nullable() });
 const revisionSchema = z.strictObject({ id: text, parentId: text.nullable(), spec: agentSchema, hypothesis: z.string(), createdAt: text });
@@ -317,6 +319,28 @@ const comparisonSchema = z.strictObject({
   cases: z.array(z.strictObject({ scenarioId: identifier, baselinePasses: z.number().int().nonnegative(), candidatePasses: z.number().int().nonnegative(), repeats: z.number().int().nonnegative() })),
 });
 /** Files written by older versions load with defaults; the in-memory type is always complete. */
+/*
+ * FailureMode: a named cluster of dialogues that broke the same way. "Bad answer" is not a
+ * failure mode; "found the article and still handed the client to the hotline" is. Naming the
+ * failure precisely is what turns an evaluation into an improvement loop, so every cluster
+ * must cite the dialogues it was drawn from and may name the stage where the chain broke.
+ * Clusters cover the traces of this run only; they are not a picture of production traffic.
+ */
+export const failureModeSchema = z.strictObject({
+  id: identifier, name: text.max(160), description: text.max(2000),
+  stage: text.max(80).optional(), trialIds: z.array(identifier).min(1).max(200),
+});
+export type FailureMode = z.infer<typeof failureModeSchema>;
+export function validateFailureModes(modes: FailureMode[], trials: Trial[]): void {
+  const failed = new Set(trials.filter(t => t.outcome === 'fail' || t.outcome === 'ungraded').map(t => t.id));
+  if (!unique(modes.map(m => m.id))) throw new Error('Названия провалов повторяются.');
+  for (const mode of modes) {
+    if (!unique(mode.trialIds)) throw new Error(`Кластер ${mode.id} ссылается на один диалог дважды.`);
+    const unknown = mode.trialIds.filter(id => !failed.has(id));
+    if (unknown.length) throw new Error(`Кластер ${mode.id} ссылается на диалоги, которые не проваливались: ${unknown.join(', ')}`);
+  }
+}
+
 export const experimentSchema: z.ZodType<Experiment> = z.strictObject({
   schemaVersion: z.literal('1'), id: identifier, task: text.max(8000), mode: z.enum(['demo', 'live']), createdAt: text, updatedAt: text,
   workflow: z.enum(['evaluate', 'compare']).default('compare'),
@@ -333,6 +357,7 @@ export const experimentSchema: z.ZodType<Experiment> = z.strictObject({
     id: identifier, createdAt: text, trialId: identifier, metricId: identifier.optional(), checkId: identifier.optional(),
     verdict: z.enum(['pass', 'fail', 'unknown', 'invalid']), note: text.max(3000),
   })).default([]), resultsReviewedAt: text.optional(), resultsReviewHash: text.optional(),
+  failureModes: z.array(failureModeSchema).max(30).optional(),
 });
 export interface CallContext {
   signal: AbortSignal; timeoutMs: number;
@@ -368,6 +393,7 @@ export interface Runtime {
   assess?(input: { scenario: Scenario; sources: Source[]; trial: Trial }, ctx: CallContext): Promise<MetricAssessment[]>;
   profiles?(input: { task: string; sources: Source[]; dialogues: Dialogue[] }, ctx: CallContext): Promise<Profile[]>;
   goals?(input: { task: string; sources: Source[]; dialogues: Dialogue[]; profiles: Profile[] }, ctx: CallContext): Promise<ObservedGoal[]>;
+  failureModes?(input: { task: string; failures: { trialId: string; card: string; reason: string; failed: string[]; trace: string }[] }, ctx: CallContext): Promise<FailureMode[]>;
 }
 
 /** Stable JSON content identity; array order remains significant. */

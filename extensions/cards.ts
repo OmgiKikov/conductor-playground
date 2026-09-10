@@ -143,6 +143,11 @@ function verdictLines(record: Experiment): Line[] {
       ...v.stages.map(st => line(`  ${st.stage}: ${st.passed} из ${st.evaluated}`, st.passed === st.evaluated ? 'success' : 'warning'))] : []),
     ...(v.tiers.some(t => t.cards) ? [line(`По ступеням: ${v.tiers.filter(t => t.cards).map(t => `${tierLabels[t.tier]} ${t.passed}/${t.graded || 0}`).join(' · ')}.`, 'muted')] : []),
     line(`Доверие к результату: ${confidenceLabels[v.confidence] ?? v.confidence}. ${v.confidenceReasons.map(noteText).join(' ')}`, v.confidence === 'high' ? 'success' : 'warning'),
+    ...(record.failureModes?.length ? [line('Типы провалов:', 'accent'),
+      ...record.failureModes.flatMap(mode => [
+        line(`• ${mode.name}${mode.stage ? ` [${mode.stage}]` : ''} — ${mode.trialIds.length} диалог(ов)`, 'warning'),
+        line(`  ${mode.description}`, 'muted'),
+      ])] : []),
     line('Что дальше:', 'accent'), ...v.nextSteps.map(step => line(`• ${noteText(step)}`)),
   ];
 }

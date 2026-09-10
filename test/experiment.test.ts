@@ -208,6 +208,49 @@ test('preparation rejects invented sources, uncovered critical requirements, and
   check(p => { p.scenarios.forEach(s => { s.familyId = 'same'; }); }, /four distinct/);
 });
 
+test('провалы прогона получают имена, а сорванная кластеризация не теряет прогон', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-modes-'));
+  // Агент, который только обещает: состояние не меняется, значит проверки падают и есть что кластеризовать.
+  const base = { ...createDemoRuntime(), async openTarget() { return { respond: async () => 'Готово, перенёс.', close: async () => {} }; } };
+  const seen: unknown[] = [];
+  const named = {
+    ...base,
+    async failureModes(input: { task: string; failures: { trialId: string }[] }) {
+      seen.push(input);
+      return [{ id: 'no_action', name: 'Пообещал перенос и не сделал его', description: 'Ответ утверждает изменение, которого нет в состоянии.', stage: 'действие', trialIds: input.failures.map(f => f.trialId) }];
+    },
+  };
+  const lab = new ExperimentLab(directory, named as never);
+  t.after(async () => { await lab.close(); await rm(directory, { recursive: true, force: true }); });
+  await lab.init();
+  const draft = await lab.create({ ...demoInput(), workflow: 'evaluate' as const });
+  await lab.waitForIdle();
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(await lab.get(draft.id)) });
+  await lab.waitForIdle();
+  const done = await lab.get(draft.id);
+  assert.ok(done.trials.filter(t => t.outcome === 'fail').length >= 2, 'в демо-прогоне есть что кластеризовать');
+  assert.equal(done.failureModes?.length, 1);
+  assert.match(done.failureModes![0]!.name, /Пообещал/);
+  assert.deepEqual(done.failureModes![0]!.trialIds.sort(), done.trials.filter(t => t.outcome === 'fail').map(t => t.id).sort());
+  // Кластеризатору дают только провалившиеся диалоги и их трассы.
+  const passed = new Set(done.trials.filter(t => t.outcome !== 'fail').map(t => t.id));
+  assert.equal((seen[0] as { failures: { trialId: string }[] }).failures.some(f => passed.has(f.trialId)), false);
+
+  // Сорванный разбор — это оговорка в записи, а не потерянный прогон.
+  const brokenDir = await mkdtemp(join(tmpdir(), 'agent-lab-modes-broken-'));
+  const broken = new ExperimentLab(brokenDir, { ...base, async failureModes() { throw new Error('судья недоступен'); } } as never);
+  t.after(async () => { await broken.close(); await rm(brokenDir, { recursive: true, force: true }); });
+  await broken.init();
+  const second = await broken.create({ ...demoInput(), workflow: 'evaluate' as const });
+  await broken.waitForIdle();
+  await broken.start(second.id, { approved: true, reviewer: 'human', expectedHash: draftHash(await broken.get(second.id)) });
+  await broken.waitForIdle();
+  const survived = await broken.get(second.id);
+  assert.equal(survived.phase, 'results_review');
+  assert.equal(survived.failureModes, undefined);
+  assert.ok(survived.limitations.some(l => /Не удалось назвать типы провалов.*судья недоступен/.test(l)));
+});
+
 test('unresolved business questions block approval until new materials produce a new experiment', async t => {
   const runtime = createDemoRuntime(); const prepare = runtime.prepare;
   runtime.prepare = async (...args) => ({ ...await prepare(...args), questions: ['Which timezone applies?'] });

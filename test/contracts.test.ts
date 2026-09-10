@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  createInputSchema, emptyUsage, experimentSchema, goalToScenario, goldenCaseSchema, goldenToScenario, observedGoalSchema, profileSchema, settingsSchema, targetSchema, validatePreparation,
+  createInputSchema, emptyUsage, validateFailureModes, experimentSchema, goalToScenario, goldenCaseSchema, goldenToScenario, observedGoalSchema, profileSchema, settingsSchema, targetSchema, validatePreparation,
   type Profile,
 } from '../src/contracts.js';
 
@@ -144,4 +144,15 @@ test('observed goals become production cards with a verbatim real opening and th
   assert.ok(scenario.metrics!.some(m => m.subject === 'agent') && scenario.metrics!.some(m => m.subject === 'simulator'));
   assert.ok(scenario.assumptions!.some(a => /real dialogue/i.test(a)));
   assert.equal(goal.outcome, 'unknown');
+});
+
+test('кластер провалов обязан ссылаться на диалоги, которые действительно провалились', () => {
+  const trial = (id: string, outcome: 'fail' | 'pass') => ({ id, outcome } as unknown as Parameters<typeof validateFailureModes>[1][number]);
+  const trials = [trial('t1', 'fail'), trial('t2', 'fail'), trial('t3', 'pass')];
+  const mode = { id: 'hotline', name: 'Нашёл статью и всё равно отправил на горячую линию', description: 'd', trialIds: ['t1', 't2'] };
+  validateFailureModes([mode], trials);
+  assert.throws(() => validateFailureModes([{ ...mode, trialIds: ['t1', 't9'] }], trials), /не проваливались/);
+  assert.throws(() => validateFailureModes([{ ...mode, trialIds: ['t1', 't3'] }], trials), /не проваливались/);
+  assert.throws(() => validateFailureModes([{ ...mode, trialIds: ['t1', 't1'] }], trials), /дважды/);
+  assert.throws(() => validateFailureModes([mode, mode], trials), /повторяются/);
 });

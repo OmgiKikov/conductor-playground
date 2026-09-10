@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, fingerprint, goalToScenario, goldenToScenario, humanReviewInputSchema, proposalSchema, settingsSchema, validateObservedGoals, validatePreparation,
+  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, fingerprint, goalToScenario, goldenToScenario, humanReviewInputSchema, proposalSchema, settingsSchema, validateFailureModes, validateObservedGoals, validatePreparation,
   type CallContext, type CreateInput, type DraftPatch, type Experiment, type HumanReviewInput, type Revision, type Runtime,
 } from './contracts.js';
 import { ExperimentStore } from './store.js';
@@ -305,8 +305,39 @@ export class ExperimentLab {
     if (!agent || !record.manifestHash) throw new Error('Missing reviewed agent or measurement manifest.');
     await this.runSuite(record, runtime, agent, 'dev', '', ctx);
     this.frozenGuard(record, record.manifestHash, ctx)();
-    await this.checkpoint(record, 'results_review', 'Dialogues and assessments are ready. Review simulator fidelity and evidence before accepting the results.');
+    await this.nameFailureModes(record, runtime, ctx);
+    await this.checkpoint(record, 'results_review', 'Диалоги и оценки готовы. Разберите провалы и проверьте поведение симулятора, прежде чем принимать результат.');
   }
+  /**
+   * Naming the failure precisely is what turns an evaluation into an improvement loop, so the
+   * failed dialogues of a finished run are clustered and named. A single failure is not a
+   * pattern, and a failed clustering must not lose a completed run: it is recorded as a
+   * limitation instead.
+   */
+  private async nameFailureModes(record: Experiment, runtime: Runtime, ctx: CallContext): Promise<void> {
+    const failed = record.trials.filter(t => t.outcome === 'fail');
+    if (!runtime.failureModes || failed.length < 2) return;
+    const failures = failed.map(trial => ({
+      trialId: trial.id,
+      card: record.scenarios.find(s => s.id === trial.scenarioId)?.title ?? trial.scenarioId,
+      reason: trial.reason,
+      failed: [
+        ...trial.checks.filter(c => !c.passed).map(c => c.description),
+        ...(trial.assessments ?? []).filter(a => a.result === 'fail').map(a => a.rationale),
+      ],
+      trace: trial.events.filter(e => e.type === 'user' || e.type === 'assistant')
+        .map(e => `${e.type === 'user' ? 'Пользователь' : 'Агент'}: ${e.text ?? ''}`).join('\n').slice(0, 6000),
+    }));
+    try {
+      const modes = await runtime.failureModes({ task: record.task, failures }, ctx);
+      validateFailureModes(modes, record.trials);
+      record.failureModes = modes;
+    } catch (error) {
+      if (ctx.signal.aborted) throw error;
+      record.limitations.push(`Не удалось назвать типы провалов: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private async execute(record: Experiment, ctx: CallContext): Promise<void> {
     const runtime = await this.runtime(record);
     const baseline = record.revisions[0];
