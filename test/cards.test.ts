@@ -162,7 +162,7 @@ test('the statistics section renders the evidence summary in narrow and wide ter
   const text = stripTerminalSequences(board.render(120).join('\n'));
   assert.match(text, /4 Статистика/);
   assert.match(text, /static/); assert.match(text, /reactive/);
-  assert.match(text, /No human verdicts/);
+  assert.match(text, /Вердиктов человека по метрикам и проверкам ещё нет/);
   assert.match(text, /Реальные диалоги: 1/);
   assert.match(text, /Калибровка судьи/);
   board.dispose();

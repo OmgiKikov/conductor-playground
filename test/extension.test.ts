@@ -175,7 +175,7 @@ test('build accepts an external module target, real dialogues and golden cases; 
     assert.equal(report.evidence.verdict.provenance.production.cards, 1);
     assert.equal(report.evidence.comparison, null);
     assert.deepEqual(report.evidence.modes.map((m: { userMode: string }) => m.userMode), ['static', 'reactive']);
-    assert.ok(report.evidence.notes.some((n: string) => /No human verdicts/.test(n)));
+    assert.ok(report.evidence.notes.some((n: string) => /Вердиктов человека по метрикам и проверкам ещё нет/.test(n)));
     const inspect = output(await tools.get('agent_lab_inspect')!.execute('inspect-v2', { id: report.id, export: true }, undefined, undefined, ctx));
     assert.equal(inspect.evidence.fidelity.realDialogues, 1);
     assert.equal(inspect.scenarios.filter((s: { provenance: string }) => s.provenance === 'curated').length, 1);

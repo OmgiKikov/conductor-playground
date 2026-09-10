@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { compareUserModes, evidenceSummary, judgeCalibration, simulatorFidelity, verdictSummary } from '../src/comparison.js';
+import { compareRuns, compareUserModes, evidenceSummary, judgeCalibration, simulatorFidelity, verdictSummary } from '../src/comparison.js';
 import { emptyUsage, settingsSchema, type Experiment, type HumanReview, type MetricAssessment, type Outcome, type Scenario, type TraceEvent, type Trial, type UserMode } from '../src/contracts.js';
 
 /** Sample size at which the verdict is allowed to call itself trusted. */
@@ -138,8 +138,8 @@ test('evidence summary states observed comparison results plainly and lists what
   const evaluate = evidenceSummary(record({ trials: [trial('a', 's1', 'reactive', 'fail', { assessments: [{ metricId: 'goal', result: 'fail', rationale: 'r', evidence: [1] }] })], humanReviews: [review('h', 'a', 'fail', { metricId: 'goal' })] }));
   assert.equal(evaluate.comparison, null);
   assert.equal(evaluate.modes.length, 3);
-  assert.ok(evaluate.notes.some(note => /fewer than 60/.test(note) && /goal/.test(note)));
-  assert.ok(evaluate.notes.some(note => /real dialogues/i.test(note)));
+  assert.ok(evaluate.notes.some(note => /меньше чем на 60/.test(note) && /goal/.test(note)));
+  assert.ok(evaluate.notes.some(note => /Реальные диалоги не загружены/.test(note)));
   const compare = evidenceSummary(record({ workflow: 'compare', comparisons: [{
     baselineId: 'b', candidateId: 'c', manifestHash: 'h', split: 'control', plannedPairs: 4, validPairs: 4, invalidPairs: 0, families: 2,
     baselinePasses: 1, candidatePasses: 4, fixed: 3, regressed: 0, tied: 1, delta: 0.75, interval: [0.5, 1], verdict: 'insufficient', reasons: ['Only two families.'], cases: [],
@@ -185,6 +185,56 @@ test('the verdict says how many dialogues passed, where the agent is weak, how m
   assert.equal(empty.passRate, null);
   assert.match(empty.headline, /Диалогов с оценкой ещё нет/);
   assert.equal(evidenceSummary(synthetic).verdict.confidence, 'low');
+});
+
+test('судья, расходящийся с человеком, назван по имени рубрики, а не спрятан в статистике', () => {
+  // 24 пары: судья и человек согласны в 14, расходятся в 10 — это про формулировку рубрики.
+  const trials = Array.from({ length: 24 }, (_, i) => trial(`t${i}`, 's1', 'reactive', 'pass', {
+    assessments: [{ metricId: 'goal', result: i < 14 ? 'pass' : 'fail', rationale: 'r', evidence: [1] }],
+  }));
+  const humanReviews = trials.map((t, i) => review(`h${i}`, t.id, 'pass', { metricId: 'goal' }));
+  const r = record({ scenarios: [scenario('s1')], trials, humanReviews });
+  const evidence = evidenceSummary(r);
+  assert.ok(evidence.notes.some(n => /расходится с человеком в 42%.*goal/.test(n)), evidence.notes.join(' | '));
+  assert.ok(evidence.verdict.nextSteps.some(n => n.code === 'rewrite_rubric' && n.detail === 'goal'));
+
+  // Согласный судья молчит: подсказка появляется только когда есть о чём говорить.
+  const agreeing = record({
+    scenarios: [scenario('s1')],
+    trials: trials.map(t => ({ ...t, assessments: [{ metricId: 'goal', result: 'pass' as const, rationale: 'r', evidence: [1] }] })),
+    humanReviews,
+  });
+  assert.equal(evidenceSummary(agreeing).verdict.nextSteps.some(n => n.code === 'rewrite_rubric'), false);
+});
+
+test('сравнение двух прогонов называет, что починилось и что сломалось, а не среднее', () => {
+  const card = (id: string, tier: 'smoke' | 'regression' | 'frontier'): Scenario => ({ ...scenario(id), tier });
+  const run = (results: Record<string, 'pass' | 'fail'>, extra: Partial<Experiment> = {}) => record({
+    scenarios: Object.keys(results).map(id => card(id, id === 'basics' ? 'smoke' : 'regression')),
+    trials: Object.entries(results).map(([id, outcome], i) => trial(`t${i}_${id}`, id, 'reactive', outcome, { failed: outcome === 'fail' ? ['time'] : [] })),
+    ...extra,
+  });
+  const before = run({ basics: 'pass', tariff: 'fail', refund: 'fail' });
+  const after = run({ basics: 'pass', tariff: 'pass', refund: 'fail' });
+  const diff = compareRuns(before, after);
+  assert.match(diff.headline, /Исправлено 1, сломалось 0/);
+  assert.deepEqual(diff.fixed.map(f => f.scenarioId), ['tariff']);
+  assert.deepEqual(diff.regressed, []);
+  assert.deepEqual(diff.unchanged, { passing: 1, failing: 1 });
+  assert.ok(diff.notes.some(n => /может быть случайной/.test(n)), 'малая выборка названа прямо');
+
+  // Улучшение на одной карточке не должно прятать поломку базового поведения.
+  const broken = compareRuns(before, run({ basics: 'fail', tariff: 'pass', refund: 'fail' }));
+  assert.match(broken.headline, /Исправлено 1, сломалось 1/);
+  assert.deepEqual(broken.regressed.map(r => [r.scenarioId, r.tier]), [['basics', 'smoke']]);
+  assert.ok(broken.notes.some(n => /дымовых карточек/.test(n)));
+
+  // Несравнимые прогоны признаются несравнимыми.
+  const other = compareRuns(before, run({ basics: 'pass', newcard: 'pass' }, { settings: settingsSchema.parse({ repeats: 3 }) }));
+  assert.ok(other.notes.some(n => /Набор карточек изменился/.test(n)));
+  assert.ok(other.notes.some(n => /повторов отличается/.test(n)));
+  assert.deepEqual(other.cards.onlyBefore.sort(), ['refund', 'tariff']);
+  assert.deepEqual(other.cards.onlyAfter, ['newcard']);
 });
 
 test('этапы показывают, какое звено сломалось, а провал дымовой карточки роняет доверие', () => {
