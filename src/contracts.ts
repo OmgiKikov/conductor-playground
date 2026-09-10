@@ -47,17 +47,18 @@ export const targetSchema = z.discriminatedUnion('kind', [
   z.strictObject({
     kind: z.literal('http'), url: z.string().url().max(2000),
     headersEnv: z.record(z.string().regex(/^[A-Za-z0-9-]{1,100}$/, 'Invalid header name'), z.string().regex(/^[A-Z_][A-Z0-9_]{0,99}$/, 'Header values must name environment variables')).default({}),
-    timeoutMs: z.number().int().min(1000).max(120000).default(60000),
+    timeoutMs: z.number().int().min(1000).max(600000).default(60000),
   }),
   z.strictObject({
     kind: z.literal('module'), path: z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute path required'),
     exportName: z.string().regex(/^[A-Za-z_$][A-Za-z0-9_$]{0,99}$/).default('createSession'),
+    timeoutMs: z.number().int().min(1000).max(600000).optional(),
   }),
   /** A local process (for example `python3 agent.py`) speaking one JSON request/reply per line over stdin/stdout. */
   z.strictObject({
     kind: z.literal('command'), command: z.string().min(1).max(4000), args: z.array(z.string().max(4000)).max(50).default([]),
     cwd: z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute path required').optional(),
-    timeoutMs: z.number().int().min(1000).max(120000).default(60000),
+    timeoutMs: z.number().int().min(1000).max(600000).default(60000),
   }),
 ]);
 export type Target = z.infer<typeof targetSchema>;
@@ -81,11 +82,12 @@ export type World = z.infer<typeof worldSchema>;
  */
 const stage = { stage: text.max(80).optional() };
 const checkBase = { id: identifier, description: text.max(1000), ...stage };
+const toolIdentifier = z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:/-]{0,199}$/);
 export const checkSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...checkBase, kind: z.literal('state_equals'), recordId: identifier, field: identifier, value: scalarSchema }),
-  z.strictObject({ ...checkBase, kind: z.literal('tool_called'), tool: z.enum(TOOL_NAMES) }),
-  z.strictObject({ ...checkBase, kind: z.literal('tool_not_called'), tool: z.enum(TOOL_NAMES) }),
-  z.strictObject({ ...checkBase, kind: z.literal('tool_count'), tool: z.enum(TOOL_NAMES), min: z.number().int().min(0).max(1000), max: z.number().int().min(0).max(1000) }),
+  z.strictObject({ ...checkBase, kind: z.literal('tool_called'), tool: toolIdentifier }),
+  z.strictObject({ ...checkBase, kind: z.literal('tool_not_called'), tool: toolIdentifier }),
+  z.strictObject({ ...checkBase, kind: z.literal('tool_count'), tool: toolIdentifier, min: z.number().int().min(0).max(1000), max: z.number().int().min(0).max(1000) }),
   z.strictObject({ ...checkBase, kind: z.literal('fresh_read_before_update') }),
   z.strictObject({ ...checkBase, kind: z.literal('answer_contains'), value: text.max(1000) }),
   /** Wording that must never reach the user: internal instructions, staff-only phrasing, forbidden promises. */
@@ -97,6 +99,12 @@ export const rubricSchema = z.strictObject({
   description: text.max(2000), passCriteria: text.max(2000), failCriteria: text.max(2000), ...stage,
 });
 export type Rubric = z.infer<typeof rubricSchema>;
+export const simulatorFidelity: Rubric = {
+  id: 'user_fidelity', name: 'Верность симулятора', subject: 'simulator',
+  description: 'Соблюдение заданных фактов, цели, поведения и лимита реплик; персона и характеристики учитываются только если заданы.',
+  passCriteria: 'Пользователь следует карточке, отвечает на уточнения только известными фактами и завершает разговор согласно поведению. Не оценивает агента и не выдумывает его ответы или результаты инструментов.',
+  failCriteria: 'Пользователь придумывает факты, знает скрытые ответы или состояние, меняет роль, оценивает агента, пропускает обязательное уточнение или продолжает разговор вопреки карточке. Неудача агента сама по себе не является провалом симулятора.',
+};
 export const metricAssessmentSchema = z.strictObject({
   metricId: identifier, result: z.enum(['pass', 'fail', 'unknown']),
   rationale: text.max(4000), evidence: z.array(z.number().int().nonnegative()).max(30),
@@ -142,12 +150,21 @@ export const dialogueSchema = z.strictObject({
 });
 export type Dialogue = z.infer<typeof dialogueSchema>;
 const profileFields = {
-  id: identifier, persona: text.max(2000), characteristics: z.array(text.max(300)).min(1).max(12),
+  id: identifier, persona: text.max(2000).optional(), characteristics: z.array(text.max(300)).max(12).default([]),
   observedStyle: text.max(2000).optional(), evidenceDialogueIds: z.array(identifier).max(50).default([]),
 };
-export const profileSchema = z.strictObject({ ...profileFields, source: z.enum(['observed', 'owner']).default('observed') })
+const profileOverrideSchema = z.strictObject({ persona: text.max(2000).nullable().optional(), characteristics: z.array(text.max(300)).max(12).optional() })
+  .refine(v => Object.keys(v).length > 0, 'Supply a profile change');
+/** Extractors cannot impersonate an owner or supply draft edits. */
+export const observedProfileSchema = z.strictObject({ ...profileFields, source: z.literal('observed').default('observed'), evidenceDialogueIds: z.array(identifier).min(1).max(50) });
+export const profileSchema = z.strictObject({ ...profileFields, source: z.enum(['observed', 'owner']).default('observed'), draftOverride: profileOverrideSchema.optional() })
   .refine(p => p.source === 'owner' || p.evidenceDialogueIds.length > 0, { message: 'Observed profiles need evidence dialogue IDs', path: ['evidenceDialogueIds'] });
 export type Profile = z.infer<typeof profileSchema>;
+/** Original evidence remains immutable; null explicitly removes the persona from linked cards. */
+export function profileUser(profile: Profile): Pick<Scenario['user'], 'persona' | 'characteristics'> {
+  const persona = profile.draftOverride?.persona !== undefined ? profile.draftOverride.persona : profile.persona;
+  return { ...(persona ? { persona } : {}), characteristics: [...(profile.draftOverride?.characteristics ?? profile.characteristics)] };
+}
 /** Profiles the owner writes by hand: a legitimate way to describe users when no dialogues exist. Synthetic, and labelled so. */
 export const ownerProfileSchema = z.strictObject({ ...profileFields, source: z.literal('owner').default('owner') });
 export const goldenCaseSchema = z.strictObject({
@@ -178,7 +195,7 @@ export function goldenToScenario(c: GoldenCase): Omit<Scenario, 'split'> {
  * The opening is the real user's own message, verbatim; it becomes a production card without model-written text.
  */
 export const observedGoalSchema = z.strictObject({
-  id: identifier, goal: text.max(3000), opening: text.max(3000), profileId: identifier,
+  id: identifier, goal: text.max(3000), opening: text.max(3000), profileId: identifier.optional(),
   evidenceDialogueIds: z.array(identifier).min(1).max(50), successCriteria: text.max(3000),
   facts: text.max(5000).default('Only what the real user revealed in the evidence dialogues.'),
   outcome: z.enum(['success', 'failure', 'abandoned', 'unknown']).default('unknown'),
@@ -188,7 +205,7 @@ export function validateObservedGoals(goals: ObservedGoal[], dialogues: Dialogue
   if (!unique(goals.map(g => g.id))) throw new Error('Observed goals have duplicate IDs');
   const byId = new Map(dialogues.map(d => [d.id, d]));
   for (const goal of goals) {
-    if (!profiles.some(p => p.id === goal.profileId)) throw new Error(`Observed goal ${goal.id} references an unknown profileId ${goal.profileId}`);
+    if (goal.profileId !== undefined && !profiles.some(p => p.id === goal.profileId)) throw new Error(`Observed goal ${goal.id} references an unknown profileId ${goal.profileId}`);
     const evidence = goal.evidenceDialogueIds.map(id => byId.get(id));
     if (evidence.some(d => !d)) throw new Error(`Observed goal ${goal.id} cites a dialogue that was not supplied`);
     if (!evidence.some(d => d!.messages.some(m => m.role === 'user' && m.content.trim() === goal.opening.trim()))) {
@@ -202,14 +219,14 @@ export function goalToScenario(goal: ObservedGoal, profile?: Profile): Omit<Scen
     user: {
       goal: goal.goal, facts: goal.facts, opening: goal.opening, maxFollowUps: 2,
       behavior: 'Behave like the real user in the evidence dialogues: answer clarifications from the known facts, stop when the goal is reached or clearly blocked.',
-      ...(profile ? { persona: profile.persona, characteristics: [...profile.characteristics] } : {}),
+      ...(profile ? profileUser(profile) : {}),
     },
     initialState: { records: {}, writableFields: [], transientFailures: 0 }, checks: [], successCriteria: goal.successCriteria,
     assumptions: [`Derived from a real dialogue (${goal.evidenceDialogueIds.join(', ')}); the opening is the real user's first message and the success criteria were inferred from the logged outcome (${goal.outcome}).`],
     metrics: [
       { id: 'goal_attainment', name: 'Goal attainment', subject: 'agent', description: 'Did the user get what they came for, as the real user would judge it.', passCriteria: 'The stated goal is reached or the user is told clearly and correctly why it cannot be.', failCriteria: 'The goal is not reached and no correct explanation is given, or the answer contradicts the success criteria.' },
       { id: 'perimeter', name: 'Stays within the agent perimeter', subject: 'agent', description: 'The agent answers only what it is meant to answer and grounds answers in its materials.', passCriteria: 'Answers stay within the described perimeter and materials; out-of-scope requests are declined or redirected.', failCriteria: 'The agent answers outside its perimeter, invents facts, or fails to decline an out-of-scope request.' },
-      { id: 'user_fidelity', name: 'Simulated user fidelity', subject: 'simulator', description: 'The simulated user stayed within the observed profile and known facts.', passCriteria: 'Messages match the profile style and only use known facts.', failCriteria: 'The simulated user invents facts, breaks role or pushes unnaturally.' },
+      { ...simulatorFidelity },
     ],
   };
 }
@@ -224,6 +241,7 @@ export const createInputSchema = z.strictObject({
   /** 0 means: run only the owner's own cards and generate nothing. */
   scenarioCount: z.number().int().min(0).max(10).default(5),
   target: targetSchema.default({ kind: 'sandbox' }),
+  targetVersion: text.max(200).optional(),
   goldenCases: z.array(goldenCaseSchema).max(40).default([]),
   dialogues: z.array(dialogueSchema).max(200).default([]),
   /** The owner's own hints about users, goals and situations. First-class input for cards; never a business rule. */
@@ -282,7 +300,10 @@ export type HumanReviewInput = z.infer<typeof humanReviewInputSchema>;
 export type HumanReview = HumanReviewInput & { id: string; createdAt: string };
 export const draftPatchSchema = z.strictObject({
   scenarios: z.array(scenarioSchema.extend({ split: z.enum(['dev', 'control']).optional() })).min(1).max(40).optional(),
+  profileEdits: z.array(z.strictObject({ id: identifier, override: profileOverrideSchema.nullable() })).min(1).max(12)
+    .refine(edits => unique(edits.map(e => e.id)), 'Duplicate profile edits').optional(),
   agent: agentSchema.optional(), settings: settingsSchema.partial().optional(),
+  target: targetSchema.optional(), targetVersion: text.max(200).optional(),
 }).refine(v => Object.keys(v).length > 0, 'Supply a draft change');
 export type DraftPatch = z.infer<typeof draftPatchSchema>;
 export type Phase = 'preparing' | 'review' | 'evaluating' | 'results_review' | 'baseline' | 'improving' | 'control' | 'complete' | 'cancelled' | 'error' | 'interrupted';
@@ -298,6 +319,9 @@ export interface Experiment {
   humanReviews: HumanReview[]; resultsReviewedAt?: string; resultsReviewHash?: string;
   /** Named clusters over the failed dialogues of this run; the bridge from evaluation to fixing. */
   failureModes?: FailureMode[];
+  parentRunId?: string;
+  targetVersion?: string;
+  targetFingerprint?: string;
 }
 const usageSchema = z.strictObject({ calls: z.number().int().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), costUsd: z.number().finite().nonnegative().nullable() });
 const revisionSchema = z.strictObject({ id: text, parentId: text.nullable(), spec: agentSchema, hypothesis: z.string(), createdAt: text });
@@ -332,7 +356,8 @@ export const failureModeSchema = z.strictObject({
 });
 export type FailureMode = z.infer<typeof failureModeSchema>;
 export function validateFailureModes(modes: FailureMode[], trials: Trial[]): void {
-  const failed = new Set(trials.filter(t => t.outcome === 'fail' || t.outcome === 'ungraded').map(t => t.id));
+  const failed = new Set(trials.filter(t => t.outcome === 'fail' || t.outcome === 'ungraded'
+    || t.outcome === 'pass' && t.assessments?.some(a => a.result === 'fail')).map(t => t.id));
   if (!unique(modes.map(m => m.id))) throw new Error('Названия провалов повторяются.');
   for (const mode of modes) {
     if (!unique(mode.trialIds)) throw new Error(`Кластер ${mode.id} ссылается на один диалог дважды.`);
@@ -358,6 +383,7 @@ export const experimentSchema: z.ZodType<Experiment> = z.strictObject({
     verdict: z.enum(['pass', 'fail', 'unknown', 'invalid']), note: text.max(3000),
   })).default([]), resultsReviewedAt: text.optional(), resultsReviewHash: text.optional(),
   failureModes: z.array(failureModeSchema).max(30).optional(),
+  parentRunId: identifier.optional(), targetVersion: text.max(200).optional(), targetFingerprint: text.optional(),
 });
 export interface CallContext {
   signal: AbortSignal; timeoutMs: number;
@@ -422,15 +448,13 @@ export function validatePreparation(raw: unknown, sources: Source[], workflow: '
     const synthetic = s.provenance === 'synthetic';
     if (synthetic && !s.requirementIds.length) throw new Error(`Scenario ${s.id} needs at least one grounded requirement`);
     if (s.profileId !== undefined && !profiles.some(profile => profile.id === s.profileId)) throw new Error(`Scenario ${s.id} references an unknown profileId`);
-    if (synthetic && profiles.length) {
-      // Observed profiles are the only source of persona text: the model may choose one, never author one.
-      const profile = profiles.find(candidate => candidate.id === s.profileId);
-      if (!profile) throw new Error(`Scenario ${s.id} must reference a profileId from the observed profiles`);
-      s.user.persona = profile.persona;
-      s.user.characteristics = [...profile.characteristics];
+    if (s.profileId !== undefined) {
+      const profile = profiles.find(candidate => candidate.id === s.profileId)!;
+      delete s.user.persona;
+      Object.assign(s.user, profileUser(profile));
     }
-    if (workflow === 'evaluate' && (!s.successCriteria || s.user.maxFollowUps === undefined || (synthetic && (!s.user.persona || !s.user.characteristics)))) {
-      throw new Error(`Scenario ${s.id} needs success criteria, a persona, characteristics and an explicit follow-up limit`);
+    if (workflow === 'evaluate' && (!s.successCriteria || s.user.maxFollowUps === undefined)) {
+      throw new Error(`Scenario ${s.id} needs success criteria and an explicit follow-up limit`);
     }
     requireUnique(s.checks.map(c => c.id), 'check IDs');
     requireUnique((s.metrics ?? []).map(m => m.id), 'metric IDs');

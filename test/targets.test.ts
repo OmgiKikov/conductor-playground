@@ -193,3 +193,25 @@ test('the reference Python adapter answers through the command target when pytho
   assert.equal(state.records.A101!.time, '15:45');
   await session.close();
 });
+
+test('module sessions isolate state, bound initialization and synchronous hangs, and cancel promptly', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-worker-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'agent.mjs');
+  const open = (signal = new AbortController().signal) => openExternalTarget({ target: { kind: 'module', path, exportName: 'createSession', timeoutMs: 1000 }, sessionId: 't', scenarioId: 's', state: world(), history: () => [], ctx: context(signal).ctx });
+  await writeFile(path, 'let n = 0; export function createSession() { return { respond() { console.log("debug"); return String(++n); } }; }');
+  for (let i = 0; i < 2; i++) { const session = await open(); assert.equal(await session.respond('hi'), '1'); await session.close(); }
+  await writeFile(path, 'export function createSession() { while (true) {} }');
+  await assert.rejects(open(), /exceeded/);
+  await writeFile(path, 'export function createSession() { return { respond() { while (true) {} } }; }');
+  const session = await open();
+  await assert.rejects(session.respond('hi'), /exceeded/); await session.close();
+  const controller = new AbortController();
+  const cancelled = await open(controller.signal);
+  const pending = cancelled.respond('hi');
+  controller.abort(new Error('operator stopped'));
+  await assert.rejects(pending, /operator stopped/); await cancelled.close();
+  await writeFile(path, 'export function createSession() { return { respond() { return "ok"; }, close() { while (true) {} } }; }');
+  const closing = await open();
+  const start = performance.now(); await closing.close(); assert.ok(performance.now() - start < 4000);
+});

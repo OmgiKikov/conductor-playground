@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { scalarSchema, type CallContext, type DialogueMessage, type Target, type TargetSession, type World } from './contracts.js';
 
@@ -72,9 +72,20 @@ async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> 
         if (signal.aborted) throw new Error(`External agent request exceeded ${target.timeoutMs} ms`);
         throw new Error(`External agent request failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (!response.ok) throw new Error(`External agent responded ${response.status}`);
-      const text = await response.text();
-      if (text.length > 200000) throw new Error('Ответ внешнего агента длиннее 200 000 символов.');
+      if (!response.ok) { await response.body?.cancel(); throw new Error(`External agent responded ${response.status}`); }
+      const reader = response.body?.getReader();
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      if (reader) try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > 200000) { await reader.cancel(); throw new Error('Ответ внешнего агента длиннее 200 000 байт.'); }
+          chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+      const text = Buffer.concat(chunks).toString('utf8');
       let body: unknown;
       try { body = JSON.parse(text); } catch { throw new Error('Ответ внешнего агента не является корректным JSON.'); }
       return applyReply(body, state, ctx, input.onRecords);
@@ -84,28 +95,11 @@ async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> 
 }
 
 async function moduleSession(input: SessionInput<'module'>): Promise<TargetSession> {
-  const { target, sessionId, scenarioId, state, history, ctx } = input;
-  let mod: Record<string, unknown>;
-  try { mod = await import(pathToFileURL(target.path).href) as Record<string, unknown>; }
-  catch (error) { throw new Error(`Cannot load module adapter ${target.path}: ${error instanceof Error ? error.message : String(error)}`); }
-  const factory = mod[target.exportName];
-  if (typeof factory !== 'function') throw new Error(`Module adapter ${target.path} has no function export named ${target.exportName}`);
-  const created: unknown = await factory({ sessionId, scenarioId, initialState: structuredClone(state) });
-  if (!created || typeof created !== 'object' || typeof (created as { respond?: unknown }).respond !== 'function') {
-    throw new Error('Адаптер-модуль должен вернуть сессию с методом respond(message, messages).');
-  }
-  const session = created as { respond(message: string, messages: DialogueMessage[]): unknown; close?(): unknown };
-  let closed = false;
-  return {
-    async respond(message) {
-      if (closed) throw new Error('Сессия с внешним агентом закрыта.');
-      ctx.signal.throwIfAborted();
-      const raw = await session.respond(message, history());
-      ctx.signal.throwIfAborted();
-      return applyReply(raw, state, ctx, input.onRecords);
-    },
-    async close() { if (closed) return; closed = true; await session.close?.(); },
-  };
+  return commandSession({ ...input, initialize: true, target: {
+    kind: 'command', command: process.execPath,
+    args: [fileURLToPath(new URL('./module-worker.mjs', import.meta.url)), input.target.path, input.target.exportName],
+    timeoutMs: input.target.timeoutMs ?? input.ctx.timeoutMs,
+  } });
 }
 
 /*
@@ -115,9 +109,18 @@ async function moduleSession(input: SessionInput<'module'>): Promise<TargetSessi
  *   stdin  → {"type":"close", sessionId}, then stdin ends
  * A reply that misses the deadline kills the process; an early exit surfaces the exit code and the stderr tail.
  */
-async function commandSession(input: SessionInput<'command'>): Promise<TargetSession> {
+async function commandSession(input: SessionInput<'command'> & { initialize?: boolean }): Promise<TargetSession> {
   const { target, sessionId, scenarioId, state, history, ctx } = input;
-  const child = spawn(target.command, target.args, { cwd: target.cwd, stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
+  ctx.signal.throwIfAborted();
+  const grouped = process.platform !== 'win32';
+  const child = spawn(target.command, target.args, { cwd: target.cwd, stdio: ['pipe', 'pipe', 'pipe'], env: process.env, detached: grouped });
+  let killed = false;
+  const kill = () => {
+    if (killed) return;
+    killed = true;
+    try { if (grouped && child.pid) process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+  };
   let stderr = '';
   child.stderr.on('data', chunk => { stderr = `${stderr}${String(chunk)}`.slice(-4000); });
   child.stdin.on('error', () => {});
@@ -125,6 +128,11 @@ async function commandSession(input: SessionInput<'command'>): Promise<TargetSes
   let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   const takePending = () => { const waiting = pending; pending = undefined; return waiting; };
   const exited = () => new Error(`External agent process exited${exit ? ` with code ${exit.code ?? exit.signal}` : ''}${stderr.trim() ? `: ${stderr.trim()}` : ''}`);
+  let bytes = 0;
+  child.stdout.on('data', chunk => {
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > 200000) { takePending()?.reject(new Error('Ответ внешнего агента превышает 200 000 байт.')); kill(); }
+  });
   const lines = createInterface({ input: child.stdout });
   lines.on('line', line => takePending()?.resolve(line));
   child.on('close', (code, signal) => { exit = { code, signal }; takePending()?.reject(exited()); });
@@ -133,40 +141,50 @@ async function commandSession(input: SessionInput<'command'>): Promise<TargetSes
     child.once('error', error => reject(new Error(`Cannot start external agent ${target.command}: ${error.message}`)));
   });
   const initialState = structuredClone(state);
-  const send = (payload: unknown) => new Promise<void>((resolve, reject) => { child.stdin.write(`${JSON.stringify(payload)}\n`, error => error ? reject(error) : resolve()); });
   let closed = false;
-  return {
-    async respond(message) {
-      if (closed) throw new Error('Сессия с внешним агентом закрыта.');
+  const exchange = async (payload: unknown) => {
+    if (closed) throw new Error('Сессия с внешним агентом закрыта.');
+    ctx.signal.throwIfAborted();
+    if (exit) throw exited();
+    if (pending) throw new Error('У сессии уже есть активный запрос.');
+    bytes = 0;
+    const reply = new Promise<string>((resolve, reject) => { pending = { resolve, reject }; });
+    const timer = setTimeout(() => { takePending()?.reject(new Error(`External agent request exceeded ${target.timeoutMs} ms`)); kill(); }, target.timeoutMs);
+    const onAbort = () => { takePending()?.reject(ctx.signal.reason instanceof Error ? ctx.signal.reason : new Error('Диалог остановлен.')); kill(); };
+    ctx.signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      const sent = new Promise<void>((resolve, reject) => { child.stdin.write(`${JSON.stringify(payload)}\n`, error => error ? reject(error) : resolve()); });
+      const [, line] = await Promise.all([sent, reply]);
       ctx.signal.throwIfAborted();
-      if (exit) throw exited();
-      const reply = new Promise<string>((resolve, reject) => { pending = { resolve, reject }; });
-      const timer = setTimeout(() => { takePending()?.reject(new Error(`External agent request exceeded ${target.timeoutMs} ms`)); child.kill('SIGKILL'); }, target.timeoutMs);
-      const onAbort = () => { takePending()?.reject(ctx.signal.reason instanceof Error ? ctx.signal.reason : new Error(String(ctx.signal.reason))); child.kill('SIGKILL'); };
-      ctx.signal.addEventListener('abort', onAbort, { once: true });
-      try {
-        await send({ type: 'respond', sessionId, scenarioId, initialState, messages: history(), message }).catch(error => { throw exit ? exited() : new Error(`Cannot write to external agent: ${error instanceof Error ? error.message : String(error)}`); });
-        const line = await reply;
-        let body: unknown;
-        try { body = JSON.parse(line); } catch { throw new Error('Ответ внешнего агента не является корректным JSON.'); }
-        return applyReply(body, state, ctx, input.onRecords);
-      } finally { clearTimeout(timer); ctx.signal.removeEventListener('abort', onAbort); }
+      try { return JSON.parse(line) as unknown; }
+      catch { throw new Error('Ответ внешнего агента не является корректным JSON.'); }
+    } finally { clearTimeout(timer); ctx.signal.removeEventListener('abort', onAbort); }
+  };
+  const session: TargetSession = {
+    async respond(message) {
+      const body = await exchange({ type: 'respond', sessionId, scenarioId, initialState, messages: history(), message });
+      return applyReply(body, state, ctx, input.onRecords);
     },
     async close() {
       if (closed) return;
       closed = true;
       if (!exit) {
-        await send({ type: 'close', sessionId }).catch(() => {});
-        child.stdin.end();
+        if (ctx.signal.aborted) kill();
+        else child.stdin.end(`${JSON.stringify({ type: 'close', sessionId })}\n`);
         await new Promise<void>(resolve => {
           if (exit) { resolve(); return; }
-          const timer = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 2000);
+          const timer = setTimeout(() => { kill(); resolve(); }, 2000);
           child.once('close', () => { clearTimeout(timer); resolve(); });
         });
       }
       lines.close();
     },
   };
+  if (input.initialize) {
+    try { await exchange({ type: 'open', sessionId, scenarioId, initialState }); }
+    catch (error) { kill(); await session.close(); throw error; }
+  }
+  return session;
 }
 
 export async function openExternalTarget(input: ExternalTargetInput): Promise<TargetSession> {

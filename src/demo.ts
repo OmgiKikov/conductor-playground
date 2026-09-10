@@ -128,7 +128,7 @@ export function createDemoRuntime(): Runtime {
     async goals({ dialogues, profiles }, ctx) {
       call(ctx);
       // Deterministic stand-in for the model role: a goal per dialogue that names an appointment, opening copied verbatim.
-      const profileId = profiles[0]?.id ?? 'observed_1';
+      const profileId = profiles[0]?.id;
       return dialogues.flatMap(dialogue => {
         const opening = dialogue.messages.find(m => m.role === 'user')?.content;
         const id = opening?.match(/\bA\d{3}\b/)?.[0];

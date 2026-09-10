@@ -381,6 +381,7 @@ test('evaluation runs every user mode, skips scripted cards without a script, an
   assert.ok(result.trials.filter(tr => tr.userMode === 'static').every(tr => tr.events.filter(e => e.type === 'user').length === 1));
   const compare = demoInput(); compare.settings.userModes = ['static', 'reactive'];
   await assert.rejects(lab.create(compare), /в одном режиме пользователя/);
+  await assert.rejects(lab.create(createInputSchema.parse({ ...demoInput(), target: { kind: 'http', url: 'http://localhost:1' } })), /внешнего агента/);
 });
 
 test('golden cases and real dialogues enter the draft as curated cards and grounded profiles', async t => {
@@ -424,6 +425,76 @@ test('profiles with evidence outside the supplied dialogues fail preparation ins
   assert.match(failed.error ?? '', /evidence/i);
 });
 
+test('a missing target yields a recoverable explanation and a rejected connection edit leaves the draft intact', async t => {
+  const { lab, directory } = await setup(t);
+  const input = createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1, target: { kind: 'module', path: join(directory, 'missing.mjs') } });
+  const created = await lab.create(input); await lab.waitForIdle();
+  const failed = await lab.get(created.id);
+  assert.equal(failed.phase, 'error'); assert.match(failed.error!, /Не найден файл агента/); assert.doesNotMatch(failed.error!, /ENOENT|stat '/);
+  assert.equal(failed.usage.calls, 0);
+  const next = await lab.create(createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1 })); await lab.waitForIdle();
+  const draft = await lab.get(next.id);
+  await assert.rejects(lab.updateDraft(draft.id, draftHash(draft), { target: input.target }), /Не найден файл агента/);
+  assert.equal(draftHash(await lab.get(draft.id)), draftHash(draft));
+});
+
+test('profile edits preserve evidence, update linked cards, invalidate approval and survive a run and repeat', async t => {
+  const runtime = createDemoRuntime();
+  const users: unknown[] = []; const userTurn = runtime.userTurn;
+  runtime.userTurn = async (input, ctx) => { users.push(structuredClone(input.user)); return userTurn(input, ctx); };
+  const { lab } = await setup(t, runtime);
+  const created = await lab.create(createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 2, settings: { repeats: 1 },
+    dialogues: [{ id: 'd1', messages: [{ role: 'user', content: 'move A101 to 14:00 pls' }] }],
+  }));
+  await lab.waitForIdle();
+  const draft = await lab.get(created.id); assert.equal(draft.phase, 'review', draft.error ?? '');
+  const original = structuredClone(draft.profiles[0]!);
+  const id = original.id;
+  const edit = { id, override: { persona: null, characteristics: ['Answers only the question asked'] } };
+  const edited = await lab.updateDraft(draft.id, draftHash(draft), { profileEdits: [edit] });
+  assert.deepEqual(edited.profiles[0], { ...original, draftOverride: edit.override });
+  assert.ok(edited.scenarios.some(s => s.provenance === 'production'));
+  assert.ok(edited.scenarios.every(s => s.profileId === id && !s.user.persona));
+  assert.ok(edited.scenarios.every(s => s.user.characteristics?.[0] === edit.override.characteristics[0]));
+  assert.notEqual(draftHash(edited), draftHash(draft)); assert.notEqual(measurementHash(edited), measurementHash(draft));
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }), /подтверждение человека/);
+  for (const profileEdits of [[{ id: 'unknown', override: null }], [edit, edit], [{ id, override: { source: 'owner' } }]]) {
+    await assert.rejects(lab.updateDraft(draft.id, draftHash(edited), { profileEdits } as never));
+    assert.deepEqual(await lab.get(draft.id), JSON.parse(JSON.stringify(edited)), 'a rejected edit must leave the saved draft intact');
+  }
+  const silentEdit = structuredClone(edited.scenarios); silentEdit[0]!.user.persona = 'Would be overwritten';
+  await assert.rejects(lab.updateDraft(draft.id, draftHash(edited), { scenarios: silentEdit }), /profileEdits/);
+  const restored = await lab.updateDraft(draft.id, draftHash(edited), { profileEdits: [{ id, override: null }] });
+  assert.deepEqual(restored.profiles[0], original); assert.deepEqual(restored.scenarios, draft.scenarios);
+  const cleared = await lab.updateDraft(draft.id, draftHash(restored), { profileEdits: [{ id, override: { persona: null, characteristics: [] } }] });
+  // Scripted fixture consent: exercise the same freeze/run boundary used by the human Pi UI.
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(cleared) }); await lab.waitForIdle();
+  const result = await lab.get(draft.id); assert.equal(result.phase, 'results_review', result.error ?? '');
+  assert.ok(users.length); assert.ok(users.every(u => !(u as { persona?: string }).persona));
+  await assert.rejects(lab.updateDraft(draft.id, draftHash(result), { profileEdits: [{ id, override: null }] }), /незапущенный черновик/);
+  const repeated = await lab.repeat(result.id);
+  assert.deepEqual(repeated.profiles, cleared.profiles); assert.deepEqual(repeated.scenarios, cleared.scenarios);
+  assert.equal(repeated.phase, 'review'); assert.equal(repeated.reviewMode, null); assert.equal(repeated.trials.length, 0);
+});
+
+test('logs yield production goals even when no meaningful profile can be extracted', async t => {
+  const runtime = createDemoRuntime(); runtime.profiles = async () => [];
+  const prepare = runtime.prepare;
+  runtime.prepare = async (input, ctx) => {
+    const result = await prepare(input, ctx);
+    for (const scenario of result.scenarios) { delete scenario.user.persona; delete scenario.user.characteristics; }
+    return result;
+  };
+  const { lab } = await setup(t, runtime);
+  const created = await lab.create(createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1,
+    dialogues: [{ id: 'd1', messages: [{ role: 'user', content: 'move A101 to 14:00 pls' }] }],
+  }));
+  await lab.waitForIdle(); const draft = await lab.get(created.id);
+  assert.equal(draft.phase, 'review', draft.error ?? ''); assert.deepEqual(draft.profiles, []);
+  assert.equal(draft.scenarios.length, 2); assert.ok(draft.scenarios.every(s => !s.profileId && !s.user.persona));
+  assert.equal(draft.scenarios.find(s => s.provenance === 'production')!.user.opening, 'move A101 to 14:00 pls');
+});
+
 test('owner notes and owner profiles are first-class inputs: cards may cite an owner profile and the runtime sees the notes', async t => {
   const runtime = createDemoRuntime();
   const prepare = runtime.prepare;
@@ -444,6 +515,9 @@ test('owner notes and owner profiles are first-class inputs: cards may cite an o
   assert.deepEqual(draft.profiles.map(p => p.source), ['owner', 'observed']);
   assert.equal(draft.scenarios[0]!.profileId, 'hurried_owner');
   assert.equal(draft.scenarios[0]!.user.persona, 'A customer in a hurry');
+  const edited = await lab.updateDraft(draft.id, draftHash(draft), { settings: { repeats: 2 } });
+  assert.equal(edited.scenarios[0]!.profileId, 'hurried_owner');
+  assert.equal(edited.settings.repeats, 2);
 });
 
 test('real dialogues also yield production cards: observed goals with verbatim openings that cite supplied dialogues', async t => {
@@ -478,4 +552,43 @@ test('an observed goal whose opening is not a real user message fails preparatio
   const failed = await lab.get(created.id);
   assert.equal(failed.phase, 'error');
   assert.match(failed.error ?? '', /opening/i);
+});
+
+test('repeat keeps the approved suite, discards results and requires fresh approval; target drift blocks execution', async t => {
+  const { lab, directory } = await setup(t);
+  const path = join(directory, 'target.mjs');
+  await writeFile(path, 'export function createSession() { return { respond: () => "hello" }; }');
+  const input = createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1,
+    target: { kind: 'module', path }, targetVersion: 'v1', settings: { ...demoInput().settings, repeats: 1, userModes: ['static'] } });
+  const created = await lab.create(input); await lab.waitForIdle();
+  let draft = await lab.get(created.id);
+  await assert.rejects(lab.repeat(draft.id), /утверждёнными/);
+  await writeFile(path, 'export function createSession() { return { respond: () => "new answer" }; }');
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }), /изменил/);
+  draft = await lab.updateDraft(draft.id, draftHash(draft), { targetVersion: 'v2' });
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }); await lab.waitForIdle();
+  const before = await lab.get(draft.id);
+  assert.equal(before.phase, 'results_review', before.error ?? '');
+  const after = await lab.repeat(before.id);
+  assert.notEqual(after.id, before.id); assert.equal(after.parentRunId, before.id);
+  assert.deepEqual(after.scenarios, before.scenarios); assert.deepEqual(after.settings, before.settings);
+  assert.deepEqual(after.trials, []); assert.deepEqual(after.humanReviews, []); assert.equal(after.reviewedAt, null);
+  assert.equal(after.targetVersion, 'v2'); assert.equal(after.phase, 'review');
+  assert.deepEqual((await lab.get(before.id)).trials, before.trials);
+  await assert.rejects(lab.start(after.id, { approved: true, reviewer: 'automated', expectedHash: draftHash(after) }), /подтверждение человека/);
+});
+
+test('rubric-only agent failures reach clustering', async t => {
+  const runtime = createDemoRuntime();
+  const prepare = runtime.prepare;
+  runtime.prepare = async (...args) => { const p = await prepare(...args); p.scenarios.forEach(s => { s.checks = []; }); return p; };
+  runtime.assess = async ({ scenario }) => scenario.metrics!.map(m => ({ metricId: m.id, result: m.subject === 'agent' ? 'fail' : 'pass', rationale: 'evidence', evidence: [0] }));
+  runtime.failureModes = async ({ failures }) => [{ id: 'goal_failed', name: 'Цель не достигнута', description: 'Рубрика зафиксировала провал цели.', trialIds: failures.map(f => f.trialId) }];
+  const { lab } = await setup(t, runtime);
+  const created = await lab.create({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1 }); await lab.waitForIdle();
+  const draft = await lab.get(created.id);
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }); await lab.waitForIdle();
+  const result = await lab.get(draft.id);
+  assert.ok(result.trials.every(t => t.outcome === 'ungraded'));
+  assert.deepEqual(result.failureModes?.[0]?.trialIds, result.trials.map(t => t.id));
 });

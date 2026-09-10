@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  createInputSchema, emptyUsage, validateFailureModes, experimentSchema, goalToScenario, goldenCaseSchema, goldenToScenario, observedGoalSchema, profileSchema, settingsSchema, targetSchema, validatePreparation,
+  createInputSchema, emptyUsage, validateFailureModes, experimentSchema, goalToScenario, goldenCaseSchema, goldenToScenario, observedGoalSchema, observedProfileSchema, profileSchema, settingsSchema, targetSchema, validatePreparation,
   type Profile,
 } from '../src/contracts.js';
 
@@ -74,9 +74,10 @@ test('synthetic cards need grounded requirements; curated and production cards d
   assert.equal(production.scenarios[0]!.provenance, 'production');
 });
 
-test('observed profiles overwrite generated persona text and must be referenced by synthetic cards', () => {
+test('linked profiles supply persona text while unlinked cards need no persona', () => {
   const profiles: Profile[] = [{ id: 'observed_1', persona: 'Observed customer', characteristics: ['Short messages'], observedStyle: '12 chars avg', evidenceDialogueIds: ['d1'] }];
-  assert.throws(() => validatePreparation(preparation([card()]), [source], 'evaluate', profiles), /profileId/);
+  const plain = validatePreparation(preparation([card({ user: { ...user, persona: undefined, characteristics: undefined } })]), [source], 'evaluate', profiles);
+  assert.equal(plain.scenarios[0]!.user.persona, undefined);
   assert.throws(() => validatePreparation(preparation([card({ profileId: 'missing' })]), [source], 'evaluate', profiles), /profileId/);
   const prepared = validatePreparation(preparation([card({ profileId: 'observed_1', user: { ...user, persona: 'Invented dramatic persona', characteristics: ['Shouts'] } })]), [source], 'evaluate', profiles);
   assert.equal(prepared.scenarios[0]!.user.persona, 'Observed customer');
@@ -105,6 +106,8 @@ test('owner-supplied profiles need no evidence, observed ones do, and owner note
   const owner = profileSchema.parse({ id: 'p', persona: 'Busy parent', characteristics: ['Terse'], source: 'owner' });
   assert.deepEqual([owner.source, owner.evidenceDialogueIds, owner.observedStyle], ['owner', [], undefined]);
   const observed = profileSchema.parse({ id: 'o', persona: 'Observed', characteristics: ['Short'], evidenceDialogueIds: ['d1'] });
+  assert.equal(observedProfileSchema.safeParse({ ...observed, source: 'owner' }).success, false);
+  assert.equal(observedProfileSchema.safeParse({ ...observed, draftOverride: { persona: 'Model pretending this was edited' } }).success, false);
   assert.equal(observed.source, 'observed');
   const base = { task: 'task', materials: [{ name: 'm', content: 'c' }], mode: 'demo' as const };
   const parsed = createInputSchema.parse({ ...base, notes: 'Users are often angry and rarely know their appointment ID.', profiles: [{ id: 'p', persona: 'Busy parent', characteristics: ['Terse'] }] });
