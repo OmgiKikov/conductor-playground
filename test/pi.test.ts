@@ -306,7 +306,7 @@ test('preparation separates grounded requirements, independent cards and candida
     // Check the generated schema reaches the actual provider, rather than existing only in local grading types.
     assert.match(f.requests[2]?.systemPrompt ?? '', /"const":"fresh_read_before_update"/);
     assert.match(f.requests[2]?.systemPrompt ?? '', /"const":"tool_count"/);
-    assert.match(f.requests[2]?.systemPrompt ?? '', /"required":\["goal","facts","behavior","opening","maxFollowUps","persona","characteristics"\]/);
+    assert.match(f.requests[2]?.systemPrompt ?? '', /"required":\["goal","facts","behavior","opening","maxFollowUps"\]/);
     assert.match(f.requests[2]?.systemPrompt ?? '', /extra reads must not fail unless a source explicitly limits them/);
     assert.match(f.requests[2]?.systemPrompt ?? '', /exact requested fixture values or wording a source explicitly mandates verbatim/);
     assert.match(f.requests[2]?.systemPrompt ?? '', /before observing an error the user simply wants the task done/);
@@ -420,7 +420,7 @@ test('scenario batches reject invalid attribution and incomplete human-review ca
     initialState: { records: { A: { time: '10:00' } }, writableFields: ['time'], transientFailures: 0 },
     checks: [{ id: 'time', description: 'Requested time', kind: 'state_equals', recordId: 'A', field: 'time', value: '11:00' }],
   }));
-  for (const issue of ['duplicate plan', 'unknown plan requirement', 'unplanned family', 'duplicate scenario', 'unknown card requirement', 'missing follow-up budget', 'missing persona', 'missing success criteria', 'missing simulator rubric']) {
+  for (const issue of ['duplicate plan', 'unknown plan requirement', 'unplanned family', 'duplicate scenario', 'unknown card requirement', 'missing follow-up budget', 'missing success criteria', 'missing simulator rubric']) {
     const plan = structuredClone(families);
     const scenarios = structuredClone(cards);
     if (issue === 'duplicate plan') plan[1]!.familyId = plan[0]!.familyId;
@@ -429,7 +429,6 @@ test('scenario batches reject invalid attribution and incomplete human-review ca
     if (issue === 'duplicate scenario') scenarios[4]!.id = scenarios[0]!.id;
     if (issue === 'unknown card requirement') scenarios[0]!.requirementIds = ['unknown'];
     if (issue === 'missing follow-up budget') delete (scenarios[0]!.user as { maxFollowUps?: number }).maxFollowUps;
-    if (issue === 'missing persona') delete (scenarios[0]!.user as { persona?: string }).persona;
     if (issue === 'missing success criteria') delete (scenarios[0]! as { successCriteria?: string }).successCriteria;
     if (issue === 'missing simulator rubric') scenarios[0]!.metrics = scenarios[0]!.metrics.filter(m => m.subject === 'agent');
     const outputs = [{ requirements, questions: [] }, { families: plan }, { scenarios: scenarios.slice(0, 4) }, { scenarios: scenarios.slice(4) }];
@@ -520,20 +519,38 @@ test('a rejected answer is repaired from the stated reason instead of losing the
   } finally { await f.close(); }
 });
 
-test('card generation with observed profiles requires a profileId and passes the profiles as evidence', async () => {
+test('card generation can omit persona and profileId even when observed profiles are supplied', async () => {
   const quote = 'Support is available by email.';
   const profile = { id: 'observed_1', persona: 'Observed customer', characteristics: ['Writes short messages'], observedStyle: 'short', evidenceDialogueIds: ['d1'] };
   const requirements = [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }];
-  const outputs = [{ requirements, questions: [] }, { scenarios: [plainCard(0)] }, { requirements, questions: [] }, { scenarios: [{ ...plainCard(1), profileId: 'observed_1' }] }];
+  const plain = plainCard(0);
+  delete (plain.user as { persona?: string }).persona;
+  delete (plain.user as { characteristics?: string[] }).characteristics;
+  const outputs = [{ requirements, questions: [] }, { scenarios: [plain] }, { requirements, questions: [] }, { scenarios: [{ ...plainCard(1), profileId: 'observed_1' }] }];
   const f = await fixture(scripted(outputs));
   try {
     const input = { task: 'Evaluate support answers', sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }], existingAgent: { name: 'A', instructions: 'Help.', tools: [] }, scenarioCount: 1, profiles: [profile] };
-    await assert.rejects(f.adapter.prepare(input, callContext().ctx), /profileId/);
+    const unlinked = await f.adapter.prepare(input, callContext().ctx);
+    assert.equal(unlinked.scenarios[0]?.profileId, undefined);
+    assert.equal(unlinked.scenarios[0]?.user.persona, undefined);
+    assert.equal(unlinked.scenarios[0]?.user.characteristics, undefined);
     const prepared = await f.adapter.prepare(input, callContext().ctx);
     assert.equal(prepared.scenarios[0]?.profileId, 'observed_1');
-    assert.match(f.requests[3]?.systemPrompt ?? '', /profileId to one of them/);
+    assert.match(f.requests[3]?.systemPrompt ?? '', /Use profileId only when/);
     assert.match(JSON.stringify(f.requests[3]?.messages), /observedProfiles/);
     assert.match(JSON.stringify(f.requests[3]?.messages), /Observed customer/);
+  } finally { await f.close(); }
+});
+
+test('profile extraction may return no profiles and goals still retain their real openings', async () => {
+  const opening = 'Can I contact support?';
+  const f = await fixture(scripted([{ profiles: [] }, { goals: [{ id: 'g', goal: 'Contact support', opening, evidenceDialogueIds: ['d1'], successCriteria: 'Find the support contact' }] }]));
+  try {
+    const dialogues = [{ id: 'd1', outcome: 'unknown' as const, messages: [{ role: 'user' as const, content: opening }] }];
+    const profiles = await f.adapter.profiles!({ task: 'Support', sources: [], dialogues }, callContext().ctx);
+    assert.deepEqual(profiles, []);
+    const goals = await f.adapter.goals!({ task: 'Support', sources: [], dialogues, profiles }, callContext().ctx);
+    assert.equal(goals[0]!.opening, opening); assert.equal(goals[0]!.profileId, undefined);
   } finally { await f.close(); }
 });
 
@@ -590,5 +607,26 @@ test('the card generator is told to probe the agent perimeter with an out-of-sco
   try {
     await f.adapter.prepare({ task: 'Evaluate the appointment assistant', sources: [{ id: 'source_1', name: 'Agent card', content: quote, hash: 'hash' }], existingAgent: { name: 'A', instructions: 'Help.', tools: [] }, scenarioCount: 1 }, callContext().ctx);
     assert.match(f.requests[1]?.systemPrompt ?? '', /out-of-scope question whose success is a correct refusal or redirect/);
+  } finally { await f.close(); }
+});
+
+test('external generation repairs invented state and literal checks and receives a fixed simulator rubric', async () => {
+  const quote = 'Support is available by email.';
+  const card = plainCard(0); card.metrics = card.metrics.filter(m => m.subject === 'agent');
+  const bad = structuredClone(card);
+  bad.initialState.records = { invented_customer: { balance: 100 } };
+  bad.checks = [{ id: 'exact_words', kind: 'answer_contains', description: 'Correct answer', value: 'available by email' }] as never;
+  const outputs = [{ requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] }, { scenarios: [bad] }, { scenarios: [card] }];
+  const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+  try {
+    const prepared = await f.adapter.prepare({ task: 'Evaluate support answers', targetKind: 'command', scenarioCount: 1,
+      sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }],
+    }, callContext().ctx);
+    assert.equal(f.requests.length, 3); assert.match(f.requests[1]?.systemPrompt ?? '', /EXTERNAL TARGET/);
+    assert.match(JSON.stringify(f.requests[2]?.messages), /Without an external state\/tool contract/);
+    assert.deepEqual(prepared.scenarios[0]!.initialState.records, {}); assert.deepEqual(prepared.scenarios[0]!.checks, []);
+    const simulator = prepared.scenarios[0]!.metrics!.filter(m => m.subject === 'simulator');
+    assert.equal(simulator.length, 1); assert.equal(simulator[0]!.id, 'user_fidelity');
+    assert.match(simulator[0]!.failCriteria, /Неудача агента сама по себе/);
   } finally { await f.close(); }
 });

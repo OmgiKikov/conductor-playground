@@ -234,7 +234,7 @@ export function simulatorFidelity(record: Experiment): FidelityReport | null {
     return { metric, real: r, simulated: s, gap: r === null || s === null ? null : s - r };
   });
   const simulatorMetrics = new Set(record.scenarios.flatMap(s => (s.metrics ?? []).filter(m => m.subject === 'simulator').map(m => m.id)));
-  const verdicts = record.humanReviews.filter(r => r.metricId && simulatorMetrics.has(r.metricId) && (r.verdict === 'pass' || r.verdict === 'fail'));
+  const verdicts = [...latestHumanReviews(record).values()].filter(r => r.metricId && simulatorMetrics.has(r.metricId) && (r.verdict === 'pass' || r.verdict === 'fail'));
   return { metrics, realDialogues: record.dialogues.length, simulatedDialogues: simulated.length, humanFidelity: { reviewed: verdicts.length, passed: verdicts.filter(r => r.verdict === 'pass').length } };
 }
 
@@ -253,23 +253,31 @@ export interface VerdictSummary {
   weakSpots: { kind: 'check' | 'metric'; description: string; failures: number; stage?: string }[];
   confidence: 'low' | 'medium' | 'high'; confidenceReasons: VerdictNote[]; nextSteps: VerdictNote[];
 }
-/**
- * Dialogues whose failure still needs a person: failed objectively or by an agent rubric,
- * and without a decisive (pass/fail) verdict from the owner. The board reviews these first,
- * and the confidence rule counts exactly the same set, so the two can never disagree.
- */
+/** Rubric outcomes stay separate from objective checks everywhere they are presented. */
+export function agentRubricResult(scenario: Scenario | undefined, trial: Trial): 'pass' | 'fail' | 'unknown' | undefined {
+  const metrics = scenario?.metrics?.filter(m => m.subject === 'agent') ?? [];
+  if (!metrics.length) return undefined;
+  const results = metrics.map(m => trial.assessments?.find(a => a.metricId === m.id)?.result);
+  return results.includes('fail') ? 'fail' : results.every(r => r === 'pass') ? 'pass' : 'unknown';
+}
+export function isAgentFailure(record: Experiment, trial: Trial): boolean {
+  return !['invalid', 'cancelled'].includes(trial.outcome) && (trial.outcome === 'fail'
+    || agentRubricResult(record.scenarios.find(s => s.id === trial.scenarioId), trial) === 'fail');
+}
+/** A label on a passing or simulator criterion does not resolve an agent's failed criteria. */
 export function awaitingVerdict(record: Experiment): Set<string> {
   const latest = latestHumanReviews(record);
-  const decided = new Set<string>();
-  for (const review of latest.values()) if (review.verdict === 'pass' || review.verdict === 'fail') decided.add(review.trialId);
-  const pending = new Set<string>();
-  for (const trial of record.trials) {
-    if (decided.has(trial.id)) continue;
-    const agentRubrics = record.scenarios.find(s => s.id === trial.scenarioId)?.metrics?.filter(m => m.subject === 'agent') ?? [];
-    const rubricFailed = (trial.assessments ?? []).some(a => a.result === 'fail' && agentRubrics.some(m => m.id === a.metricId));
-    if (trial.outcome === 'fail' || rubricFailed) pending.add(trial.id);
-  }
-  return pending;
+  const decided = (key: string) => ['pass', 'fail'].includes(latest.get(key)?.verdict ?? '');
+  return new Set(record.trials.filter(trial => {
+    if (!isAgentFailure(record, trial) || decided(`${trial.id}|dialogue`)) return false;
+    const failed = [
+      ...trial.checks.filter(c => !c.passed).map(c => `check:${c.id}`),
+      ...(record.scenarios.find(s => s.id === trial.scenarioId)?.metrics ?? [])
+        .filter(m => m.subject === 'agent' && trial.assessments?.some(a => a.metricId === m.id && a.result === 'fail'))
+        .map(m => `metric:${m.id}`),
+    ];
+    return !failed.length || failed.some(key => !decided(`${trial.id}|${key}`));
+  }).map(t => t.id));
 }
 
 /**
@@ -282,23 +290,10 @@ function disagreeing(calibration: CalibrationRow[]): CalibrationRow[] {
   return calibration.filter(row => row.n >= DISAGREEMENT_SIGNAL.pairs && row.agreement !== null && row.agreement < DISAGREEMENT_SIGNAL.agreement);
 }
 
-/** Fewer graded dialogues than this cannot say anything about an agent at all. */
+// ponytail: audit heuristics, not statistical confidence; use a calibrated estimator for population claims.
 const MIN_GRADED = 5;
-/**
- * Error analysis works on tens of traces, not units: the established practice is to start
- * from about a hundred and label at least the first thirty by hand. A run smaller than this
- * can be right, but it cannot be called trusted.
- */
 const TRUSTED_SAMPLE = 30;
-/**
- * The plain-language layer: "is my agent good, and how much should I trust that?"
- * Confidence rules are deliberately simple and stated in the reasons:
- *   low     – fewer than MIN_GRADED objectively graded dialogues (rubric-only runs included), or every card is synthetic, or more than a quarter of dialogues were invalid
- *   medium  – real or golden cards exist but human review is missing, not finalized, some failed dialogues lack a decisive (pass/fail) verdict, or the sample is below TRUSTED_SAMPLE
- *   high    – review finalized, every failed dialogue carries a decisive human verdict, at least one non-synthetic card, TRUSTED_SAMPLE+ graded dialogues, no invalid ones
- *   unknown/invalid human verdicts never decide anything; they stay listed as undecided
- * Wording lives here, in the owner's language: the board, the report and the CLI all read these notes.
- */
+/** High confidence requires a complete, diverse sample and individual human review; repeats add no coverage. */
 export function verdictSummary(record: Experiment): VerdictSummary {
   const gradedTrials = record.trials.filter(graded);
   const passed = gradedTrials.filter(t => t.outcome === 'pass').length;
@@ -321,7 +316,7 @@ export function verdictSummary(record: Experiment): VerdictSummary {
     if (trial.outcome === 'pass') row.passed += 1;
   }
   // A smoke card is the floor of the product: if it fails, nothing above it is worth reading yet.
-  const smokeFailures = gradedTrials.filter(t => t.outcome === 'fail' && tierOf(t.scenarioId) === 'smoke').length;
+  const smokeFailures = record.trials.filter(t => isAgentFailure(record, t) && tierOf(t.scenarioId) === 'smoke').length;
 
   // Per stage: every criterion that named a job of the agent, counted where it was evaluated.
   const stageTally = new Map<string, { passed: number; evaluated: number }>();
@@ -349,7 +344,6 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   const checkFailures = new Map<string, number>();
   const metricFailures = new Map<string, number>();
   const rubric = { assessed: 0, passed: 0, failed: 0, unknown: 0 };
-  const rubricFailed = new Set<string>();
   const failureStage = new Map<string, string>();
   let simulatorFlagged = 0;
   for (const trial of completed) {
@@ -363,8 +357,8 @@ export function verdictSummary(record: Experiment): VerdictSummary {
     const agentResults = (trial.assessments ?? []).filter(a => subjectOf(a.metricId) === 'agent');
     if (agentResults.length) {
       rubric.assessed += 1;
-      if (agentResults.some(a => a.result === 'fail')) { rubric.failed += 1; rubricFailed.add(trial.id); }
-      else if (agentResults.some(a => a.result === 'unknown')) rubric.unknown += 1;
+      if (agentRubricResult(scenario, trial) === 'fail') rubric.failed += 1;
+      else if (agentRubricResult(scenario, trial) !== 'pass') rubric.unknown += 1;
       else rubric.passed += 1;
     }
     if ((trial.assessments ?? []).some(a => subjectOf(a.metricId) === 'simulator' && a.result === 'fail')) simulatorFlagged += 1;
@@ -390,10 +384,11 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   const decisiveVerdicts = current.some(decisive);
   const finalized = !!record.resultsReviewedAt;
   // A failed dialogue is one that failed objectively or by the agent rubrics; every one of them needs a decisive human verdict before the result is trusted.
-  const failedTrials = completed.filter(t => t.outcome === 'fail' || rubricFailed.has(t.id));
+  const failedTrials = completed.filter(t => isAgentFailure(record, t));
+  const pending = awaitingVerdict(record);
   const reviewsFor = (trialId: string) => current.filter(r => r.trialId === trialId);
   const unreviewed = failedTrials.filter(t => reviewsFor(t.id).length === 0).length;
-  const undecided = failedTrials.filter(t => { const reviews = reviewsFor(t.id); return reviews.length > 0 && !reviews.some(decisive); }).length;
+  const undecided = failedTrials.filter(t => reviewsFor(t.id).length > 0 && pending.has(t.id)).length;
   const reasons: VerdictNote[] = [];
   if (gradedCount === 0 && rubric.assessed === 0) reasons.push({ code: 'none_graded', text: 'Диалогов с оценкой ещё нет.' });
   else if (gradedCount === 0) reasons.push({ code: 'rubric_only', text: 'Только оценки модели по рубрикам, объективных проверок нет: кодом ничего не подтверждено.' });
@@ -406,16 +401,22 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   else if (!finalized) reasons.push({ code: 'not_finalized', text: 'Аудит результатов человеком не завершён.' });
   else {
     if (unreviewed) reasons.push({ code: 'unreviewed_failures', text: `${unreviewed} провалившихся диалог(ов) без вердикта человека.`, count: unreviewed });
-    if (undecided) reasons.push({ code: 'undecided_failures', text: `${undecided} провалившихся диалог(ов) только с вердиктами «неясно» или «невалидно».`, count: undecided });
+    if (undecided) reasons.push({ code: 'undecided_failures', text: `${undecided} провалившихся диалог(ов) ещё без решающего вердикта на диалог или все проваленные критерии.`, count: undecided });
   }
   const invalidShare = record.trials.length ? invalid / record.trials.length : 0;
-  const reviewComplete = finalized && decisiveVerdicts && unreviewed === 0 && undecided === 0 && invalid === 0;
-  if (reviewComplete && gradedCount >= MIN_GRADED && gradedCount < TRUSTED_SAMPLE) {
-    reasons.push({ code: 'small_sample', text: `Разобрано ${gradedCount} диалог(ов) из ${TRUSTED_SAMPLE}, с которых выборка перестаёт быть случайной.`, count: gradedCount });
-  }
-  if (smokeFailures) reasons.unshift({ code: 'smoke_failed', text: `Провалено ${smokeFailures} дымовых карточек: базовое поведение сломано, остальное читать рано.`, count: smokeFailures });
-  const confidence: VerdictSummary['confidence'] = gradedCount < MIN_GRADED || allSynthetic || invalidShare > 0.25 || smokeFailures ? 'low'
-    : reviewComplete && gradedCount >= TRUSTED_SAMPLE ? 'high' : 'medium';
+  const uniqueCards = new Set(gradedTrials.map(t => t.scenarioId)).size;
+  const families = new Set(gradedTrials.map(t => t.familyId)).size;
+  const reviewedCards = new Set(record.trials.filter(t => current.some(r => r.trialId === t.id && !r.metricId && !r.checkId && decisive(r))).map(t => t.scenarioId)).size;
+  const reviewComplete = finalized && decisiveVerdicts && pending.size === 0 && invalid === 0;
+  if (gradedCount >= MIN_GRADED && uniqueCards < TRUSTED_SAMPLE) reasons.push({ code: 'small_sample', text: `Проверено ${uniqueCards} разных карточек. Для высокого доверия нужны ${TRUSTED_SAMPLE}; повторы не расширяют покрытие.`, count: uniqueCards });
+  if (families < 8 && gradedCount >= MIN_GRADED) reasons.push({ code: 'few_families', text: `Покрыто ${families} семейств ситуаций из ориентира 8.`, count: families });
+  if (reviewedCards < TRUSTED_SAMPLE && gradedCount >= MIN_GRADED) reasons.push({ code: 'few_reviews', text: `Индивидуально разобрано ${reviewedCards} разных карточек из ${TRUSTED_SAMPLE}.`, count: reviewedCards });
+  const incomplete = record.workflow === 'evaluate' ? runCompleteness(record) : [];
+  if (incomplete.length && record.trials.length) reasons.push({ code: 'incomplete_run', text: 'Прогон неполный или содержит невалидные попытки: итог описывает только сохранённую часть.' });
+  if (record.mode === 'demo') reasons.push({ code: 'demo', text: 'Сценарное демо проверяет механику, а не качество модели.' });
+  if (smokeFailures) reasons.unshift({ code: 'smoke_failed', text: `Провалено ${smokeFailures} попыток на дымовых карточках: базовое поведение требует исправления.`, count: smokeFailures });
+  const confidence: VerdictSummary['confidence'] = gradedCount < MIN_GRADED || allSynthetic || invalidShare > 0.25 || smokeFailures || record.mode === 'demo' ? 'low'
+    : reviewComplete && uniqueCards >= TRUSTED_SAMPLE && families >= 8 && reviewedCards >= TRUSTED_SAMPLE && !incomplete.length && !simulatorFlagged ? 'high' : 'medium';
   const nextSteps: VerdictNote[] = [];
   if (gradedCount === 0 && rubric.assessed === 0) nextSteps.push({ code: 'approve_and_run', text: 'Утвердите карточки в /agent-lab и запустите диалоги.' });
   if (allSynthetic) nextSteps.push({ code: 'add_real_data', text: 'Добавьте golden set или реальные диалоги, чтобы результат не держался на одной синтетике.' });
@@ -426,12 +427,12 @@ export function verdictSummary(record: Experiment): VerdictSummary {
   for (const row of disagreeing(judgeCalibration(record))) {
     nextSteps.push({ code: 'rewrite_rubric', text: `Перепишите рубрику «${row.key}»: судья расходится с вашими вердиктами в ${Math.round((1 - (row.agreement ?? 0)) * 100)}% случаев.`, detail: row.key, count: row.n });
   }
-  if (gradedCount > 0 && gradedCount < TRUSTED_SAMPLE) nextSteps.push({ code: 'run_more', text: `Прогоните больше карточек: ${gradedCount} диалог(ов) против ${TRUSTED_SAMPLE}, с которых результату можно верить.`, count: gradedCount });
+  if (gradedCount > 0 && uniqueCards < TRUSTED_SAMPLE) nextSteps.push({ code: 'run_more', text: `Добавьте новые ситуации: проверено ${uniqueCards} разных карточек; ориентир для аудита — ${TRUSTED_SAMPLE}. Это не статистическая гарантия.`, count: uniqueCards });
   const passRate = gradedCount ? passed / gradedCount : null;
   const confidenceWord: Record<VerdictSummary['confidence'], string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
   const estimates = rubric.assessed ? ` ${record.mode === 'demo' ? 'Сценарная оценка демо' : 'Оценка модели'} (не проверена): ${rubric.passed} из ${rubric.assessed} диалогов без замечаний по рубрикам агента.` : '';
   const headline = gradedCount ? `Пройдено ${passed} из ${gradedCount} диалогов (${Math.round((passRate ?? 0) * 100)}%). Доверие ${confidenceWord[confidence]}.${estimates}`
-    : rubric.assessed ? `Объективных проверок нет.${estimates} Доверие ${confidenceWord[confidence]}.` : 'Диалогов с оценкой ещё нет.';
+    : rubric.assessed ? `${estimates.trim()} Провалов: ${rubric.failed}; неясно: ${rubric.unknown}. Доверие ${confidenceWord[confidence]}. Объективных проверок нет.` : 'Диалогов с оценкой ещё нет.';
   return { headline, passed, graded: gradedCount, invalid, passRate, rubric, simulatorFlagged, provenance, stages, tiers, weakSpots, confidence, confidenceReasons: reasons, nextSteps };
 }
 
@@ -473,69 +474,119 @@ export function evidenceSummary(record: Experiment): EvidenceSummary {
  * per rung, and it states out loud when the two runs are not actually comparable.
  */
 export interface RunComparison {
-  headline: string;
+  headline: string; comparable: boolean;
+  coverage: { plannedPairs: number; validPairs: number; excludedPairs: number; missingBefore: number; missingAfter: number; invalidBefore: number; invalidAfter: number };
   cards: { shared: number; onlyBefore: string[]; onlyAfter: string[] };
   fixed: { scenarioId: string; title: string; tier: Tier }[];
   regressed: { scenarioId: string; title: string; tier: Tier }[];
   unchanged: { passing: number; failing: number };
+  ungraded: number; includesRubrics: boolean;
   stages: { stage: string; before: number | null; after: number | null }[];
   tiers: { tier: Tier; before: { passed: number; graded: number }; after: { passed: number; graded: number } }[];
   notes: string[];
 }
 
-/** A card passes a run only when every graded dialogue of that card passed; one failure is a failure. */
-function cardOutcome(record: Experiment, scenarioId: string): 'pass' | 'fail' | 'ungraded' {
-  const trials = record.trials.filter(t => t.scenarioId === scenarioId && graded(t));
-  if (!trials.length) return 'ungraded';
-  return trials.every(t => t.outcome === 'pass') ? 'pass' : 'fail';
+/** Expected attempts, including all repeats. Missing/invalid attempts never disappear from a comparison. */
+export function plannedTrials(record: Experiment): number {
+  return record.scenarios.reduce((sum, s) => sum + record.settings.userModes.filter(m => m !== 'scripted' || s.user.script?.length).length * record.settings.repeats, 0);
+}
+const attemptKey = (trial: Trial) => `${trial.scenarioId}|${trial.userMode}|${trial.repeat}`;
+const measured = (trial: Trial) => graded(trial) || trial.outcome === 'ungraded';
+function runCompleteness(record: Experiment, allowPartial = false): string[] {
+  const expected = new Set(record.scenarios.flatMap(s => record.settings.userModes.filter(m => m !== 'scripted' || s.user.script?.length)
+    .flatMap(mode => Array.from({ length: record.settings.repeats }, (_, i) => `${s.id}|${mode}|${i}`))));
+  const seen = new Set<string>();
+  const ids = new Set<string>();
+  let invalid = false;
+  let unmeasured = false;
+  for (const trial of record.trials) {
+    const key = attemptKey(trial);
+    const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
+    if (!expected.has(key) || seen.has(key) || ids.has(trial.id) || !scenario
+      || trial.familyId !== scenario.familyId || fingerprint(trial.initialState) !== fingerprint(scenario.initialState)
+      || trial.split !== scenario.split
+      || measured(trial) && (trial.checks.length !== scenario.checks.length || new Set(trial.checks.map(c => c.id)).size !== scenario.checks.length
+        || trial.checks.some(c => !scenario.checks.some(expected => expected.id === c.id)))
+      || trial.outcome === 'pass' && (!trial.checks.length || trial.checks.some(c => !c.passed))
+      || (record.manifestHash && trial.manifestHash !== record.manifestHash)) invalid = true;
+    if (!measured(trial)) unmeasured = true;
+    seen.add(key); ids.add(trial.id);
+  }
+  const notes: string[] = [];
+  if (!['results_review', 'complete'].includes(record.phase)) notes.push('Прогон не завершён.');
+  if (invalid || !expected.size) notes.push('Есть повторяющиеся или несовместимые попытки.');
+  if (!allowPartial && (unmeasured || seen.size !== expected.size || record.trials.length !== expected.size)) notes.push('Есть пропущенные или невалидные попытки.');
+  return notes;
+}
+function cardOutcome(record: Experiment, scenario: Scenario): 'pass' | 'fail' | 'unknown' {
+  const trials = record.trials.filter(t => t.scenarioId === scenario.id);
+  if (!trials.length) return 'unknown';
+  if (trials.some(t => isAgentFailure(record, t))) return 'fail';
+  return trials.every(t => {
+    const rubric = agentRubricResult(scenario, t);
+    return (!scenario.checks.length || t.outcome === 'pass') && (rubric === 'pass' || (rubric === undefined && scenario.checks.length > 0));
+  }) ? 'pass' : 'unknown';
 }
 
 export function compareRuns(before: Experiment, after: Experiment): RunComparison {
   const beforeIds = new Set(before.scenarios.map(s => s.id));
   const afterIds = new Set(after.scenarios.map(s => s.id));
   const shared = after.scenarios.filter(s => beforeIds.has(s.id));
-  const onlyBefore = before.scenarios.filter(s => !afterIds.has(s.id)).map(s => s.id);
-  const onlyAfter = after.scenarios.filter(s => !beforeIds.has(s.id)).map(s => s.id);
-
-  const fixed: RunComparison['fixed'] = [];
-  const regressed: RunComparison['regressed'] = [];
-  let stillPassing = 0;
-  let stillFailing = 0;
-  for (const scenario of shared) {
-    const was = cardOutcome(before, scenario.id);
-    const now = cardOutcome(after, scenario.id);
-    if (was === 'ungraded' || now === 'ungraded') continue;
-    if (was === 'fail' && now === 'pass') fixed.push({ scenarioId: scenario.id, title: scenario.title, tier: scenario.tier });
-    else if (was === 'pass' && now === 'fail') regressed.push({ scenarioId: scenario.id, title: scenario.title, tier: scenario.tier });
-    else if (now === 'pass') stillPassing += 1;
-    else stillFailing += 1;
-  }
-
-  const beforeVerdict = verdictSummary(before);
-  const afterVerdict = verdictSummary(after);
-  const rate = (rows: VerdictSummary['stages'], stage: string) => {
-    const row = rows.find(r => r.stage === stage);
-    return row ? row.passed / row.evaluated : null;
+  const result: RunComparison = {
+    headline: '', comparable: false, cards: { shared: shared.length,
+      onlyBefore: before.scenarios.filter(s => !afterIds.has(s.id)).map(s => s.id),
+      onlyAfter: after.scenarios.filter(s => !beforeIds.has(s.id)).map(s => s.id) },
+    fixed: [], regressed: [], unchanged: { passing: 0, failing: 0 }, ungraded: 0,
+    includesRubrics: shared.some(s => s.metrics?.some(m => m.subject === 'agent')),
+    stages: [], tiers: [], notes: [],
+    coverage: { plannedPairs: plannedTrials(before), validPairs: 0, excludedPairs: plannedTrials(before),
+      missingBefore: Math.max(0, plannedTrials(before) - before.trials.length), missingAfter: Math.max(0, plannedTrials(after) - after.trials.length),
+      invalidBefore: before.trials.filter(t => !measured(t)).length, invalidAfter: after.trials.filter(t => !measured(t)).length },
   };
-  const stageNames = [...new Set([...beforeVerdict.stages, ...afterVerdict.stages].map(r => r.stage))].sort();
-  const stages = stageNames.map(stage => ({ stage, before: rate(beforeVerdict.stages, stage), after: rate(afterVerdict.stages, stage) }));
-  const tiers = afterVerdict.tiers.map(row => ({
-    tier: row.tier,
-    before: (() => { const b = beforeVerdict.tiers.find(t => t.tier === row.tier)!; return { passed: b.passed, graded: b.graded }; })(),
-    after: { passed: row.passed, graded: row.graded },
-  }));
-
-  const notes: string[] = [];
-  if (fingerprint(before.target) !== fingerprint(after.target)) notes.push('Испытуемый в прогонах разный: это сравнение не о версии одного агента.');
-  if (fingerprint(before.settings.userModes) !== fingerprint(after.settings.userModes)) notes.push('Режимы пользователя отличаются, условия прогонов не совпадают.');
-  if (before.settings.repeats !== after.settings.repeats) notes.push(`Число повторов отличается: было ${before.settings.repeats}, стало ${after.settings.repeats}.`);
-  if (onlyBefore.length || onlyAfter.length) notes.push(`Набор карточек изменился: только в первом ${onlyBefore.length}, только во втором ${onlyAfter.length}. Сравниваются ${shared.length} общих.`);
-  const smokeRegressions = regressed.filter(r => r.tier === 'smoke').length;
-  if (smokeRegressions) notes.push(`Сломано ${smokeRegressions} дымовых карточек: базовое поведение сломано изменением.`);
-  const compared = fixed.length + regressed.length + stillPassing + stillFailing;
-  if (compared < TRUSTED_SAMPLE) notes.push(`Сравнение идёт по ${compared} карточкам из ${TRUSTED_SAMPLE}: разница такого размера может быть случайной.`);
-
-  const headline = !compared ? 'Общих оценённых карточек нет, сравнивать нечего.'
-    : `Исправлено ${fixed.length}, сломалось ${regressed.length}, без изменений ${stillPassing + stillFailing} из ${compared} карточек.`;
-  return { headline, cards: { shared: shared.length, onlyBefore, onlyAfter }, fixed, regressed, unchanged: { passing: stillPassing, failing: stillFailing }, stages, tiers, notes };
+  const { notes } = result;
+  if (before.id === after.id) notes.push('Выбран один и тот же прогон.');
+  if (before.workflow !== 'evaluate' || after.workflow !== 'evaluate') notes.push('Сравнение поддерживает отдельные оценочные прогоны.');
+  if (before.mode !== after.mode) notes.push('Демо и живые прогоны несравнимы.');
+  if (fingerprint(before.target) !== fingerprint(after.target) && after.parentRunId !== before.id) notes.push('Испытуемый в прогонах разный: выберите повтор того же агента.');
+  if (fingerprint(before.settings) !== fingerprint(after.settings)) notes.push('Настройки, модель, режимы пользователя или число повторов отличаются.');
+  if (fingerprint(before.sources) !== fingerprint(after.sources) || fingerprint(before.requirements) !== fingerprint(after.requirements)) notes.push('Материалы или требования изменились.');
+  if (result.cards.onlyBefore.length || result.cards.onlyAfter.length) notes.push('Набор карточек изменился.');
+  const changed = shared.filter(s => fingerprint(s) !== fingerprint(before.scenarios.find(b => b.id === s.id)));
+  if (changed.length) notes.push(`Содержимое карточек изменилось: ${changed.map(s => s.title).join(', ')}.`);
+  for (const [name, record] of [['До', before], ['После', after]] as const) notes.push(...runCompleteness(record, true).map(n => `${name}: ${n}`));
+  if (notes.length) { result.headline = 'Прогоны несравнимы. Исправления и регрессии не подсчитываются.'; return result; }
+  const afterAttempts = new Map(after.trials.map(t => [attemptKey(t), t]));
+  const pairs = before.trials.filter(t => measured(t) && afterAttempts.has(attemptKey(t)) && measured(afterAttempts.get(attemptKey(t))!));
+  result.coverage.validPairs = pairs.length;
+  result.coverage.excludedPairs -= pairs.length;
+  if (result.coverage.excludedPairs) notes.push(`Сопоставлено ${pairs.length} из ${result.coverage.plannedPairs} пар попыток. Исключено ${result.coverage.excludedPairs}: до — ${result.coverage.invalidBefore} невалидных и ${result.coverage.missingBefore} пропущенных; после — ${result.coverage.invalidAfter} невалидных и ${result.coverage.missingAfter} пропущенных. Сбои могут скрывать регрессии; вывод относится только к сопоставленной части.`);
+  if (!pairs.length) { result.headline = 'Нет совпадающих валидных попыток. Повторите неудавшиеся диалоги, чтобы получить сравнение.'; return result; }
+  before = { ...before, trials: pairs };
+  after = { ...after, trials: pairs.map(t => afterAttempts.get(attemptKey(t))!) };
+  result.comparable = true;
+  for (const scenario of shared) {
+    const was = cardOutcome(before, scenario);
+    const now = cardOutcome(after, scenario);
+    if (was === 'unknown' || now === 'unknown') { result.ungraded++; continue; }
+    const row = { scenarioId: scenario.id, title: scenario.title, tier: scenario.tier ?? 'regression' };
+    if (was === 'fail' && now === 'pass') result.fixed.push(row);
+    else if (was === 'pass' && now === 'fail') result.regressed.push(row);
+    else if (now === 'pass') result.unchanged.passing++;
+    else result.unchanged.failing++;
+  }
+  const bv = verdictSummary(before);
+  const av = verdictSummary(after);
+  const rate = (v: VerdictSummary, stage: string) => { const s = v.stages.find(s => s.stage === stage); return s ? s.passed / s.evaluated : null; };
+  result.stages = [...new Set([...bv.stages, ...av.stages].map(s => s.stage))].sort().map(stage => ({ stage, before: rate(bv, stage), after: rate(av, stage) }));
+  result.tiers = av.tiers.map(row => ({ tier: row.tier, before: bv.tiers.find(t => t.tier === row.tier)!, after: row }));
+  const compared = shared.length - result.ungraded;
+  result.headline = compared ? `Исправлено ${result.fixed.length}, сломалось ${result.regressed.length}, без изменений ${result.unchanged.passing + result.unchanged.failing} из ${compared} карточек.` : 'Общих оценённых карточек нет, сравнивать нечего.';
+  if (result.coverage.excludedPairs) result.headline = `Частичное сравнение (${pairs.length}/${result.coverage.plannedPairs} пар). ${result.headline}`;
+  if (result.ungraded) notes.push(`${result.ungraded} карточек без решающей оценки; они не считаются пройденными.`);
+  if (result.includesRubrics) notes.push('Сравнение включает предварительные оценки модели по рубрикам. Это не подтверждённое улучшение.');
+  const smoke = result.regressed.filter(r => r.tier === 'smoke').length;
+  if (smoke) notes.push(`Сломано ${smoke} дымовых карточек: сначала восстановите базовое поведение.`);
+  if (compared < TRUSTED_SAMPLE) notes.push(`Сравнение по ${compared} карточкам: разница может быть случайной. Повторы не создают новые ситуации.`);
+  if (before.target.kind !== 'sandbox' && (!before.targetVersion || !after.targetVersion)) notes.push('Не все версии внешнего агента названы. Локальный отпечаток не учитывает удалённые сервисы и переменные окружения.');
+  return result;
 }

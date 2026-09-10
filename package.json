@@ -29,7 +29,7 @@
   },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
-    "typecheck": "tsc --noEmit && tsc --noEmit --strict --noUncheckedIndexedAccess --target ES2023 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/*.ts",
+    "typecheck": "npm run build && tsc --noEmit --strict --noUncheckedIndexedAccess --target ES2023 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/*.ts",
     "demo": "tsx src/cli.ts demo",
     "test": "npm run build && tsx --test test/*.test.ts",
     "pi": "pi -e ./extensions/agent-lab.ts --skill ./skills/agent-builder/SKILL.md",

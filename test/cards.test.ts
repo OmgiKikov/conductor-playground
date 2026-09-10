@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { visibleWidth, stripTerminalSequences } from '@earendil-works/pi-tui';
 import { LabBoard, reviewOrder, safeText, type BoardAction } from '../extensions/cards.ts';
+import { htmlReport } from '../src/report.js';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
 import { emptyUsage, fingerprint, type Experiment } from '../src/contracts.js';
 
@@ -74,7 +75,7 @@ test('result cards keep model grades, missing grades, traces and human annotatio
     checks: [], events: [{ seq: 0, type: 'user', text: 'Реплика пользователя' }, { seq: 1, type: 'assistant', text: 'Ответ агента' }], initialState: scenario.initialState, finalState: scenario.initialState, usage: { ...emptyUsage(), costUsd: null }, elapsedMs: 12,
     assessments: [{ metricId: 'm1', result: 'unknown', rationale: 'Недостаточно данных', evidence: [1] }] }];
   record.humanReviews = [{ id: 'h1', trialId: 'trial1', verdict: 'fail', note: 'Ошибка в реплике #1', createdAt: record.createdAt }];
-  const board = new LabBoard({ record }, theme, () => {}, () => {}, () => 120);
+  const board = new LabBoard({ record, section: 'results' }, theme, () => {}, () => {}, () => 120);
   const text = stripTerminalSequences(board.render(120).join('\n'));
   assert.match(text, /Агент · Точность: НЕЯСНО/);
   assert.match(text, /Симулятор · Реалистичность: НЕТ ОЦЕНКИ/);
@@ -86,8 +87,18 @@ test('result cards keep model grades, missing grades, traces and human annotatio
   assert.match(text, /#1  АГЕНТ/);
   assert.match(text, /Ответ агента/);
   board.dispose();
+  scenario.checks = []; record.trials[0]!.outcome = 'ungraded';
+  record.trials[0]!.assessments = [
+    { metricId: 'm2', result: 'fail', rationale: 'SIMULATOR_FAILURE_SENTINEL', evidence: [0] },
+    { metricId: 'm1', result: 'fail', rationale: 'AGENT_FAILURE_SENTINEL', evidence: [1] },
+  ];
+  const overview = new LabBoard({ record }, theme, () => {}, () => {}, () => 120);
+  const overviewText = overview.render(120).join('\n');
+  assert.match(overviewText, /AGENT_FAILURE_SENTINEL/); assert.doesNotMatch(overviewText, /SIMULATOR_FAILURE_SENTINEL/);
+  assert.match(overviewText, /реплики #1/); overview.dispose();
+  assert.match(htmlReport(record), /По рубрикам · предварительно<\/h3><strong>0<span class="muted"> \/ 1/);
   record.phase = 'complete'; record.resultsReviewedAt = record.updatedAt; record.humanReviews = [];
-  const reviewed = new LabBoard({ record }, theme, () => {}, () => {}, () => 120);
+  const reviewed = new LabBoard({ record, section: 'results' }, theme, () => {}, () => {}, () => 120);
   assert.match(reviewed.render(120).join('\n'), /Набор проверен человеком.*вердикта нет/);
   reviewed.dispose();
 });
@@ -191,6 +202,50 @@ test('the board leads with a plain verdict once dialogues exist and keeps the re
   for (const width of [16, 40, 80]) for (const line of board.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}`);
   board.dispose();
   const results = new LabBoard({ record }, theme, () => {}, () => {}, () => 40);
-  assert.match(stripTerminalSequences(results.render(120).join('\n')), /Итог: пройдено 2 из 3/);
+  assert.match(results.render(120).join('\n'), /ЧТО ТРЕБУЕТ ВНИМАНИЯ/);
+  assert.match(stripTerminalSequences(results.render(120).join('\n')), /Итог: Пройдено 2 из 3/);
   results.dispose();
+});
+
+test('filtered review targets the visible trial ID and help cannot accidentally submit a verdict', async () => {
+  const record = await fixture(); record.phase = 'results_review';
+  record.trials = record.scenarios.map((s, i) => ({ id: `trial-${i}`, scenarioId: s.id, revisionId: 'r', familyId: s.familyId, repeat: 0, userMode: 'reactive', split: 'dev', manifestHash: 'h', outcome: 'fail', reason: '', checks: [{ id: 'c', passed: false, evidence: '', description: 'c' }], events: [], initialState: s.initialState, finalState: s.initialState, elapsedMs: 1, usage: emptyUsage() }));
+  record.scenarios[0]!.title = 'Первый'; record.scenarios[1]!.title = 'Возврат';
+  const actions: BoardAction[] = [];
+  const board = new LabBoard({ record, section: 'results' }, theme, a => actions.push(a), () => {}, () => 30);
+  board.handleInput('?'); board.handleInput('n'); assert.equal(actions.length, 0); board.handleInput('?');
+  board.handleInput('/'); board.handleInput('Возврат'); board.handleInput('\r');
+  const lines = board.render(120);
+  assert.ok(lines.at(-1)?.endsWith('╯'), 'footer fits the terminal');
+  assert.match(lines.join('\n'), /Возврат/);
+  board.handleInput('n');
+  assert.equal(actions[0]?.type === 'verdict' && actions[0].trialId, 'trial-1');
+  const discussion = new LabBoard({ record, section: 'cards', query: 'Возврат' }, theme, a => actions.push(a), () => {});
+  discussion.handleInput('a');
+  assert.equal(actions[1]?.type === 'discuss' && record.scenarios[actions[1].selected]?.id, record.scenarios[1]!.id);
+  const empty = new LabBoard({ records: [] }, theme, a => actions.push(a), () => {});
+  empty.handleInput('n'); assert.equal(actions[2]?.type, 'new');
+});
+
+test('HTML reports escape untrusted text and remain self-contained with explicit evidence limits', async () => {
+  const record = await fixture();
+  record.task = '<script>alert(1)</script> & "тест"';
+  const html = htmlReport(record);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script|<iframe|<img|<link|<form/i);
+  assert.match(html, /default-src 'none'/);
+  assert.match(html, /lang="ru"/);
+  assert.match(html, /Аудит не завершён/);
+  assert.match(html, /Сценарное демо/);
+  record.profiles = [{ id: 'p', source: 'observed', persona: '<img src=x>', characteristics: ['Original trait'], evidenceDialogueIds: ['d1'], draftOverride: { persona: null, characteristics: ['<script>override</script>'] } }];
+  record.scenarios[0]!.profileId = 'p'; delete record.scenarios[0]!.user.persona;
+  const profiles = htmlReport(record);
+  assert.match(profiles, /&lt;img src=x&gt;/); assert.match(profiles, /&lt;script&gt;override&lt;\/script&gt;/);
+  assert.match(profiles, /Правка черновика/); assert.match(profiles, /Персона: убрана/);
+  assert.doesNotMatch(profiles, /<script|<img/i);
+  record.workflow = 'compare'; record.scenarios[1]!.split = 'control'; record.scenarios[1]!.title = 'CONTROL_CARD_SENTINEL';
+  assert.doesNotMatch(htmlReport(record), /CONTROL_CARD_SENTINEL/);
+  record.controlConsumedAt = 'now'; record.phase = 'control';
+  assert.doesNotMatch(htmlReport(record), /CONTROL_CARD_SENTINEL/);
+  record.phase = 'complete'; assert.match(htmlReport(record), /CONTROL_CARD_SENTINEL/);
 });

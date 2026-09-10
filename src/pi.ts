@@ -5,11 +5,11 @@ import {
 import { Type } from 'typebox';
 import { z } from 'zod';
 import {
-  agentSchema, failureModeSchema, metricAssessmentSchema, observedGoalSchema, preparationSchema, profileSchema, proposalSchema, requirementSchema, scenarioSchema,
-  TOOL_NAMES, userTurnSchema, validateObservedGoals,
+  agentSchema, failureModeSchema, metricAssessmentSchema, observedGoalSchema, observedProfileSchema, preparationSchema, proposalSchema, requirementSchema, scenarioSchema,
+  TOOL_NAMES, simulatorFidelity, userTurnSchema, validateObservedGoals,
   type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
-import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
+import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
 const groundingSchema = z.strictObject({
@@ -23,10 +23,13 @@ const familyPlanSchema = z.strictObject({ families: z.array(z.strictObject({
 })).min(4).max(16) });
 // New generated cards require an explicit interaction budget; older saved cards keep their original semantics.
 // With observed profiles the model may only choose a profileId; persona text is copied from the profile later.
-const generatedScenarioSchema = (hasProfiles: boolean) => scenarioSchema.required({ successCriteria: true, assumptions: true, metrics: true })
-  .extend({ user: scenarioSchema.shape.user.required({ maxFollowUps: true, persona: true, characteristics: true }) })
-  .refine(s => s.metrics.some(m => m.subject === 'agent') && s.metrics.some(m => m.subject === 'simulator'), 'Agent-goal and simulator-fidelity metrics are both required')
-  .refine(s => !hasProfiles || s.profileId !== undefined, { message: 'profileId must reference an observed profile', path: ['profileId'] });
+const generatedScenarioSchema = (external: boolean) => scenarioSchema.required({ successCriteria: true, assumptions: true, metrics: true })
+  .extend({ user: scenarioSchema.shape.user.required({ maxFollowUps: true }) })
+  .refine(s => s.metrics.some(m => m.subject === 'agent') && (external || s.metrics.some(m => m.subject === 'simulator')), 'Agent-goal and simulator-fidelity metrics are both required')
+  .refine(s => !external || !s.checks.length && !Object.keys(s.initialState.records).length && !s.initialState.writableFields.length && !s.initialState.transientFailures,
+    'Without an external state/tool contract use checks:[] and an empty initialState; assess semantic answers with agent rubrics')
+  .refine(s => !external || s.metrics.length < 8 && s.metrics.every(m => m.subject === 'agent' && m.id !== simulatorFidelity.id),
+    'External generation uses at most 7 agent rubrics only; the harness adds user_fidelity for the simulator');
 const simulatorReplySchema = userTurnSchema.describe('A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
 const authHelp = 'Войдите в Pi через /login или задайте ключ выбранного провайдера, затем выберите доступную модель. Живой прогон никогда не подменяется демо.';
 
@@ -298,6 +301,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       const requirementIds = new Set(grounding.requirements.map(r => r.id));
       if (requirementIds.size !== grounding.requirements.length) throw new Error('Requirements: duplicate requirement IDs');
       const compare = input.workflow === 'compare';
+      const external = !!input.targetKind && input.targetKind !== 'sandbox';
       const plan = compare ? await ask(
         'План семейств сценариев',
         FAMILY_PLAN_ROLE,
@@ -325,7 +329,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
         const observedGoals = input.observedGoals ?? [];
         const cards = await ask(
           batchLabel,
-          cardsRole(compare, profiles.length > 0, observedGoals.length > 0),
+          cardsRole(compare, profiles.length > 0, observedGoals.length > 0) + (external ? `\n${EXTERNAL_CARDS_CLAUSE}` : ''),
           {
             ...evidence,
             ...(input.notes ? { ownerNotes: input.notes } : {}),
@@ -336,7 +340,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
               earlierGoals: scenarios.map(s => ({ id: s.id, familyId: s.familyId, goal: s.user.goal })),
             }),
           },
-          z.strictObject({ scenarios: z.array(generatedScenarioSchema(profiles.length > 0)).length(batchSize) }), ctx,
+          z.strictObject({ scenarios: z.array(generatedScenarioSchema(external)).length(batchSize) }), ctx,
           // Pure review: attribution problems are a reason for the model to rewrite the
           // batch, not a reason to lose the whole run. Nothing is recorded until it passes.
           value => {
@@ -359,7 +363,10 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
             return undefined;
           },
         );
-        for (const scenario of cards.scenarios) { scenarioIds.add(scenario.id); scenarios.push(scenario); }
+        for (const scenario of cards.scenarios) {
+          if (external) scenario.metrics.push({ ...simulatorFidelity });
+          scenarioIds.add(scenario.id); scenarios.push(scenario);
+        }
       }
       // An external target answers with its own agent, so a sandbox AgentSpec would be
       // built, paid for and never used.
@@ -411,7 +418,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
         PROFILES_ROLE,
         // Assistant turns stay out: a profile describes how the user writes, not what the business answered.
         { task: input.task, dialogues: input.dialogues.map(d => ({ id: d.id, outcome: d.outcome, userMessages: d.messages.filter(m => m.role === 'user').map(m => m.content) })) },
-        z.strictObject({ profiles: z.array(profileSchema).min(1).max(6) }), ctx,
+        z.strictObject({ profiles: z.array(observedProfileSchema).max(6) }), ctx,
       );
       for (const profile of result.profiles) for (const id of profile.evidenceDialogueIds) if (!supplied.has(id)) throw new Error(`User profiles: profile ${profile.id} cites evidence dialogue ${id} that was not supplied`);
       return result.profiles;
