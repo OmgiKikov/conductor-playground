@@ -74,6 +74,10 @@ function grade(scenario: Scenario, trial: Trial): CheckResult[] {
       const actual = trial.finalState.records[check.recordId]?.[check.field];
       passed = Object.is(actual, check.value);
       evidence = `${check.recordId}.${check.field}: expected ${JSON.stringify(check.value)}, observed ${JSON.stringify(actual)}`;
+    } else if (check.kind === 'answer_equals') {
+      const last = trial.events.findLast(event => event.type === 'assistant');
+      passed = last?.text === check.value;
+      evidence = `Последний ответ${last ? ` #${last.seq}` : ' отсутствует'}: ожидается ${JSON.stringify(check.value)}, получено ${JSON.stringify(last?.text)}. Регистр, пробелы и переносы строк значимы.`;
     } else if (check.kind === 'answer_contains' || check.kind === 'answer_omits') {
       const present = answers.includes(check.value.toLocaleLowerCase());
       passed = check.kind === 'answer_contains' ? present : !present;
@@ -92,8 +96,9 @@ function grade(scenario: Scenario, trial: Trial): CheckResult[] {
 export async function evaluateTrial(input: {
   runtime: Runtime; revision: Revision; scenario: Scenario; repeat: number; manifestHash: string;
   sources: Source[]; settings: Settings; ctx: CallContext; userMode: UserMode; target: Target;
+  onStage?(stage: 'target' | 'user' | 'assessment'): void;
 }): Promise<Trial> {
-  const { runtime, revision, scenario, repeat, manifestHash, sources, settings, ctx, userMode, target } = input;
+  const { runtime, revision, scenario, repeat, manifestHash, sources, settings, ctx, userMode, target, onStage } = input;
   const started = performance.now();
   const state = structuredClone(scenario.initialState);
   const trial: Trial = {
@@ -133,6 +138,7 @@ export async function evaluateTrial(input: {
   let reportedState = false;
   try {
     ctx.signal.throwIfAborted();
+    onStage?.('target');
     if (target.kind === 'sandbox') {
       const tools = sandbox(state, sources, emit, localCtx).filter(tool => revision.spec.tools.includes(tool.name));
       session = await runtime.openTarget(structuredClone(revision.spec), structuredClone(sources), tools, localCtx);
@@ -144,6 +150,7 @@ export async function evaluateTrial(input: {
       ctx.signal.throwIfAborted();
       append('user', userMessage);
       stage = 'target response';
+      onStage?.('target');
       const response = await session.respond(userMessage);
       if (persistenceFailed) throw persistenceError;
       ctx.signal.throwIfAborted();
@@ -159,6 +166,7 @@ export async function evaluateTrial(input: {
         continue;
       }
       stage = 'user simulation';
+      onStage?.('user');
       const decision = await runtime.userTurn({ user: structuredClone(scenario.user), messages: structuredClone(messages), turn }, userCtx);
       emit({ type: 'simulator', result: decision });
       const user = userTurnSchema.parse(decision);
@@ -199,6 +207,7 @@ export async function evaluateTrial(input: {
     try {
       if (!runtime.assess) throw new Error('Metric assessment is unavailable for this runtime');
       ctx.signal.throwIfAborted();
+      onStage?.('assessment');
       const assessments = z.array(metricAssessmentSchema).parse(await runtime.assess({
         scenario: structuredClone(scenario), sources: structuredClone(sources), trial: structuredClone(trial),
       }, { ...localCtx, onTargetEvent: undefined, onTrace: undefined }));

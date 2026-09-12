@@ -125,6 +125,7 @@ test('real SDK sessions omit discovered resources and simulator receives only ex
     assert.match(payload, /Appointment holder|Answers concisely/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /assigned interaction behavior takes priority over achieving the goal/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /use done:true rather than repeatedly asking "try again" to force success/);
+    assert.match(f.requests[0]?.systemPrompt ?? '', /Before composing another message, check whether the assigned stopping condition/);
     assert.doesNotMatch(payload, /PRIVATE_CONTEXT_SENTINEL|HIDDEN_RUBRIC_SENTINEL|BACKEND_FAILURE_SCHEDULE_SENTINEL|Current working directory/);
     assert.deepEqual(f.requests[0]?.tools, []);
     assert.ok(f.requests.every(r => !(r.tools ?? []).some(t => /web|fetch|browse|bash|read|write/.test(t.name))));
@@ -135,7 +136,7 @@ test('real SDK sessions omit discovered resources and simulator receives only ex
 });
 
 test('simulator preserves a final user message separately from stopping without another message', async () => {
-  const replies = [{ message: 'Record ID A.', done: true }, { message: '', done: true }];
+  const replies = [{ message: 'Record ID A.', done: true }, { done: true }];
   const f = await fixture((_request, index) => JSON.stringify(replies[index]));
   try {
     const input = {
@@ -143,19 +144,19 @@ test('simulator preserves a final user message separately from stopping without 
       messages: [{ role: 'assistant' as const, content: 'What is the record ID?' }], turn: 1,
     };
     assert.deepEqual(await f.adapter.userTurn(input, callContext().ctx), replies[0]);
-    assert.deepEqual(await f.adapter.userTurn(input, callContext().ctx), replies[1]);
+    assert.deepEqual(await f.adapter.userTurn(input, callContext().ctx), { done: true, message: '' });
     assert.match(f.requests[0]?.systemPrompt ?? '', /done:true with a nonempty message means deliver this final user message, receive the target response, then end/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /done:true with an empty message means stop now without another target response/);
   } finally { await f.close(); }
 });
 
-test('actual SDK executes only allowed tools, counts continuations and retains target conversation', async () => {
+test('actual SDK executes only allowed tools, counts continuations and retains exact reply text and target conversation', async () => {
   const calls: unknown[] = [];
   const f = await fixture((_request, index) => index === 0 ? [
-    { type: 'text', text: 'I will look up the record.' },
+    { type: 'text', text: ' I will look up the record.\n' },
     { type: 'toolCall', id: 'lookup-1', name: 'lookup_record', arguments: { recordId: 'A' } },
     { type: 'toolCall', id: 'forbidden-1', name: 'bash', arguments: { command: 'echo forbidden' } },
-  ] : 'Your appointment is at 10:00.');
+  ] : '  Your appointment is at 10:00.\n');
   try {
     const { ctx, usage } = callContext();
     const targetEvents: unknown[] = [];
@@ -166,12 +167,12 @@ test('actual SDK executes only allowed tools, counts continuations and retains t
       async execute(args) { calls.push(args); return { ok: true, record: { time: '10:00' } }; },
     };
     const target = await f.adapter.openTarget({ name: 'Scheduling', instructions: 'Check the appointment.', tools: ['lookup_record'] }, [], [tool], ctx);
-    assert.equal(await target.respond('When is A?'), 'Your appointment is at 10:00.');
+    assert.equal(await target.respond('When is A?'), '  Your appointment is at 10:00.\n');
     assert.deepEqual(calls, [{ recordId: 'A' }]);
     assert.equal(usage.calls, 2);
     assert.equal(usage.inputTokens, 26);
     assert.equal(targetEvents.length, 3);
-    assert.deepEqual(targetEvents[0], { type: 'assistant', text: 'I will look up the record.' });
+    assert.deepEqual(targetEvents[0], { type: 'assistant', text: ' I will look up the record.\n' });
     assert.match(JSON.stringify(targetEvents), /forbidden|bash/);
     assert.doesNotMatch(JSON.stringify(targetEvents), /lookup_record|10:00/);
     assert.deepEqual(f.requests[0]?.tools?.map(t => t.name), ['lookup_record']);
@@ -308,7 +309,7 @@ test('preparation separates grounded requirements, independent cards and candida
     assert.match(f.requests[2]?.systemPrompt ?? '', /"const":"tool_count"/);
     assert.match(f.requests[2]?.systemPrompt ?? '', /"required":\["goal","facts","behavior","opening","maxFollowUps"\]/);
     assert.match(f.requests[2]?.systemPrompt ?? '', /extra reads must not fail unless a source explicitly limits them/);
-    assert.match(f.requests[2]?.systemPrompt ?? '', /exact requested fixture values or wording a source explicitly mandates verbatim/);
+    assert.match(f.requests[2]?.systemPrompt ?? '', /exact requested fixture values or wording a source explicitly mandates/);
     assert.match(f.requests[2]?.systemPrompt ?? '', /before observing an error the user simply wants the task done/);
     for (const request of f.requests.slice(1, 4)) assert.doesNotMatch(JSON.stringify(request.messages), /IMPLEMENTATION_PRIVATE/);
     assert.doesNotMatch(JSON.stringify(f.requests[4]?.messages), /SCENARIO_PRIVATE|Boundary for/);
@@ -390,7 +391,7 @@ test('isolated assessment uses approved rubrics and trace evidence without inher
     const scenario: Scenario = { ...plainCard(0), split: 'dev' };
     const trial: Trial = {
       id: 'trial_1', revisionId: 'revision_1', scenarioId: scenario.id, familyId: scenario.familyId, repeat: 0,
-      split: 'dev', manifestHash: 'hash', outcome: 'fail', reason: 'DETERMINISTIC_GRADE_SENTINEL', checks: [],
+      split: 'dev', userMode: 'static', manifestHash: 'hash', outcome: 'fail', reason: 'DETERMINISTIC_GRADE_SENTINEL', checks: [],
       events: [{ seq: 0, type: 'user', text: 'How do I contact support?' }, { seq: 1, type: 'assistant', text: 'Email support@example.test.' }],
       initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 1,
     };
@@ -400,9 +401,11 @@ test('isolated assessment uses approved rubrics and trace evidence without inher
     assert.deepEqual(f.requests[0]?.tools, []);
     const payload = JSON.stringify(f.requests[0]?.messages);
     assert.match(payload, /passCriteria|support@example.test/);
+    assert.match(payload, /userMode.*static/);
     assert.doesNotMatch(payload, /DETERMINISTIC_GRADE_SENTINEL/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /actual event seq number/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /provisional model estimates for human review/);
+    assert.match(f.requests[0]?.systemPrompt ?? '', /check each continuation against the stopping rule/);
     assert.deepEqual(await f.adapter.assess!({ scenario: { ...scenario, metrics: undefined }, sources: [], trial }, ctx), []);
     assert.equal(usage.calls, 1, 'Legacy cards without rubrics do not incur a judge call');
   } finally { await f.close(); }
@@ -610,23 +613,51 @@ test('the card generator is told to probe the agent perimeter with an out-of-sco
   } finally { await f.close(); }
 });
 
-test('external generation repairs invented state and literal checks and receives a fixed simulator rubric', async () => {
-  const quote = 'Support is available by email.';
-  const card = plainCard(0); card.metrics = card.metrics.filter(m => m.subject === 'agent');
+test('external generation accepts observable text checks, repairs invented state/tool checks, and adds the fixed simulator rubric', async () => {
+  const quote = 'Reply to ping exactly with two spaces, then Pong!, then a newline. Never include INTERNAL.';
+  const card = plainCard(0); card.metrics = [];
+  card.user.opening = 'ping'; card.user.goal = 'Receive the prescribed reply'; card.user.maxFollowUps = 0;
+  card.checks = [
+    { id: 'exact_reply', kind: 'answer_equals', description: 'Prescribed final reply', value: '  Pong!\n' },
+    { id: 'required_word', kind: 'answer_contains', description: 'Required word', value: 'Pong!' },
+    { id: 'private_word', kind: 'answer_omits', description: 'Forbidden word', value: 'INTERNAL' },
+  ];
   const bad = structuredClone(card);
   bad.initialState.records = { invented_customer: { balance: 100 } };
-  bad.checks = [{ id: 'exact_words', kind: 'answer_contains', description: 'Correct answer', value: 'available by email' }] as never;
-  const outputs = [{ requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] }, { scenarios: [bad] }, { scenarios: [card] }];
+  const inventedTool = structuredClone(card);
+  inventedTool.checks = [{ id: 'invented', kind: 'tool_called', description: 'Invented backend', tool: 'lookup_account' }];
+  const outputs = [{ requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] }, { scenarios: [bad] }, { scenarios: [inventedTool] }, { scenarios: [card] }];
   const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
   try {
     const prepared = await f.adapter.prepare({ task: 'Evaluate support answers', targetKind: 'command', scenarioCount: 1,
       sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }],
     }, callContext().ctx);
-    assert.equal(f.requests.length, 3); assert.match(f.requests[1]?.systemPrompt ?? '', /EXTERNAL TARGET/);
+    assert.equal(f.requests.length, 4); assert.match(f.requests[1]?.systemPrompt ?? '', /EXTERNAL TARGET/);
     assert.match(JSON.stringify(f.requests[2]?.messages), /Without an external state\/tool contract/);
-    assert.deepEqual(prepared.scenarios[0]!.initialState.records, {}); assert.deepEqual(prepared.scenarios[0]!.checks, []);
+    assert.match(JSON.stringify(f.requests[3]?.messages), /Without an external state\/tool contract/);
+    assert.match(f.requests[1]?.systemPrompt ?? '', /use checks:\[\] and agent rubrics when truthful paraphrases are valid/);
+    assert.deepEqual(prepared.scenarios[0]!.initialState.records, {}); assert.deepEqual(prepared.scenarios[0]!.checks, card.checks);
     const simulator = prepared.scenarios[0]!.metrics!.filter(m => m.subject === 'simulator');
     assert.equal(simulator.length, 1); assert.equal(simulator[0]!.id, 'user_fidelity');
+    assert.equal(prepared.scenarios[0]!.metrics!.length, 1, 'literal checks do not require a duplicate agent rubric');
     assert.match(simulator[0]!.failCriteria, /Неудача агента сама по себе/);
+  } finally { await f.close(); }
+});
+
+test('external semantic cards require an agent rubric when no literal check covers the goal', async () => {
+  const quote = 'Explain how to contact support; any clear and correct paraphrase is acceptable.';
+  const card = plainCard(0); card.metrics = card.metrics.filter(m => m.subject === 'agent');
+  const empty = { ...card, checks: [], metrics: [] };
+  const outputs = [{ requirements: [{ id: 'req_1', text: quote, sourceId: 'source_1', quote, critical: true }], questions: [] }, { scenarios: [empty] }, { scenarios: [card] }];
+  const f = await fixture((_request, index) => JSON.stringify(outputs[index]));
+  try {
+    const prepared = await f.adapter.prepare({ task: 'Evaluate a paraphrase-friendly support answer', targetKind: 'command', scenarioCount: 1,
+      sources: [{ id: 'source_1', name: 'Policy', content: quote, hash: 'hash' }],
+    }, callContext().ctx);
+    assert.equal(f.requests.length, 3);
+    assert.match(JSON.stringify(f.requests[2]?.messages), /agent-goal rubric/);
+    assert.deepEqual(prepared.scenarios[0]!.checks, []);
+    assert.equal(prepared.scenarios[0]!.metrics!.filter(m => m.subject === 'agent').length, 1);
+    assert.equal(prepared.scenarios[0]!.metrics!.filter(m => m.subject === 'simulator').length, 1);
   } finally { await f.close(); }
 });

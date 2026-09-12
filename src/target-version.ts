@@ -8,12 +8,17 @@ const exec = promisify(execFile);
 // ponytail: one cached repository snapshot; independent active repositories may recompute, never reuse stale data.
 let cached: { key: string; changes: string } | undefined;
 
-/** Record local code identity without persisting source code, diffs or environment secrets. */
-export async function targetFingerprint(target: Target): Promise<string | undefined> {
+/** The same entry point is checked before preparation and fingerprinted before execution. */
+export function targetEntryPath(target: Target): string | undefined {
   const entry = target.kind === 'module' ? target.path : target.kind === 'command'
     ? target.args.find(arg => /\.(?:[cm]?js|ts|py|sh)$/.test(arg)) : undefined;
-  if (!entry) return undefined;
-  const path = resolve(target.kind === 'command' ? target.cwd ?? process.cwd() : '.', entry);
+  return entry ? resolve(target.kind === 'command' ? target.cwd ?? process.cwd() : '.', entry) : undefined;
+}
+
+/** Record local code identity without persisting source code, diffs or environment secrets. */
+export async function targetFingerprint(target: Target): Promise<string | undefined> {
+  const path = targetEntryPath(target);
+  if (!path) return undefined;
   try {
     const entryStat = await stat(path);
     if (!entryStat.isFile()) throw Object.assign(new Error(), { code: 'EISDIR' });

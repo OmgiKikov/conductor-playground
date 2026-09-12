@@ -1,8 +1,71 @@
 import { spawn } from 'node:child_process';
+import { constants } from 'node:fs';
+import { access, stat } from 'node:fs/promises';
+import { delimiter, extname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { scalarSchema, type CallContext, type DialogueMessage, type Target, type TargetSession, type World } from './contracts.js';
+import { targetEntryPath } from './target-version.js';
+
+function httpHeaders(target: Extract<Target, { kind: 'http' }>): Record<string, string> {
+  const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json' };
+  for (const [header, variable] of Object.entries(target.headersEnv)) {
+    const value = process.env[variable];
+    if (!value) throw new Error(`Не задана переменная окружения ${variable} для заголовка ${header}. Задайте её перед запуском Pi.`);
+    headers[header] = value;
+  }
+  return headers;
+}
+
+/** Static readiness only: never imports, starts, or sends a request to the target. Actual execution still handles drift/errors. */
+export async function preflightTarget(target: Target): Promise<void> {
+  if (target.kind === 'sandbox') return;
+  if (target.kind === 'http') { httpHeaders(target); return; }
+  const entry = targetEntryPath(target);
+  if (entry) {
+    try {
+      if (!(await stat(entry)).isFile()) throw new Error(`Вместо файла агента указана папка: ${entry}. Выберите файл адаптера.`);
+      await access(entry, constants.R_OK);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') throw new Error(`Не найден файл агента: ${entry}. Исправьте путь в подключении.`);
+      if (code === 'EACCES' || code === 'EPERM') throw new Error(`Нет доступа к файлу агента: ${entry}. Проверьте права чтения.`);
+      throw error;
+    }
+  }
+  if (target.kind !== 'command') return;
+  const cwd = target.cwd ?? process.cwd();
+  try {
+    if (!(await stat(cwd)).isDirectory()) throw new Error(`Рабочая папка агента не является папкой: ${cwd}. Исправьте cwd в подключении.`);
+    await access(cwd, constants.X_OK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new Error(`Не найдена рабочая папка агента: ${cwd}. Исправьте cwd в подключении.`);
+    if (code === 'EACCES' || code === 'EPERM') throw new Error(`Нет доступа к рабочей папке агента: ${cwd}. Проверьте права доступа.`);
+    throw error;
+  }
+  const windows = process.platform === 'win32';
+  const hasPath = target.command.includes('/') || windows && target.command.includes('\\');
+  const path = windows ? Object.entries(process.env).find(([key]) => key.toUpperCase() === 'PATH')?.[1] : process.env.PATH;
+  const directories = hasPath ? [''] : (path ?? (windows ? '' : '/usr/bin:/bin')).split(delimiter);
+  const suffixes = windows && !extname(target.command) ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';') : [''];
+  let denied: string | undefined;
+  for (const directory of directories) for (const suffix of suffixes) {
+    const candidate = resolve(cwd, directory, target.command + suffix);
+    try {
+      if (!(await stat(candidate)).isFile()) continue;
+      await access(candidate, constants.X_OK);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EACCES' || code === 'EPERM') denied ??= candidate;
+      else if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+    }
+  }
+  if (denied) throw new Error(`Нет права запуска команды агента: ${denied}. Проверьте права или выберите другой исполняемый файл.`);
+  throw new Error(`Не найдена команда агента: ${target.command}. Укажите полный путь к исполняемому файлу или добавьте его папку в PATH.`);
+}
 
 /*
  * External targets: the agent under test lives outside this process.
@@ -48,12 +111,7 @@ function applyReply(raw: unknown, state: World, ctx: CallContext, onRecords?: ()
 
 async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> {
   const { target, sessionId, scenarioId, state, history, ctx } = input;
-  const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json' };
-  for (const [header, variable] of Object.entries(target.headersEnv)) {
-    const value = process.env[variable];
-    if (!value) throw new Error(`Environment variable ${variable} for header ${header} is not set`);
-    headers[header] = value;
-  }
+  const headers = httpHeaders(target);
   const initialState = structuredClone(state);
   let closed = false;
   return {

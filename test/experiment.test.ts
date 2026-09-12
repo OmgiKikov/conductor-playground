@@ -7,6 +7,7 @@ import { ExperimentLab, draftHash, measurementHash, resultHash } from '../src/ex
 import { ExperimentStore } from '../src/store.js';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
 import { createInputSchema, fingerprint, validatePreparation, type Runtime } from '../src/contracts.js';
+import { awaitingVerdict } from '../src/comparison.js';
 
 async function setup(t: TestContext, runtime?: Runtime) {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-experiment-'));
@@ -139,7 +140,7 @@ test('shutdown during the initial checkpoint waits, keeps the lock, and never st
   const next = new ExperimentStore(directory); await next.init(); await next.close();
 });
 
-test('one writer, validated atomic saves, fail-closed stale locks, and interrupted restart', async t => {
+test('one writer, validated atomic saves, stale recovery, and isolated corrupt records on restart', async t => {
   const { lab, directory } = await setup(t);
   const record = await lab.create(demoInput()); await lab.waitForIdle();
   const ready = await lab.get(record.id);
@@ -156,12 +157,17 @@ test('one writer, validated atomic saves, fail-closed stale locks, and interrupt
   assert.equal((await restarted.get(record.id)).usage.costUsd, null);
   await restarted.close();
   await writeFile(join(directory, '.lock'), JSON.stringify({ pid: 2147483647, token: 'stale' }));
-  await assert.rejects(new ExperimentStore(directory).init(), /Verify no other instance/);
-  assert.equal(JSON.parse(await readFile(join(directory, '.lock'), 'utf8')).token, 'stale');
-  await rm(join(directory, '.lock'));
+  const recovered = new ExperimentStore(directory);
+  await recovered.init();
+  assert.equal(JSON.parse(await readFile(join(directory, '.lock'), 'utf8')).pid, process.pid);
+  await recovered.close();
   await writeFile(join(directory, `${record.id}.json`), '{"broken":true}');
   const corrupt = new ExperimentLab(directory);
-  await assert.rejects(corrupt.init());
+  await corrupt.init();
+  assert.deepEqual(await corrupt.list(), []);
+  assert.equal(corrupt.store.diagnostics[0]?.id, record.id);
+  assert.equal(await readFile(join(directory, `${record.id}.json`), 'utf8'), '{"broken":true}');
+  await corrupt.close();
   await assert.rejects(readFile(join(directory, '.lock')), { code: 'ENOENT' });
 });
 
@@ -591,4 +597,101 @@ test('rubric-only agent failures reach clustering', async t => {
   const result = await lab.get(draft.id);
   assert.ok(result.trials.every(t => t.outcome === 'ungraded'));
   assert.deepEqual(result.failureModes?.[0]?.trialIds, result.trials.map(t => t.id));
+});
+
+test('one-card edits preserve neighbours; only explicit removals delete and invalid changes save nothing', async t => {
+  const { lab } = await setup(t);
+  const created = await lab.create({ ...demoInput(), workflow: 'evaluate', scenarioCount: 5 }); await lab.waitForIdle();
+  const draft = await lab.get(created.id);
+  const changed = { ...draft.scenarios[1]!, title: 'Только вторая карточка' };
+  const edited = await lab.updateDraft(draft.id, draftHash(draft), { scenarios: [changed] });
+  assert.equal(edited.scenarios.length, 5);
+  assert.deepEqual(edited.scenarios.map(s => s.id), draft.scenarios.map(s => s.id));
+  assert.deepEqual(edited.scenarios.filter(s => s.id !== changed.id), draft.scenarios.filter(s => s.id !== changed.id));
+  assert.match(edited.message, /изменено 1, добавлено 0, удалено 0/);
+  const extra = { ...changed, id: 'new_card', title: 'Новая карточка' };
+  const updated = await lab.updateDraft(draft.id, draftHash(edited), { scenarios: [extra], removeScenarioIds: [draft.scenarios[0]!.id] });
+  assert.equal(updated.scenarios.length, 5);
+  assert.equal(updated.scenarios.at(-1)!.id, extra.id);
+  assert.equal(updated.scenarios.some(s => s.id === draft.scenarios[0]!.id), false);
+  assert.match(updated.message, /изменено 0, добавлено 1, удалено 1/);
+  const hash = draftHash(updated);
+  const saved = await lab.get(draft.id);
+  for (const patch of [
+    { removeScenarioIds: ['missing'] }, { removeScenarioIds: updated.scenarios.map(s => s.id) },
+    { scenarios: [{ ...changed, user: { ...changed.user, maxFollowUps: -1 } }] },
+    { scenarios: [{ ...changed, profileId: 'missing_profile' }] },
+    { scenarios: [changed], settings: { repeats: 0 } },
+  ]) {
+    await assert.rejects(lab.updateDraft(draft.id, hash, patch));
+    assert.deepEqual(await lab.get(draft.id), saved);
+  }
+  await assert.rejects(lab.updateDraft(draft.id, draftHash(draft), { scenarios: [changed] }), /Черновик изменился/);
+  assert.deepEqual(await lab.get(draft.id), saved);
+});
+
+test('finalizing requires decisive failure review and preserves original evidence', async t => {
+  const { lab } = await setup(t);
+  const input = createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 2, settings: { repeats: 1 } });
+  const created = await lab.create(input); await lab.waitForIdle();
+  let draft = await lab.get(created.id);
+  draft = await lab.updateDraft(draft.id, draftHash(draft), { agent: { ...draft.revisions[0]!.spec, tools: ['search_materials', 'lookup_record'] } });
+  assert.match(draft.message, /Агент обновлён/);
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }); await lab.waitForIdle();
+  let result = await lab.get(draft.id);
+  const original = structuredClone(result.trials);
+  assert.equal(awaitingVerdict(result).size, 2);
+  await assert.rejects(lab.reviewResults(result.id, resultHash(result)), /2.*без решающего вердикта/);
+  result = await lab.addHumanReview(result.id, { trialId: result.trials[0]!.id, verdict: 'unknown', note: 'Нужен разбор.' });
+  await assert.rejects(lab.reviewResults(result.id, resultHash(result)), /без решающего вердикта/);
+  for (const trial of result.trials) {
+    for (const check of trial.checks.filter(c => !c.passed)) result = await lab.addHumanReview(result.id, { trialId: trial.id, checkId: check.id, verdict: 'fail', note: 'Проверено по состоянию.' });
+    for (const assessment of trial.assessments?.filter(a => a.result === 'fail') ?? []) result = await lab.addHumanReview(result.id, { trialId: trial.id, metricId: assessment.metricId, verdict: 'fail', note: 'Проверено по трассе.' });
+  }
+  assert.equal(awaitingVerdict(result).size, 0);
+  const completed = await lab.reviewResults(result.id, resultHash(result));
+  assert.equal(completed.phase, 'complete');
+  assert.deepEqual(completed.trials, original);
+  const reopened = await lab.addHumanReview(result.id, { trialId: result.trials[0]!.id, checkId: result.trials[0]!.checks.find(c => !c.passed)!.id, verdict: 'unknown', note: 'Предыдущее решение пересмотрено.' });
+  assert.equal(reopened.phase, 'results_review');
+  await assert.rejects(lab.reviewResults(result.id, resultHash(reopened)), /без решающего вердикта/);
+});
+
+test('the active snapshot names the current card and target wait before a trial finishes', async t => {
+  const runtime = createDemoRuntime();
+  const entered = deferred(); const release = deferred();
+  const grading = deferred(); const releaseGrading = deferred();
+  const assess = runtime.assess!;
+  runtime.openTarget = async () => ({ async respond() { entered.resolve(); await release.promise; return 'Ответ'; }, async close() {} });
+  runtime.assess = async (...args) => { grading.resolve(); await releaseGrading.promise; return assess(...args); };
+  const { lab } = await setup(t, runtime);
+  const created = await lab.create(createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1, settings: { repeats: 1 } })); await lab.waitForIdle();
+  const draft = await lab.get(created.id);
+  await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) });
+  await entered.promise;
+  try {
+    const active = await lab.get(draft.id);
+    assert.equal(active.trials.length, 0);
+    assert.ok(active.message.includes(draft.scenarios[0]!.title));
+    assert.match(active.message, /диалог 1\/1.*ответ агента/);
+    const journal = await lab.store.traceJournal(draft.id);
+    assert.match(journal, /"type":"user"/);
+    release.resolve(); await grading.promise;
+    assert.match((await lab.get(draft.id)).message, /диалог 1\/1.*оценка критериев/);
+  } finally { release.resolve(); releaseGrading.resolve(); await lab.waitForIdle(); }
+});
+
+test('static connection failures precede model work and a vanished target cannot receive approval', async t => {
+  const { lab, directory } = await setup(t);
+  const entry = join(directory, 'agent.mjs'); await writeFile(entry, '// local target fixture');
+  const input = createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 1,
+    target: { kind: 'command', command: 'agent-lab-no-such-executable-fixture', args: [entry] } });
+  const created = await lab.create(input); await lab.waitForIdle();
+  const failed = await lab.get(created.id);
+  assert.equal(failed.phase, 'error'); assert.equal(failed.usage.calls, 0); assert.equal(failed.trials.length, 0);
+  const next = await lab.create({ ...input, target: { kind: 'command', command: process.execPath, args: [entry], timeoutMs: 1000 } }); await lab.waitForIdle();
+  const draft = await lab.get(next.id); assert.equal(draft.phase, 'review');
+  await rm(entry);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }), /Не найден файл агента/);
+  assert.deepEqual(await lab.get(draft.id), draft);
 });

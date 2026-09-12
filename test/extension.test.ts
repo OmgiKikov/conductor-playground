@@ -56,8 +56,10 @@ test('Pi connects a new request, conversational correction, reviewed run, eviden
           }
           awaitResults = false;
         }
-        if (keys[0] === 'x') assert.match(component.render(120).join('\n'), /Исправлено 1, сломалось 0/);
-        for (const key of keys) component.handleInput!(key);
+        for (const key of keys) {
+          if (key === 'x') assert.match(component.render(120).join('\n'), /Оценка выросла у 1, снизилась у 0/);
+          component.handleInput!(key);
+        }
       })().catch(error => { component.dispose?.(); reject(error); });
     }),
   } as unknown as ExtensionContext['ui'];
@@ -97,11 +99,17 @@ test('Pi connects a new request, conversational correction, reviewed run, eviden
     await call('agent_lab_edit', { id: repeated.id, expectedHash: repeated.draftHash, patch: {
       agent: { ...fixture.agent, tools: [...fixture.agent.tools, 'update_record'] }, targetVersion: 'fixture-fixed',
     } });
-    steps = [['r'], ['d'], ['x'], ['q']]; awaitResults = true;
+    steps = [['r'], ['5', 'a']]; awaitResults = true; request = 'Покажи конкретное исправление до и после.';
+    await command(repeated.id, ctx);
+    const pairDiscussion = JSON.parse(contexts.at(-1)!.content);
+    assert.deepEqual(pairDiscussion.comparisonSource, { kind: 'parent', beforeId: built.id, afterId: repeated.id });
+    assert.equal(pairDiscussion.comparedPair.beforeTrialId, discussion.trialId);
+    assert.equal(pairDiscussion.comparedPair.afterTrialId, pairDiscussion.trialId);
+    steps = [['5', 'x'], ['q']];
     await command(repeated.id, ctx);
     const exportDir = join(directory, '.agent-lab', 'exports');
     const html = (await readdir(exportDir)).find(name => name.startsWith(repeated.id) && name.endsWith('.html'));
-    assert.ok(html); assert.match(await readFile(join(exportDir, html), 'utf8'), /Исправлено 1, сломалось 0/);
+    assert.ok(html); assert.match(await readFile(join(exportDir, html), 'utf8'), /Оценка выросла у 1, снизилась у 0/);
     assert.deepEqual(errors, []); assert.equal(steps.length, 0);
   } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
 });
@@ -316,7 +324,7 @@ test('the plain verdict leads every surface and the thorough preset widens the r
     const quick = output(await tools.get('agent_lab_build')!.execute('build-quick', { mode: 'demo', scenarioCount: 1, notes: 'Users rarely know their ID.' }, undefined, undefined, ctx));
     assert.equal(quick.phase, 'review');
     assert.deepEqual(quick.evidence.verdict.provenance.synthetic.cards, 1);
-    assert.match(quick.evidence.verdict.headline, /Диалогов с оценкой ещё нет/);
+    assert.match(quick.evidence.verdict.headline, /Черновик готов.*после подтверждения/);
     assert.ok(quick.evidence.verdict.nextSteps.length >= 1);
     const thorough = output(await tools.get('agent_lab_build')!.execute('build-thorough', { mode: 'demo', scenarioCount: 1, preset: 'thorough' }, undefined, undefined, ctx));
     const evidence = JSON.parse(await readFile(thorough.artifacts.evidence, 'utf8'));
