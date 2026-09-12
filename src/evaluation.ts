@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import {
-  emptyUsage, userTurnSchema, metricAssessmentSchema,
+  emptyUsage, userTurnSchema, metricAssessmentSchema, scriptIssue,
   type CallContext, type CheckResult, type DialogueMessage, type Revision,
   type Runtime, type Scenario, type Settings, type Source, type Target, type TargetSession, type TraceEvent, type Trial, type UserMode,
 } from './contracts.js';
@@ -138,6 +138,10 @@ export async function evaluateTrial(input: {
   let reportedState = false;
   try {
     ctx.signal.throwIfAborted();
+    if (userMode === 'scripted') {
+      const issue = scriptIssue(scenario.user, settings.maxTurns);
+      if (issue) { stage = 'сценарий теста'; throw new Error(issue); }
+    }
     onStage?.('target');
     if (target.kind === 'sandbox') {
       const tools = sandbox(state, sources, emit, localCtx).filter(tool => revision.spec.tools.includes(tool.name));

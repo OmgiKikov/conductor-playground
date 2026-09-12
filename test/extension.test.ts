@@ -19,7 +19,7 @@ function registered(onUserMessage?: (message: unknown) => void) {
   agentLab({
     registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
     registerCommand: (name: string, options: { handler: typeof command }) => { assert.equal(name, 'agent-lab'); command = options.handler; },
-    on: (name: string, handler: () => Promise<void>) => { assert.equal(name, 'session_shutdown'); shutdown = handler; },
+    on: (name: string, handler: () => Promise<void>) => { if (name === 'session_shutdown') shutdown = handler; else assert.ok(['session_start', 'before_agent_start'].includes(name)); },
     sendMessage: (message: { content: string; display: boolean }, options: { deliverAs: string }) => { assert.equal(options.deliverAs, 'followUp'); contexts.push(message); },
     sendUserMessage: (message: unknown, options: { deliverAs: string; expandPromptTemplates: boolean }) => { assert.equal(options.deliverAs, 'followUp'); assert.equal(options.expandPromptTemplates, false); userMessages.push(message); onUserMessage?.(message); },
   } as unknown as ExtensionAPI);
@@ -29,6 +29,35 @@ function registered(onUserMessage?: (message: unknown) => void) {
 function output(result: Awaited<ReturnType<ToolDefinition['execute']>>) {
   return JSON.parse(result.content.filter(c => c.type === 'text').map(c => c.text).join('\n'));
 }
+
+test('conversation runs only the confirmed plan, then saves and loads the same case without claiming human review', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-conversation-'));
+  const { tools, shutdown } = registered();
+  t.after(async () => { await shutdown(); await rm(directory, { recursive: true, force: true }); });
+  const plans: string[] = [];
+  let consent = false;
+  const ctx = { cwd: directory, mode: 'tui', hasUI: true, ui: { confirm: async (_title: string, plan: string) => { plans.push(plan); return consent; } } } as ExtensionContext;
+  const call = async (name: string, params: unknown) => output(await tools.get(name)!.execute('fixture', params, undefined, undefined, ctx));
+  const draft = await call('agent_lab_build', { mode: 'demo', scenarioCount: 1 });
+  const cancelled = await call('agent_lab_run', { id: draft.id, expectedHash: draft.draftHash });
+  assert.equal(cancelled.cancelled, true);
+  assert.equal((await call('agent_lab_inspect', { id: draft.id })).trialCount, 0);
+  await assert.rejects(call('agent_lab_run', { id: draft.id, expectedHash: '0'.repeat(64) }), /План изменился/);
+  assert.equal(plans.length, 1);
+  await assert.rejects(tools.get('agent_lab_run')!.execute('fixture', { id: draft.id, expectedHash: draft.draftHash }, undefined, undefined,
+    { ...ctx, hasUI: false, mode: 'print' } as unknown as ExtensionContext), /интерактивный терминал/);
+  consent = true;
+  const result = await call('agent_lab_run', { id: draft.id, expectedHash: draft.draftHash });
+  assert.equal(result.phase, 'results_review'); assert.equal(result.trialCount, 1);
+  assert.equal(result.reviewMode, 'automated'); assert.deepEqual(result.humanReviews, []);
+  assert.match(plans[1]!, /Запуск не означает/); assert.match(plans[1]!, /20 вызовов/);
+  const inspection = await call('agent_lab_inspect', { id: draft.id });
+  const ids = [inspection.scenarios[0].id];
+  const saved = await call('agent_lab_suite', { action: 'save', id: draft.id, scenarioIds: ids, file: '.evals/regression.json' });
+  const loaded = await call('agent_lab_suite', { action: 'load', file: saved.file });
+  assert.equal(loaded.phase, 'review'); assert.equal(loaded.scenarioCount, 1); assert.equal(loaded.trialCount, 0);
+  assert.equal(loaded.reviewMode, null); assert.equal(loaded.usage.calls, 0);
+});
 
 test('Pi connects a new request, conversational correction, reviewed run, evidence discussion and repeat without UI JSON', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-journey-fixture-'));
@@ -73,7 +102,7 @@ test('Pi connects a new request, conversational correction, reviewed run, eviden
       { signal: new AbortController().signal, timeoutMs: 1000, beforeCall() {}, addUsage() {} });
     const built = await call('agent_lab_build', { mode: 'demo', scenarioCount: 1, existingAgent: fixture.agent });
     assert.equal(built.phase, 'review', built.error ?? 'draft not ready');
-    assert.equal(built.trialCount, 0); assert.equal(built.reviewMode, null); assert.equal(editorCommands.at(-1), `/agent-lab ${built.id}`);
+    assert.equal(built.trialCount, 0); assert.equal(built.reviewMode, null); assert.equal(editorCommands.length, 0);
     steps = [['a']]; request = 'Убери персону: хочу проверить только задачу.';
     await command(built.id, ctx); assert.equal(userMessages.at(-1), request);
     const selected = JSON.parse(contexts.at(-1)!.content); assert.equal(selected.experimentId, built.id); assert.ok(selected.scenarioId, JSON.stringify(selected));
@@ -95,7 +124,7 @@ test('Pi connects a new request, conversational correction, reviewed run, eviden
     const original = await call('agent_lab_inspect', { id: built.id, trialId: discussion.trialId }); assert.deepEqual(original, evidence);
     const repeated = await call('agent_lab_repeat', { id: built.id });
     assert.equal(repeated.parentRunId, built.id); assert.equal(repeated.phase, 'review'); assert.equal(repeated.trialCount, 0); assert.equal(repeated.reviewMode, null);
-    assert.equal(editorCommands.at(-1), `/agent-lab ${repeated.id}`);
+    assert.equal(editorCommands.length, 0);
     await call('agent_lab_edit', { id: repeated.id, expectedHash: repeated.draftHash, patch: {
       agent: { ...fixture.agent, tools: [...fixture.agent.tools, 'update_record'] }, targetVersion: 'fixture-fixed',
     } });
@@ -120,7 +149,7 @@ test('headless model tools prepare and edit only; approvals and human assessment
   const ctx = { cwd: directory, model: undefined, mode: 'print', hasUI: false } as ExtensionContext;
   const updates: string[] = [];
   try {
-    assert.deepEqual([...tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat']);
+    assert.deepEqual([...tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat', 'agent_lab_run', 'agent_lab_suite']);
     const report = output(await tools.get('agent_lab_build')!.execute('build-1', { mode: 'demo', scenarioCount: 2 }, undefined,
       value => { updates.push(JSON.stringify(value)); }, ctx));
     assert.equal(report.phase, 'review'); assert.equal(report.workflow, 'evaluate');
@@ -156,7 +185,7 @@ test('native profile editor changes linked cards, detaches one and restores orig
       dialogues: [{ id: 'd1', messages: [{ role: 'user', content: 'move A101 to 14:00 pls' }] }],
     }, undefined, undefined, ctx));
     const steps = [['2', 'e'], ['e'], ['s'], ['q']];
-    const choices = ['Персона', 'Профиль пользователя · выбрать или убрать', 'Без профиля и персоны', 'Профили пользователей', 'observed_1', 'Восстановить исходный профиль'];
+    const choices = ['Расширенные настройки', 'Персона', 'Расширенные настройки', 'Профиль пользователя · выбрать или убрать', 'Без профиля и персоны', 'Профили пользователей', 'observed_1', 'Восстановить исходный профиль'];
     const errors: string[] = [];
     ctx.ui = {
       custom: (factory: (tui: unknown, theme: unknown, keys: unknown, done: (value: unknown) => void) => Component & { dispose?(): void }) => new Promise(resolve => {
@@ -219,7 +248,7 @@ test('native command demo fixture requires two separate confirmations and preser
       }),
       confirm: async (_title: string, message: string) => {
         confirmations.push(message);
-        assert.match(message, /[a-f0-9]{64}/, 'confirmation binds the exact displayed version');
+        assert.match(message, /[a-f0-9]{12}/, 'a readable fingerprint identifies the exact plan; start checks the full hash');
         return confirmations.length === 2 || confirmations.length === 4;
       },
       select: async (_title: string, choices: string[]) => { selection++; return selection === 1 ? choices[0] : choices[1]; },
@@ -228,9 +257,9 @@ test('native command demo fixture requires two separate confirmations and preser
     } as unknown as ExtensionContext['ui'];
     await command(report.id, ctx);
     assert.deepEqual(errors, []); assert.equal(confirmations.length, 4);
-    assert.match(confirmations[0]!, /карточек/); assert.match(confirmations[2]!, /результатов/);
+    assert.match(confirmations[0]!, /Версия тестов/); assert.match(confirmations[2]!, /результатов/);
     const evidence = JSON.parse(await readFile(report.artifacts.evidence, 'utf8'));
-    assert.equal(evidence.phase, 'complete'); assert.equal(evidence.reviewMode, 'human');
+    assert.equal(evidence.phase, 'complete'); assert.equal(evidence.reviewMode, 'automated');
     assert.ok(evidence.resultsReviewedAt); assert.ok(evidence.resultsReviewHash);
     assert.equal(evidence.trials.length, 1); assert.equal(evidence.humanReviews.length, 1);
     assert.equal(evidence.humanReviews[0].verdict, 'fail'); assert.match(evidence.humanReviews[0].note, /fixture/);
@@ -272,7 +301,7 @@ test('actual Pi SDK loader imports native cards, preparation-only tools and embe
     await loader.reload();
     const loaded = loader.getExtensions();
     assert.deepEqual(loaded.errors, []); assert.equal(loaded.extensions.length, 1);
-    assert.deepEqual([...loaded.extensions[0]!.tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat']);
+    assert.deepEqual([...loaded.extensions[0]!.tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat', 'agent_lab_run', 'agent_lab_suite']);
     assert.ok(loaded.extensions[0]!.commands.has('agent-lab'));
     assert.deepEqual(loader.getAgentsFiles().agentsFiles, []);
     const skills = loader.getSkills();
