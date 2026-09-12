@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
-import { openExternalTarget } from '../src/targets.js';
+import { openExternalTarget, preflightTarget } from '../src/targets.js';
 import { type CallContext, type TraceEvent, type World } from '../src/contracts.js';
 
 function context(signal = new AbortController().signal) {
@@ -33,6 +33,45 @@ async function server(handler: Handler) {
   const { port } = srv.address() as { port: number };
   return { url: `http://127.0.0.1:${port}/agent`, requests, close: () => new Promise<void>(r => { srv.closeAllConnections(); srv.close(() => r()); }) };
 }
+
+test('preflight checks files, cwd, PATH and header variables without executing an agent or making a request', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-preflight-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const previousPath = process.env.PATH;
+  t.after(() => { if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; });
+  const bin = join(directory, 'bin'); await mkdir(bin);
+  const marker = join(directory, 'was-executed');
+  const adapter = join(directory, 'adapter.mjs');
+  await writeFile(adapter, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'executed');`);
+  await preflightTarget({ kind: 'sandbox' });
+  await preflightTarget({ kind: 'module', path: adapter, exportName: 'createSession' });
+  await preflightTarget({ kind: 'command', command: process.execPath, args: ['adapter.mjs'], cwd: directory, timeoutMs: 1000 });
+  await assert.rejects(preflightTarget({ kind: 'module', path: join(directory, 'missing.mjs'), exportName: 'createSession' }), /Не найден файл агента/);
+  await assert.rejects(preflightTarget({ kind: 'module', path: directory, exportName: 'createSession' }), /Вместо файла агента указана папка/);
+  await assert.rejects(preflightTarget({ kind: 'command', command: process.execPath, args: [], cwd: adapter, timeoutMs: 1000 }), /не является папкой/);
+  await assert.rejects(preflightTarget({ kind: 'command', command: process.execPath, args: [], cwd: join(directory, 'missing'), timeoutMs: 1000 }), /Не найдена рабочая папка/);
+  const command = join(bin, 'agent-lab-preflight-fixture');
+  await writeFile(command, '#!/bin/sh\nexit 99\n', { mode: 0o755 });
+  process.env.PATH = bin;
+  await preflightTarget({ kind: 'command', command: 'agent-lab-preflight-fixture', args: [], timeoutMs: 1000 });
+  await preflightTarget({ kind: 'command', command: './bin/agent-lab-preflight-fixture', args: [], cwd: directory, timeoutMs: 1000 });
+  await assert.rejects(preflightTarget({ kind: 'command', command: 'missing-agent', args: [], timeoutMs: 1000 }), /Не найдена команда агента.*missing-agent/);
+  if (process.platform !== 'win32') {
+    await chmod(command, 0o644);
+    await assert.rejects(preflightTarget({ kind: 'command', command, args: [], timeoutMs: 1000 }), /Нет права запуска команды/);
+  }
+  await assert.rejects(access(marker), /ENOENT/, 'module loading and command execution must not happen during preparation');
+  const api = await server(() => 'must not run'); t.after(api.close);
+  const variable = 'AGENT_LAB_PREFLIGHT_TEST_TOKEN';
+  const previousToken = process.env[variable];
+  t.after(() => { if (previousToken === undefined) delete process.env[variable]; else process.env[variable] = previousToken; });
+  const target = { kind: 'http' as const, url: api.url, headersEnv: { Authorization: variable }, timeoutMs: 1000 };
+  delete process.env[variable];
+  await assert.rejects(preflightTarget(target), /AGENT_LAB_PREFLIGHT_TEST_TOKEN/);
+  process.env[variable] = 'private fixture value';
+  await preflightTarget(target);
+  assert.equal(api.requests.length, 0);
+});
 
 test('http adapter sends the contract body with env headers and applies reported events and records', async t => {
   const api = await server(() => ({

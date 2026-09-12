@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { awaitingVerdict, compareRuns, compareUserModes, evidenceSummary, judgeCalibration, simulatorFidelity, verdictSummary } from '../src/comparison.js';
+import { awaitingVerdict, compareRuns, compareUserModes, evidenceSummary, humanFindings, isAgentFailure, judgeCalibration, repeatResults, simulatorFidelity, verdictSummary } from '../src/comparison.js';
 import { emptyUsage, settingsSchema, type Experiment, type HumanReview, type MetricAssessment, type Outcome, type Scenario, type TraceEvent, type Trial, type UserMode } from '../src/contracts.js';
 
 /** Sample size at which the verdict is allowed to call itself trusted. */
@@ -45,6 +45,33 @@ function trial(id: string, scenarioId: string, userMode: UserMode, outcome: Outc
 }
 const review = (id: string, trialId: string, verdict: HumanReview['verdict'], target: { metricId?: string; checkId?: string } = {}, createdAt = '2026-09-08T00:00:00Z'): HumanReview => ({ id, trialId, verdict, note: 'n', createdAt, ...target });
 
+test('identical replies with flipped rubric scores require review without rewriting evidence', () => {
+  const card = { ...scenario('s1'), checks: [] };
+  const a = { ...trial('a', 's1', 'reactive', 'ungraded', {
+    assessments: [{ metricId: 'goal', result: 'fail', rationale: 'later refusal', evidence: [1] }],
+  }), checks: [] };
+  const before = record({ id: 'before', scenarios: [card], trials: [a],
+    settings: settingsSchema.parse({ repeats: 1, userModes: ['reactive'] }) });
+  const after = structuredClone(before); after.id = 'after';
+  after.trials[0]!.id = 'b';
+  after.trials[0]!.assessments![0]!.result = 'pass';
+  after.trials[0]!.events[0]!.text = 'A differently worded question';
+  const original = structuredClone([before, after]);
+  const diff = compareRuns(before, after);
+  assert.equal(diff.comparable, true);
+  assert.equal(diff.pairs[0]?.change, 'fixed', 'the automatic transition stays visible');
+  assert.match(diff.pairs[0]?.reviewNote ?? '', /Ответы агента совпали/);
+  assert.match(diff.headline, /Оценка выросла у 1/);
+  assert.match(diff.headline, /разными оценками: 1\./);
+  assert.doesNotMatch(diff.headline, /Исправлено/);
+  assert.deepEqual([before, after], original);
+  after.trials[0]!.events[1]!.text = 'A changed answer';
+  assert.equal(compareRuns(before, after).pairs[0]?.reviewNote, undefined);
+  after.trials[0]!.events = [];
+  before.trials[0]!.events = [];
+  assert.equal(compareRuns(before, after).pairs[0]?.reviewNote, undefined, 'missing replies are not identical evidence');
+});
+
 test('user-mode comparison reports pass rates, turns, cost and the failures only the reactive simulator found', () => {
   const r = record({ trials: [
     trial('a', 's1', 'static', 'fail', { failed: ['time'] }),
@@ -67,6 +94,12 @@ test('user-mode comparison reports pass rates, turns, cost and the failures only
   assert.deepEqual(reactive.uniqueFailedChecks, ['extra']);
   assert.equal(reactive.avgUserTurns, 1.5);
   assert.equal(stat.avgUserTurns, 1);
+  const rubricOnly = compareUserModes(record({ trials: [
+    trial('rubric', 's1', 'reactive', 'ungraded', { events: dialogue(['question', 'clarification'], 'answer') }),
+    trial('timeout', 's2', 'reactive', 'invalid', { events: dialogue(['question'], '') }),
+  ] })).find(m => m.userMode === 'reactive')!;
+  assert.equal(rubricOnly.avgUserTurns, 2, 'completed rubric-only dialogues have observable turns; invalid attempts are excluded');
+  assert.equal(rubricOnly.passRate, null, 'observing turns does not invent a deterministic score');
   assert.deepEqual(compareUserModes(record()).map(m => [m.userMode, m.trials, m.passRate]), [['static', 0, null], ['scripted', 0, null], ['reactive', 0, null]]);
 });
 
@@ -271,11 +304,11 @@ test('этапы показывают, какое звено сломалось,
     { tier: 'frontier', cards: 1, passed: 0, graded: 2 },
   ]);
 
-  // Дымовая карточка — пол продукта: её провал держит доверие низким, что бы ни было выше.
+  // Дымовая карточка — приоритет исправления; уверенность в измерении остаётся отдельной осью.
   const broken = verdictSummary({ ...r, trials: [...r.trials, composed('t4', 'smoke_card', 'fail')] });
   assert.equal(broken.confidence, 'low');
-  assert.ok(broken.confidenceReasons.some(n => n.code === 'smoke_failed' && n.count === 1));
-  assert.equal(broken.confidenceReasons[0]?.code, 'smoke_failed', 'самое важное сказано первым');
+  assert.ok(broken.nextSteps.some(n => n.code === 'smoke_failed' && n.count === 1));
+  assert.equal(broken.confidenceReasons.some(n => n.code === 'smoke_failed'), false);
 });
 
 test('rubric failures in dialogues without objective checks still count as weak spots and never earn high confidence', () => {
@@ -365,6 +398,13 @@ test('confidence needs distinct reviewed situations and complete evidence; demo 
   assert.notEqual(verdictSummary({ ...r, trials: trials.slice(1) }).confidence, 'high');
   assert.notEqual(verdictSummary({ ...r, humanReviews: r.humanReviews.slice(0, 1) }).confidence, 'high');
   assert.notEqual(verdictSummary({ ...r, scenarios: scenarios.map(s => ({ ...s, familyId: 'one' })), trials: trials.map(t => ({ ...t, familyId: 'one' })) }).confidence, 'high');
+  const smokeFailure = verdictSummary({ ...r,
+    scenarios: scenarios.map((s, i) => ({ ...s, tier: i === 0 ? 'smoke' : 'regression' })),
+    trials: [{ ...trials[0]!, outcome: 'fail', checks: trials[0]!.checks.map((c, i) => ({ ...c, passed: i !== 0 })) }, ...trials.slice(1)],
+    humanReviews: r.humanReviews.map((review, i) => ({ ...review, verdict: i === 0 ? 'fail' : 'pass' })),
+  });
+  assert.equal(smokeFailure.confidence, 'high', 'a well-reviewed failure is strong evidence of a bad result');
+  assert.ok(smokeFailure.nextSteps.some(step => step.code === 'smoke_failed'));
 });
 
 test('run differences reject changed cards, missing or duplicate attempts and invalid evidence; rubric-only failures participate', () => {
@@ -406,4 +446,139 @@ test('partial run comparisons pair the same valid attempts and disclose missing 
   assert.equal(tier.before.graded, 2); assert.equal(tier.after.graded, 2, 'stage/tier rates must use the paired sample too');
   const duplicated = compareRuns(before, { ...after, trials: [...after.trials, after.trials[0]!] });
   assert.equal(duplicated.comparable, false); assert.equal(duplicated.fixed.length, 0);
+  assert.deepEqual(duplicated.pairs, []);
+  assert.deepEqual(result.pairs, [
+    { scenarioId: 'broken', userMode: 'reactive', repeat: 0, beforeTrialId: 'broken_0', afterTrialId: 'broken_0', change: 'regressed' },
+    { scenarioId: 'fixed', userMode: 'reactive', repeat: 0, beforeTrialId: 'fixed_0', afterTrialId: 'fixed_0', change: 'fixed' },
+  ]);
+});
+
+test('execution, judgement source and human review describe distinct facts across the run lifecycle', () => {
+  const settings = settingsSchema.parse({ repeats: 1, userModes: ['reactive'] });
+  const scenarios = [{ ...scenario('s1'), metrics: [] }];
+  const base = record({ mode: 'live', scenarios, settings });
+  const draft = verdictSummary({ ...base, phase: 'review' });
+  assert.equal(draft.nextSteps[0]!.code, 'approve_and_run');
+  assert.deepEqual(draft.execution, { planned: 1, completed: 0, invalid: 0, cancelled: 0, missing: 1, running: false });
+  assert.equal(draft.review.status, 'not_started');
+  const active = verdictSummary({ ...base, phase: 'evaluating' });
+  assert.match(active.headline, /Идёт прогон/); assert.equal(active.execution.running, true);
+  assert.equal(active.nextSteps[0]!.code, 'wait_for_run');
+  const unavailable = verdictSummary({ ...base, trials: [{ ...trial('t', 's1', 'reactive', 'invalid'), reason: 'Cannot start fixture executable', checks: [] }] });
+  assert.match(unavailable.headline, /Не удалось измерить.*Cannot start fixture executable/);
+  assert.equal(unavailable.nextSteps[0]!.code, 'repair_execution');
+  assert.equal(unavailable.nextSteps.some(step => step.code === 'approve_and_run'), false);
+  assert.deepEqual(unavailable.execution, { planned: 1, completed: 0, invalid: 1, cancelled: 0, missing: 0, running: false });
+  const failed = { ...base, phase: 'complete' as const, resultsReviewedAt: 'old', trials: [trial('t', 's1', 'reactive', 'fail', { failed: ['time'] })] };
+  const reviewState = (record: Experiment) => {
+    const { status, pending, reviewed, total } = verdictSummary(record).review;
+    return { status, pending, reviewed, total };
+  };
+  assert.deepEqual(reviewState(failed), { status: 'pending', pending: 1, reviewed: 0, total: 1 });
+  const reviewed = { ...failed, humanReviews: [review('h', 't', 'fail')] };
+  assert.deepEqual(reviewState(reviewed), { status: 'complete', pending: 0, reviewed: 1, total: 1 });
+  assert.deepEqual(reviewState({ ...reviewed, humanReviews: [review('h', 't', 'unknown')] }), { status: 'pending', pending: 1, reviewed: 0, total: 1 });
+  const rubricOnly = verdictSummary({ ...base, scenarios: [{ ...scenario('s1'), checks: [] }],
+    trials: [{ ...trial('t', 's1', 'reactive', 'ungraded', { assessments: [{ metricId: 'goal', result: 'pass', rationale: 'r', evidence: [1] }] }), checks: [] }] });
+  assert.deepEqual([rubricOnly.execution.completed, rubricOnly.graded, rubricOnly.rubric.assessed], [1, 0, 1]);
+  assert.match(rubricOnly.headline, /Оценка модели.*1 из 1/);
+  assert.doesNotMatch(rubricOnly.headline, /Доверие/);
+  assert.equal(rubricOnly.confidence, 'low');
+});
+
+test('legacy comparison summaries describe selected control evidence without averaging versions or exposing active control', () => {
+  const dev = { ...scenario('dev'), metrics: [] };
+  const control = { ...scenario('control'), split: 'control' as const, metrics: [] };
+  const recordWithVersions = record({ workflow: 'compare', phase: 'complete', controlConsumedAt: 'now', selectedRevisionId: 'candidate',
+    scenarios: [dev, control], settings: settingsSchema.parse({ repeats: 1, userModes: ['reactive'] }), trials: [
+      { ...trial('base_dev', dev.id, 'reactive', 'fail', { failed: ['time'] }), revisionId: 'baseline' },
+      { ...trial('candidate_dev', dev.id, 'reactive', 'pass'), revisionId: 'candidate' },
+      { ...trial('base_control', control.id, 'reactive', 'fail', { failed: ['time'] }), revisionId: 'baseline', split: 'control' },
+      { ...trial('candidate_control', control.id, 'reactive', 'pass'), revisionId: 'candidate', split: 'control' },
+    ] });
+  const summary = evidenceSummary(recordWithVersions);
+  assert.deepEqual([summary.verdict.passed, summary.verdict.graded], [1, 1]);
+  assert.deepEqual(summary.verdict.execution, { planned: 1, completed: 1, invalid: 0, cancelled: 0, missing: 0, running: false });
+  assert.deepEqual([summary.modes[0]!.passed, summary.modes[0]!.trials], [1, 1]);
+  const active = evidenceSummary({ ...recordWithVersions, phase: 'control',
+    trials: recordWithVersions.trials.map(t => t.split === 'control' ? { ...t, outcome: 'fail', checks: t.checks.map(c => ({ ...c, passed: false })) } : t) });
+  assert.deepEqual([active.verdict.passed, active.verdict.graded], [1, 1]);
+  assert.deepEqual(active.verdict.weakSpots, []);
+});
+
+test('human findings surface missed failures and false alarms without rewriting automatic evidence', () => {
+  const r = record({ scenarios: [{ ...scenario('s1'), metrics: [] }], trials: [trial('t1', 's1', 'static', 'pass')] });
+  const measured = JSON.stringify(r.trials);
+  r.humanReviews.push(review('negative', 't1', 'fail'));
+  const v = verdictSummary(r);
+  assert.match(v.headline, /^Человек отметил проблемы: 1/);
+  assert.equal(v.passed, 1);
+  assert.equal(v.review.flagged, 1);
+  assert.equal(v.review.failed, 1);
+  assert.equal(v.review.disagreements, 1);
+  assert.equal(v.nextSteps[0]?.code, 'inspect_human_findings');
+  assert.equal(JSON.stringify(r.trials), measured);
+  assert.equal(isAgentFailure(r, r.trials[0]!), false);
+  r.humanReviews.push(review('revised', 't1', 'pass', {}, '2026-09-09T00:00:00Z'));
+  assert.deepEqual(humanFindings(r), []);
+  r.humanReviews.push(review('specific', 't1', 'fail', { checkId: 'time' }));
+  assert.equal(humanFindings(r)[0]?.target, 'time', 'a whole-dialogue pass must not erase a separate criterion finding');
+  assert.equal(verdictSummary(r).review.passed, 1);
+  r.humanReviews.push(review('unsure', 't1', 'unknown', { checkId: 'time' }, '2026-09-10T00:00:00Z'));
+  assert.deepEqual(humanFindings(r), []);
+  r.trials[0]!.outcome = 'fail'; r.trials[0]!.checks[0]!.passed = false;
+  const falseAlarm = verdictSummary(r);
+  assert.equal(falseAlarm.review.flagged, 0);
+  assert.equal(falseAlarm.review.disagreements, 1);
+  assert.match(falseAlarm.headline, /^Есть расхождения/);
+});
+
+test('simulator labels and unmeasured attempts never become automatic agent failures or calibrated disagreements', () => {
+  const r = record({ trials: [trial('t1', 's1', 'reactive', 'pass', { assessments: [
+    { metricId: 'goal', result: 'pass', rationale: 'r', evidence: [1] },
+    { metricId: 'fidelity', result: 'pass', rationale: 'r', evidence: [1] },
+  ] })], humanReviews: [review('h1', 't1', 'fail', { metricId: 'fidelity' })] });
+  assert.equal(humanFindings(r)[0]?.subject, 'simulator');
+  assert.equal(isAgentFailure(r, r.trials[0]!), false);
+  assert.equal(verdictSummary(r).review.failed, 0, 'criterion review is not a whole-dialogue verdict');
+  r.trials[0]!.outcome = 'cancelled';
+  assert.equal(humanFindings(r)[0]?.automatic, 'unknown');
+  assert.equal(humanFindings(r)[0]?.disagreement, false);
+});
+
+test('repeats reveal mixed cases behind 5/6 and retain missing, unknown and duplicate attempts', () => {
+  const scenarios = ['s1', 's2'].map(id => ({ ...scenario(id), metrics: [] }));
+  const trials = scenarios.flatMap(s => Array.from({ length: 3 }, (_, repeat) => ({
+    ...trial(`${s.id}-${repeat}`, s.id, 'static', s.id === 's2' && repeat === 2 ? 'fail' : 'pass', { failed: s.id === 's2' && repeat === 2 ? ['time'] : [] }), repeat,
+  })));
+  const r = record({ scenarios, trials, settings: settingsSchema.parse({ repeats: 3, userModes: ['static', 'scripted'] }) });
+  const v = verdictSummary(r);
+  assert.equal(v.passed, 5); assert.equal(v.graded, 6);
+  assert.deepEqual(v.repeats.map(row => [row.status, row.passed, row.failed, row.unknown]), [['all_pass', 3, 0, 0], ['mixed', 2, 1, 0]]);
+  assert.equal(v.nextSteps.some(n => n.code === 'inspect_repeats'), true);
+  assert.equal(v.repeats.length, 2, 'scripted mode without a script has no planned attempts');
+  r.humanReviews = [review('override', 's2-2', 'pass')];
+  assert.equal(repeatResults(r)[1]?.status, 'mixed', 'manual verdicts never rewrite repeated automatic results');
+  r.trials.pop();
+  assert.deepEqual(repeatResults(r)[1]?.unknown, 1);
+  assert.equal(repeatResults(r)[1]?.status, 'incomplete');
+  r.trials.push({ ...trials[0]!, id: 'duplicate' });
+  assert.equal(repeatResults(r)[0]?.status, 'incomplete');
+  assert.equal(repeatResults(r)[0]?.unknown, 1);
+  r.trials[1]!.outcome = 'invalid';
+  assert.equal(repeatResults(r)[0]?.unknown, 2);
+  r.settings.repeats = 1; r.settings.userModes = ['static']; r.trials = [trials[0]!];
+  assert.equal(repeatResults(r)[0]?.status, 'single');
+});
+
+test('comparison opens the repaired repeat before unchanged attempts of the same card', () => {
+  const scenarios = [{ ...scenario('s1'), metrics: [] }];
+  const settings = settingsSchema.parse({ repeats: 3, userModes: ['static'] });
+  const attempts = Array.from({ length: 3 }, (_, repeat) => ({ ...trial(`t${repeat}`, 's1', 'static', repeat === 2 ? 'fail' : 'pass', { failed: repeat === 2 ? ['time'] : [] }), repeat }));
+  const before = record({ id: 'before', scenarios, settings, trials: attempts });
+  const after = record({ id: 'after', scenarios, settings, trials: attempts.map(t => ({ ...t, id: `new-${t.id}`, outcome: 'pass', checks: t.checks.map(c => ({ ...c, passed: true })) })) });
+  const diff = compareRuns(before, after);
+  assert.equal(diff.fixed.length, 1);
+  assert.deepEqual(diff.pairs.map(p => p.repeat), [2, 0, 1]);
+  assert.deepEqual(diff.pairs.map(p => p.change), ['fixed', 'unchanged', 'unchanged']);
 });

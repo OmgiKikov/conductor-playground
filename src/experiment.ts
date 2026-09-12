@@ -5,8 +5,9 @@ import {
 } from './contracts.js';
 import { ExperimentStore } from './store.js';
 import { evaluateTrial } from './evaluation.js';
-import { compareTrials, isAgentFailure } from './comparison.js';
+import { awaitingVerdict, compareTrials, isAgentFailure, plannedTrials } from './comparison.js';
 import { targetFingerprint } from './target-version.js';
+import { preflightTarget } from './targets.js';
 import { createDemoRuntime } from './demo.js';
 import { createPiRuntime } from './pi.js';
 
@@ -107,6 +108,7 @@ export class ExperimentLab {
       ],
     };
     await this.launch(record, async ctx => {
+      await preflightTarget(record.target);
       record.targetFingerprint = await targetFingerprint(record.target);
       const runtime = await this.runtime(record);
       if (record.dialogues.length && runtime.profiles) {
@@ -143,6 +145,9 @@ export class ExperimentLab {
       if (record.phase !== 'review') throw new Error('Править можно только незапущенный черновик. Готовые доказательства остаются как есть, для изменений создайте новый эксперимент.');
       if (draftHash(record) !== expectedHash) throw new Error('Черновик изменился. Откройте карточки заново, прежде чем править.');
       const patch = draftPatchSchema.parse(raw);
+      const beforeCards = new Map(record.scenarios.map(s => [s.id, s]));
+      const removed = new Set(patch.removeScenarioIds ?? []);
+      for (const id of removed) if (!beforeCards.has(id)) throw new Error(`Нет карточки для удаления: ${id}`);
       for (const scenario of patch.scenarios ?? []) {
         const before = record.scenarios.find(s => s.id === scenario.id);
         if (scenario.profileId && before?.profileId === scenario.profileId && !patch.profileEdits?.some(e => e.id === scenario.profileId)
@@ -157,17 +162,22 @@ export class ExperimentLab {
         else profile.draftOverride = edit.override;
       }
       const agent = patch.agent ?? record.revisions[0]?.spec;
-      const scenarios = (patch.scenarios ?? record.scenarios).map(({ split: _split, ...s }) => s);
+      const cards = new Map(record.scenarios.filter(s => !removed.has(s.id)).map(({ split: _split, ...s }) => [s.id, s]));
+      for (const { split: _split, ...scenario } of patch.scenarios ?? []) cards.set(scenario.id, scenario);
+      const scenarios = [...cards.values()];
       const prepared = validatePreparation({ requirements: record.requirements, questions: record.questions, agent, scenarios }, record.sources, record.workflow ?? 'compare', record.profiles);
       record.scenarios = prepared.scenarios;
       if (patch.agent) record.revisions = [revision(patch.agent, null, 'Agent configuration reviewed in the draft.')];
       record.settings = settingsSchema.parse({ ...record.settings, ...patch.settings });
       if (patch.target) record.target = patch.target;
       if (patch.targetVersion) record.targetVersion = patch.targetVersion;
+      await preflightTarget(record.target);
       record.targetFingerprint = await targetFingerprint(record.target);
       record.selectedRevisionId = record.revisions[0]!.id;
       record.reviewedAt = null; record.reviewMode = null; record.manifestHash = null;
-      await this.checkpoint(record, 'review', 'Draft updated. The current goals, users and metrics need human confirmation.');
+      const added = record.scenarios.filter(s => !beforeCards.has(s.id)).length;
+      const changed = record.scenarios.filter(s => beforeCards.has(s.id) && fingerprint(s) !== fingerprint(beforeCards.get(s.id))).length;
+      await this.checkpoint(record, 'review', `${patch.agent ? 'Агент обновлён. ' : ''}${patch.settings || patch.target || patch.targetVersion ? 'Настройки прогона обновлены. ' : ''}Карточки: изменено ${changed}, добавлено ${added}, удалено ${removed.size}. Проверьте черновик перед запуском.`);
       return structuredClone(record);
     });
   }
@@ -213,6 +223,8 @@ export class ExperimentLab {
       const record = await this.store.get(id);
       if (record.workflow !== 'evaluate' || record.phase !== 'results_review') throw new Error('Нет завершённого набора диалогов, ожидающего аудита.');
       if (resultHash(record) !== expectedHash) throw new Error('Результаты изменились. Откройте их заново, прежде чем подтверждать аудит.');
+      const pending = awaitingVerdict(record).size;
+      if (pending) throw new Error(`Нельзя завершить разбор: ${pending} провалившихся диалогов без решающего вердикта. Оцените весь диалог или все проваленные критерии; «неясно» и «невалидно» оставляют вопрос открытым.`);
       record.resultsReviewedAt = new Date().toISOString(); record.resultsReviewHash = expectedHash;
       await this.checkpoint(record, 'complete', 'Human review complete. Original checks, model estimates and human annotations remain separate.');
       return structuredClone(record);
@@ -228,6 +240,7 @@ export class ExperimentLab {
         throw new Error('Нужно подтверждение человека. Откройте карточки в Pi и утвердите именно эту версию черновика.');
       }
       if (record.questions.length) throw new Error('Сначала ответьте на бизнес-вопросы из черновика: добавьте ответы в материалы и подготовьте новый эксперимент.');
+      await preflightTarget(record.target);
       if (record.targetFingerprint && record.targetFingerprint !== await targetFingerprint(record.target)) {
         throw new Error('Код агента изменился после подготовки карточек. Обновите подключение в настройках и подтвердите новую версию.');
       }
@@ -327,6 +340,8 @@ export class ExperimentLab {
     if (!hash) throw new Error('Missing measurement manifest.');
     const guard = this.frozenGuard(record, hash, ctx);
     const scenarios = record.scenarios.filter(s => s.split === split);
+    const planned = plannedTrials({ ...record, scenarios });
+    let completed = 0;
     for (const userMode of record.settings.userModes) {
       const skipped: string[] = [];
       const prefix = record.settings.userModes.length > 1 ? `[${userMode}] ` : '';
@@ -335,8 +350,19 @@ export class ExperimentLab {
         for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
           guard();
           if (record.targetFingerprint && record.targetFingerprint !== await targetFingerprint(record.target)) throw new Error('Код внешнего агента изменился во время прогона. Создайте повтор с новой версией.');
-          const trial = await evaluateTrial({ runtime, revision, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings, ctx, userMode, target: record.target });
+          const progress = `${label}${prefix}${scenario.title} · диалог ${completed + 1}/${planned}`;
+          record.message = `${progress} · открываем сессию`;
+          const trial = await evaluateTrial({ runtime, revision, scenario, repeat, manifestHash: hash, sources: record.sources, settings: record.settings,
+            onStage: stage => { record.message = `${progress} · ${{ target: 'ответ агента', user: 'реплика пользователя', assessment: 'оценка критериев' }[stage]}`; },
+            ctx: { ...ctx, onTrace: (trialId, event) => {
+              ctx.onTrace?.(trialId, event);
+              const stage = event.type === 'user' ? 'ждём ответ агента' : event.type === 'assistant' ? 'ответ получен · готовим следующий шаг'
+                : event.type === 'simulator' ? 'реплика симулятора готова' : event.type === 'tool_call' ? `инструмент ${event.tool ?? ''}`
+                : event.type === 'tool_result' ? 'инструмент завершён' : 'сбой диалога';
+              record.message = `${progress} · ${stage}`;
+            } }, userMode, target: record.target });
           record.trials.push(trial);
+          completed++;
           await this.checkpoint(record, record.phase, `${label}${prefix}${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
           if (record.targetFingerprint && record.targetFingerprint !== await targetFingerprint(record.target)) throw new Error('Код внешнего агента изменился во время диалога. Результат сохранён, но сравнение недоступно.');
           guard();

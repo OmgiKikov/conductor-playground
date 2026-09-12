@@ -22,6 +22,12 @@ export function demoInput(): CreateInput {
   return createInputSchema.parse({ task, materials: [{ name: 'Appointment policy', content: policy }], mode: 'demo', workflow: 'compare', settings: { maxIterations: 1 } });
 }
 
+/** The normal review workflow, with a deliberately missing tool to make failure analysis tangible. */
+export function demoEvaluationInput(): CreateInput {
+  return createInputSchema.parse({ ...demoInput(), workflow: 'evaluate', scenarioCount: 3,
+    existingAgent: baseline, settings: { ...demoInput().settings, repeats: 1 } });
+}
+
 const demoMetrics: Rubric[] = [
   { id: 'demo_task_state', name: 'Task outcome (scripted estimate)', subject: 'agent',
     description: 'A deterministic demo estimate from the objective checks, not a semantic model judgment.',

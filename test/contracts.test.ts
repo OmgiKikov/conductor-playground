@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  createInputSchema, emptyUsage, validateFailureModes, experimentSchema, goalToScenario, goldenCaseSchema, goldenToScenario, observedGoalSchema, observedProfileSchema, profileSchema, settingsSchema, targetSchema, validatePreparation,
+  createInputSchema, draftPatchSchema, emptyUsage, validateFailureModes, experimentSchema, goalToScenario, goldenCaseSchema, goldenToScenario, observedGoalSchema, observedProfileSchema, profileSchema, settingsSchema, targetSchema, validatePreparation,
   type Profile,
 } from '../src/contracts.js';
 
@@ -158,4 +158,23 @@ test('кластер провалов обязан ссылаться на ди�
   assert.throws(() => validateFailureModes([{ ...mode, trialIds: ['t1', 't3'] }], trials), /не проваливались/);
   assert.throws(() => validateFailureModes([{ ...mode, trialIds: ['t1', 't1'] }], trials), /дважды/);
   assert.throws(() => validateFailureModes([mode, mode], trials), /повторяются/);
+});
+
+test('draft card operations name removals and reject duplicate or conflicting ids', () => {
+  assert.ok(draftPatchSchema.safeParse({ scenarios: [card()] }).success);
+  assert.deepEqual(draftPatchSchema.parse({ removeScenarioIds: ['c1'] }), { removeScenarioIds: ['c1'] });
+  for (const patch of [
+    { scenarios: [card(), card()] }, { removeScenarioIds: ['c1', 'c1'] },
+    { scenarios: [card()], removeScenarioIds: ['c1'] }, { removeScenarioIds: ['../c1'] }, {},
+  ]) assert.equal(draftPatchSchema.safeParse(patch).success, false);
+});
+
+test('exact final-answer checks reject impossible combinations without constraining earlier replies', () => {
+  const exact = { id: 'exact', kind: 'answer_equals', description: 'Final answer', value: 'Thank you.' };
+  const validate = (checks: unknown[]) => validatePreparation(preparation([card({ checks })]), [source], 'evaluate');
+  assert.throws(() => validate([exact, { ...exact, id: 'different', value: 'thank you.' }]), /Contradictory exact answer/);
+  const forbidden = { id: 'forbidden', kind: 'answer_omits', description: 'Forbidden wording', value: 'THANK' };
+  assert.throws(() => validate([exact, forbidden]), /Exact answer contains forbidden/);
+  assert.throws(() => validate([forbidden, exact]), /Exact answer contains forbidden/);
+  assert.doesNotThrow(() => validate([exact, { ...exact, id: 'same' }, { id: 'earlier', kind: 'answer_contains', description: 'Earlier clarification', value: 'What is your name?' }]));
 });

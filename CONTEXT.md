@@ -22,7 +22,7 @@ A native Pi package that turns a task, materials and real data into simulated di
 
 **Stage**: The job of the agent a check or rubric is about — understanding the request, looking data up, acting, composing the answer, validating it. A dialogue is a chain of jobs, so an end-to-end verdict cannot say which link broke; results are grouped by stage. Optional: a one-step agent has one job.
 
-**Tier**: The rung a card occupies. Smoke: basics that must never break; a smoke failure caps confidence at low. Regression: behaviour that already works and must not get worse. Frontier: what the product is still climbing towards, where failures are informative. Default is regression.
+**Tier**: The rung a card occupies: smoke covers basics that must never break, regression covers established behaviour, frontier explores new capabilities. A smoke failure makes fixing basic behaviour urgent; it does not by itself make the measurement less trustworthy.
 
 **Failure mode**: A named cluster of dialogues that broke the same way, drawn from the failed traces of one run. "Bad answer" is not a failure mode; "found the article and still handed the client to the hotline" is. Every cluster cites the dialogues it came from and may name the stage where the chain broke. Naming the failure precisely is what turns an evaluation into an improvement loop. Clusters describe the run they came from, not production traffic.
 
@@ -38,7 +38,13 @@ A native Pi package that turns a task, materials and real data into simulated di
 
 **Owner notes**: The owner's own hints about users, goals and situations, in their words. First-class input for synthetic cards, recorded as owner-supplied assumptions, never promoted to business rules.
 
-**Verdict**: The plain-language layer over the evidence: how many graded dialogues passed, model rubric estimates shown separately as unverified, the weak spots (objective checks and agent rubrics, including dialogues without objective checks), a confidence level with stated reasons, and next steps. High confidence needs a finalized human review with a decisive (pass or fail) verdict on every failed dialogue, at least one non-synthetic card, thirty or more objectively graded dialogues and no invalid ones; error analysis works on tens of traces, so a smaller sample stays medium however clean it is. Unknown and invalid verdicts decide nothing; they are listed as undecided. It leads every surface; the research statistics sit beneath it.
+**Verdict**: The bounded interpretation of a run, separating execution completeness, deterministic checks, provisional rubric assessments, human review and provenance. Measurement confidence is an audit heuristic about the evidence, not a score of the agent's quality.
+
+**Draft**: An unapproved set of cards and evaluation conditions that the owner can still change. Updating a named card preserves other cards; deleting a card is a separate, explicit intention.
+
+**Review**: The owner's interpretation of recorded evidence, kept separate from original checks and model assessments. A review can be finalized when every flagged agent failure has a decisive verdict on the dialogue or all failed criteria; it does not imply an individual human verdict on every passing dialogue.
+
+**Evidence snapshot**: A run's recorded facts, their interpretation and, when available, a comparison with its parent or an explicitly selected earlier run. Missing comparison evidence remains an explicit limitation of the snapshot.
 
 **User mode**: How the user side of a dialogue is produced. Reactive: a model plays the card and answers the target's actual replies. Scripted: the card's script lines are sent in order. Static: only the opening message. Running the same cards in several modes shows what the reactive simulator adds.
 

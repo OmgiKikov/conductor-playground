@@ -1,12 +1,41 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { visibleWidth, stripTerminalSequences } from '@earendil-works/pi-tui';
-import { LabBoard, reviewOrder, safeText, type BoardAction } from '../extensions/cards.ts';
+import { LabBoard, reviewOrder, safeText, type BoardAction, type BoardOptions } from '../extensions/cards.ts';
 import { htmlReport } from '../src/report.js';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
 import { emptyUsage, fingerprint, type Experiment } from '../src/contracts.js';
+import { compareRuns } from '../src/comparison.js';
+import { evidenceBundle } from '../src/artifacts.js';
+import { markdownReport } from '../src/report.js';
 
 const theme = { fg: (_: string, value: string) => value, bold: (value: string) => value };
+
+test('coincident replies with different scores are visible in Pi and exported reports', async () => {
+  const before = await fixture();
+  before.id = 'before'; before.phase = 'results_review';
+  before.settings.userModes = ['reactive']; before.settings.repeats = 1;
+  before.scenarios = [before.scenarios[0]!];
+  const card = before.scenarios[0]!;
+  card.checks = [];
+  card.metrics = [{ id: 'goal', name: 'Goal', subject: 'agent', description: 'd', passCriteria: 'p', failCriteria: 'f' }];
+  before.trials = [{ id: 'before_trial', revisionId: 'revision-1', scenarioId: card.id, familyId: card.familyId,
+    repeat: 0, userMode: 'reactive', split: 'dev', manifestHash: 'hash', outcome: 'ungraded', reason: '', checks: [],
+    events: [{ seq: 0, type: 'assistant', text: 'The same instruction.' }], initialState: card.initialState, finalState: card.initialState,
+    elapsedMs: 1, usage: emptyUsage(), assessments: [{ metricId: 'goal', result: 'fail', rationale: 'r', evidence: [0] }] }];
+  const after = structuredClone(before); after.id = 'after'; after.parentRunId = before.id;
+  after.trials[0]!.id = 'after_trial'; after.trials[0]!.assessments![0]!.result = 'pass';
+  const bundle = await evidenceBundle(after, { get: async () => before, traceJournal: async () => '' });
+  const board = new LabBoard({ record: after, before, comparison: bundle.comparison, section: 'comparison' }, theme, () => {}, () => {}, () => 40);
+  try {
+    for (const text of [board.render(120).join('\n'), htmlReport(bundle), markdownReport(bundle)]) {
+      assert.match(text, /Оценка выросла у 1/);
+      assert.match(text, /Ответы агента совпали/);
+      assert.doesNotMatch(text, /Исправлено 1/);
+    }
+  } finally { board.dispose(); }
+});
+
 async function fixture(): Promise<Experiment> {
   const input = demoInput();
   const sources = input.materials.map((m, i) => ({ ...m, id: `source-${i + 1}`, hash: fingerprint(m.content) }));
@@ -23,6 +52,75 @@ async function fixture(): Promise<Experiment> {
     trials: [], comparisons: [], iterations: [], usage: emptyUsage(), error: null, limitations: [], humanReviews: [], target: { kind: 'sandbox' }, goldenCases: [], dialogues: [], profiles: [],
   };
 }
+
+test('80×24 shows the opening and first reply before metadata, with visible feedback and scroll position', async () => {
+  const record = await fixture();
+  const scenario = record.scenarios[0]!;
+  scenario.title = 'Перенос записи'; scenario.user.opening = 'Перенесите запись на 14:00.';
+  scenario.user.goal = 'Изменить время записи'; scenario.successCriteria = 'Время изменилось на 14:00.';
+  const cards = new LabBoard({ record, notice: { kind: 'info', message: 'Изменена 1 карточка, остальные сохранены.' } }, theme, () => {}, () => {}, () => 24);
+  const cardText = cards.render(80).join('\n');
+  assert.match(cardText, /Перенесите запись на 14:00/);
+  assert.match(cardText, /Изменена 1 карточка/);
+  cards.dispose();
+  record.phase = 'results_review';
+  record.trials = [{ id: 'readable', revisionId: 'revision-1', scenarioId: scenario.id, familyId: scenario.familyId,
+    repeat: 0, userMode: 'static', split: 'dev', manifestHash: 'hash', outcome: 'ungraded', reason: 'Оценено по рубрикам.',
+    checks: [], events: [{ seq: 0, type: 'user', text: scenario.user.opening }, { seq: 1, type: 'assistant', text: 'Запись перенесена на 14:00.' }],
+    initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 20 }];
+  const results = new LabBoard({ record, section: 'results' }, theme, () => {}, () => {}, () => 24);
+  const text = results.render(80).join('\n');
+  assert.match(text, /Перенесите запись на 14:00/);
+  assert.match(text, /Запись перенесена на 14:00/);
+  assert.match(text, /ПО РУБРИКАМ/);
+  assert.match(text, /\d+–\d+\/\d+/);
+  results.dispose();
+  record.phase = 'evaluating'; record.trials = []; record.message = 'Карточка 1/2: ждём ответ агента';
+  const running = new LabBoard({ record, section: 'results' }, theme, () => {}, () => {}, () => 24);
+  assert.match(running.render(80).join('\n'), /ДИАЛОГ ВЫПОЛНЯЕТСЯ/);
+  assert.doesNotMatch(running.render(80).join('\n'), /Затем нажмите r|r для запуска/);
+  running.dispose();
+});
+
+test('comparison refreshes with a finished repeat, so 5 opens current paired evidence immediately', async t => {
+  const before = await fixture();
+  before.id = 'before'; before.phase = 'results_review'; before.reviewedAt = before.createdAt;
+  before.settings.repeats = 2;
+  before.scenarios.forEach(s => { s.metrics = []; });
+  before.trials = before.scenarios.flatMap((s, i) => [0, 1].map(repeat => ({
+    id: `before-${i}-${repeat}`, revisionId: 'revision-1', scenarioId: s.id, familyId: s.familyId, repeat,
+    userMode: 'reactive', split: 'dev', manifestHash: 'hash', outcome: i || repeat ? 'pass' : 'fail', reason: '',
+    checks: s.checks.map((c, j) => ({ id: c.id, description: c.description, evidence: 'fixture', passed: i > 0 || repeat > 0 || j > 0 })),
+    events: [{ seq: 0, type: 'assistant', text: 'Раньше не мог изменить запись.' }], initialState: s.initialState, finalState: s.initialState,
+    elapsedMs: 1, usage: emptyUsage(),
+  })));
+  const after = structuredClone(before); after.id = 'after'; after.parentRunId = before.id;
+  for (const trial of after.trials) {
+    trial.id = trial.id.replace('before', 'after'); trial.outcome = 'pass';
+    trial.checks.forEach(c => { c.passed = true; });
+    trial.events[0]!.text = 'Теперь запись изменена.';
+  }
+  const running = { ...after, phase: 'evaluating' as const, trials: [] };
+  let rendered!: () => void;
+  const refreshed = new Promise<void>(resolve => { rendered = resolve; });
+  const actions: BoardAction[] = [];
+  const board = new LabBoard({ record: running, before, comparison: compareRuns(before, running),
+    warnings: ['Прогон ещё идёт.'], reportPath: '/fixture/partial.html', notice: { kind: 'info', message: 'Промежуточный отчёт сохранён.' },
+    load: async () => ({ record: after, before, comparison: compareRuns(before, after), warnings: [] }) }, theme, a => actions.push(a), rendered, () => 40);
+  let timer: ReturnType<typeof setTimeout>;
+  t.after(() => { clearTimeout(timer); board.dispose(); });
+  await Promise.race([refreshed, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('board did not refresh')), 3000); })]);
+  board.handleInput('5');
+  const text = board.render(120).join('\n');
+  assert.match(text, /Исправлено 1, сломалось 0/);
+  assert.match(text, /Раньше не мог изменить запись/);
+  assert.match(text, /Теперь запись изменена/);
+  const list = text.split('\n').map(line => line.split('│')[1] ?? '');
+  assert.equal(list.filter(line => line.includes('+ ')).length, 1, 'only the changed attempt gets a plus; its unchanged repeat must not');
+  assert.doesNotMatch(text, /Прогон ещё идёт|Промежуточный отчёт|o Открыть отчёт/);
+  board.handleInput('o');
+  assert.deepEqual(actions, []);
+});
 
 test('native cards sanitize terminal escapes, preserve readable Unicode, and fit narrow or wide terminals', async () => {
   const record = await fixture();
@@ -99,7 +197,8 @@ test('result cards keep model grades, missing grades, traces and human annotatio
   assert.match(htmlReport(record), /По рубрикам · предварительно<\/h3><strong>0<span class="muted"> \/ 1/);
   record.phase = 'complete'; record.resultsReviewedAt = record.updatedAt; record.humanReviews = [];
   const reviewed = new LabBoard({ record, section: 'results' }, theme, () => {}, () => {}, () => 120);
-  assert.match(reviewed.render(120).join('\n'), /Набор проверен человеком.*вердикта нет/);
+  assert.match(reviewed.render(120).join('\n'), /Вердикта человека нет/);
+  assert.doesNotMatch(reviewed.render(120).join('\n'), /Набор проверен человеком|Разбор набора завершён/);
   reviewed.dispose();
 });
 
@@ -145,7 +244,7 @@ test('разбор начинается с провалов без вердик�
 
   const reviewed = { ...record, humanReviews: [...record.humanReviews, { id: 'h2', trialId: 't_pending', verdict: 'pass' as const, note: 'ok', createdAt: record.createdAt }] };
   assert.match(stripTerminalSequences(new LabBoard({ record: reviewed, section: 'results' }, theme, () => {}, () => {}, () => 40).render(120).join('\n')),
-    /Разбор: все 2 провал\(ов\) разобраны/);
+    /Замечания человека: 1 диалогов · расхождения оценок: 1/);
 });
 
 test('live polling stops on dispose and never applies a late response to a closed board', async () => {
@@ -153,12 +252,12 @@ test('live polling stops on dispose and never applies a late response to a close
   record.phase = 'evaluating';
   let loads = 0;
   let renders = 0;
-  let resolveLoad!: (value: Experiment) => void;
+  let resolveLoad!: (value: Awaited<ReturnType<NonNullable<BoardOptions['load']>>>) => void;
   const board = new LabBoard({ record, load: () => { loads++; return new Promise(resolve => { resolveLoad = resolve; }); } }, theme, () => {}, () => { renders++; });
   await new Promise(resolve => setTimeout(resolve, 800));
   assert.equal(loads, 1);
   board.dispose();
-  resolveLoad({ ...record, phase: 'results_review' });
+  resolveLoad({ record: { ...record, phase: 'results_review' }, warnings: [] });
   await new Promise(resolve => setTimeout(resolve, 800));
   assert.equal(loads, 1);
   assert.equal(renders, 0);
@@ -170,7 +269,9 @@ test('the statistics section renders the evidence summary in narrow and wide ter
   record.dialogues = [{ id: 'd1', messages: [{ role: 'user', content: 'hi?' }], outcome: 'abandoned' }];
   const board = new LabBoard({ record, section: 'stats' }, theme, () => {}, () => {}, () => 40);
   for (const width of [16, 40, 80, 132]) for (const line of board.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}`);
-  const text = stripTerminalSequences(board.render(120).join('\n'));
+  const firstPage = board.render(120).join('\n');
+  board.handleInput('\u001b[F');
+  const text = stripTerminalSequences(firstPage + '\n' + board.render(120).join('\n'));
   assert.match(text, /4 Статистика/);
   assert.match(text, /static/); assert.match(text, /reactive/);
   assert.match(text, /Вердиктов человека по метрикам и проверкам ещё нет/);
@@ -193,17 +294,19 @@ test('the board leads with a plain verdict once dialogues exist and keeps the re
   const board = new LabBoard({ record, section: 'agent' }, theme, () => {}, () => {}, () => 40);
   const text = stripTerminalSequences(board.render(120).join('\n'));
   assert.match(text, /ИТОГ/);
-  assert.match(text, /Пройдено 2 из 3/);
-  assert.match(text, /Доверие к результату: низкое/);
+  assert.match(text, /По кодовым проверкам пройдено 2 из 3/);
+  assert.match(text, /Вердикт на весь диалог: 0\/3/);
   assert.match(text, /синтетических 2/);
   assert.match(text, /Время изменено/);
   assert.match(text, /Что дальше/);
   assert.doesNotMatch(text, /TPR/);
+  board.handleInput('4');
+  assert.match(board.render(120).join('\n'), /Достоверность измерения: низкое/);
   for (const width of [16, 40, 80]) for (const line of board.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}`);
   board.dispose();
   const results = new LabBoard({ record }, theme, () => {}, () => {}, () => 40);
   assert.match(results.render(120).join('\n'), /ЧТО ТРЕБУЕТ ВНИМАНИЯ/);
-  assert.match(stripTerminalSequences(results.render(120).join('\n')), /Итог: Пройдено 2 из 3/);
+  assert.match(stripTerminalSequences(results.render(120).join('\n')), /Итог: По кодовым проверкам пройдено 2 из 3/);
   results.dispose();
 });
 

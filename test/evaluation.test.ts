@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { evaluateTrial } from '../src/evaluation.js';
 import { compareTrials } from '../src/comparison.js';
 import { createDemoRuntime, demoInput } from '../src/demo.js';
-import { fingerprint, validatePreparation, type CallContext, type MetricAssessment, type Revision, type Rubric, type Runtime, type Scenario, type Source, type Tool, type Trial } from '../src/contracts.js';
+import { checkSchema, fingerprint, validatePreparation, type CallContext, type MetricAssessment, type Revision, type Rubric, type Runtime, type Scenario, type Source, type Tool, type Trial } from '../src/contracts.js';
 
 function context(signal = new AbortController().signal): CallContext {
   return { signal, timeoutMs: 1000, beforeCall() { signal.throwIfAborted(); }, addUsage() {} };
@@ -18,7 +18,7 @@ async function fixture() {
   const preparation = validatePreparation(await runtime.prepare({ task: input.task, sources }, context()), sources);
   const baseline: Revision = { id: 'baseline', parentId: null, createdAt: '2026-01-01T00:00:00Z', hypothesis: 'Original', spec: preparation.agent };
   const candidate: Revision = { ...structuredClone(baseline), id: 'candidate', parentId: 'baseline', spec: { ...preparation.agent, tools: [...preparation.agent.tools, 'update_record'] } };
-  const evaluate = (scenario = preparation.scenarios[0]!, revision = baseline, actor = runtime, ctx = context(), repeat = 0) => evaluateTrial({ runtime: actor, revision, scenario, repeat, manifestHash: 'frozen', sources, settings: input.settings, ctx, userMode: 'reactive', target: { kind: 'sandbox' } });
+  const evaluate = (scenario = preparation.scenarios[0]!, revision = baseline, actor = runtime, ctx = context(), repeat = 0, onStage?: Parameters<typeof evaluateTrial>[0]['onStage']) => evaluateTrial({ runtime: actor, revision, scenario, repeat, manifestHash: 'frozen', sources, settings: input.settings, ctx, userMode: 'reactive', target: { kind: 'sandbox' }, onStage });
   return { input, sources, runtime, preparation, baseline, candidate, evaluate };
 }
 
@@ -87,6 +87,29 @@ test('evaluation demo prepares the requested diverse cards for a working agent a
 function targetRuntime(base: Runtime, respond: (tools: Tool[], message: string) => Promise<string>): Runtime {
   return { ...base, async openTarget(_agent, _sources, tools) { return { respond: message => respond(tools, message), async close() {} }; }, async userTurn() { return { message: '', done: true }; } };
 }
+
+test('answer_equals checks the last answer with exact case, whitespace and newlines, never an earlier matching answer', async () => {
+  const f = await fixture();
+  const scenario = structuredClone(f.preparation.scenarios[0]!);
+  const expected = '  Готово!\n';
+  scenario.checks = [checkSchema.parse({ id: 'literal', kind: 'answer_equals', description: 'Exact final reply', value: expected })];
+  assert.equal(scenario.checks[0]!.kind === 'answer_equals' && scenario.checks[0]!.value, expected, 'schema must not trim expected text');
+  scenario.user.maxFollowUps = 0;
+  for (const response of [expected, expected.toLowerCase(), expected.trim(), expected.replace('\n', '\r\n'), `Prefix ${expected}`]) {
+    const trial = await f.evaluate(scenario, f.candidate, targetRuntime(f.runtime, async () => response));
+    assert.equal(trial.checks[0]!.passed, response === expected, JSON.stringify(response));
+    assert.equal(trial.outcome, response === expected ? 'pass' : 'fail');
+    assert.match(trial.checks[0]!.evidence, /Последний ответ #1/);
+  }
+  scenario.user.maxFollowUps = 1;
+  let replies = 0;
+  const actor = targetRuntime(f.runtime, async () => ++replies === 1 ? expected : 'Другой ответ');
+  actor.userTurn = async () => ({ message: 'Ответь ещё раз.', done: true });
+  const lastOnly = await f.evaluate(scenario, f.candidate, actor);
+  assert.equal(replies, 2);
+  assert.equal(lastOnly.checks[0]!.passed, false);
+  assert.match(lastOnly.checks[0]!.evidence, /Последний ответ #4/);
+});
 
 test('invented success does not mutate state; target receives no denied tool or private assertions', async () => {
   const f = await fixture();
@@ -268,10 +291,12 @@ test('rubric-only dialogues stay ungraded; assessments run after cleanup, cite r
   scenario.checks = [];
   scenario.metrics = structuredClone(testMetrics);
   let closed = false;
+  const stages: string[] = [];
   const actor: Runtime = { ...f.runtime,
     async openTarget() { return { async respond() { return 'I cannot make that change.'; }, async close() { closed = true; } }; },
     async assess(input, ctx) {
       assert.equal(closed, true);
+      assert.equal(stages.at(-1), 'assessment', 'progress enters assessment before the slow judge starts');
       assert.equal(ctx.onTargetEvent, undefined);
       assert.equal(ctx.onTrace, undefined);
       assert.equal(input.trial.outcome, 'ungraded');
@@ -285,12 +310,13 @@ test('rubric-only dialogues stay ungraded; assessments run after cleanup, cite r
       ];
     },
   };
-  const trial = await f.evaluate(scenario, { ...f.candidate, spec: { ...f.candidate.spec, tools: [] } }, actor);
+  const trial = await f.evaluate(scenario, { ...f.candidate, spec: { ...f.candidate.spec, tools: [] } }, actor, context(), 0, stage => stages.push(stage));
   assert.equal(trial.outcome, 'ungraded');
   assert.deepEqual(trial.checks, []);
   assert.equal(trial.assessments?.[0]!.result, 'fail');
   assert.equal(trial.assessments?.[1]!.result, 'unknown');
   assert.equal(trial.assessmentError, undefined);
+  assert.equal(stages[0], 'target');
   assert.equal(trial.events[0]!.text, scenario.user.opening);
   assert.equal(scenario.metrics[0]!.name, 'Goal achieved');
   assert.deepEqual(trial.usage, { calls: 1, inputTokens: 20, outputTokens: 5, costUsd: 0.01 });

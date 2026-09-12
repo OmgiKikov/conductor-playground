@@ -90,6 +90,8 @@ export const checkSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...checkBase, kind: z.literal('tool_count'), tool: toolIdentifier, min: z.number().int().min(0).max(1000), max: z.number().int().min(0).max(1000) }),
   z.strictObject({ ...checkBase, kind: z.literal('fresh_read_before_update') }),
   z.strictObject({ ...checkBase, kind: z.literal('answer_contains'), value: text.max(1000) }),
+  /** The last assistant reply must match exactly; whitespace, case and newlines are significant. */
+  z.strictObject({ ...checkBase, kind: z.literal('answer_equals'), value: z.string().min(1).max(8000) }),
   /** Wording that must never reach the user: internal instructions, staff-only phrasing, forbidden promises. */
   z.strictObject({ ...checkBase, kind: z.literal('answer_omits'), value: text.max(1000) }),
 ]);
@@ -102,8 +104,8 @@ export type Rubric = z.infer<typeof rubricSchema>;
 export const simulatorFidelity: Rubric = {
   id: 'user_fidelity', name: 'Верность симулятора', subject: 'simulator',
   description: 'Соблюдение заданных фактов, цели, поведения и лимита реплик; персона и характеристики учитываются только если заданы.',
-  passCriteria: 'Пользователь следует карточке, отвечает на уточнения только известными фактами и завершает разговор согласно поведению. Не оценивает агента и не выдумывает его ответы или результаты инструментов.',
-  failCriteria: 'Пользователь придумывает факты, знает скрытые ответы или состояние, меняет роль, оценивает агента, пропускает обязательное уточнение или продолжает разговор вопреки карточке. Неудача агента сама по себе не является провалом симулятора.',
+  passCriteria: 'Пользователь следует карточке, отвечает на необходимые уточнения только известными фактами и соблюдает каждое условие остановки. Если карточка требует закончить после достаточной инструкции, дальнейших реплик нет. Не оценивает агента и не выдумывает его ответы или результаты инструментов.',
+  failCriteria: 'Пользователь придумывает факты, знает скрытые ответы или состояние, меняет роль, оценивает агента, пропускает обязательное уточнение или продолжает разговор вопреки карточке. Новый вопрос после достаточной инструкции нарушает требование закончить, даже если все сообщённые факты верны. Неудача агента сама по себе не является провалом симулятора.',
 };
 export const metricAssessmentSchema = z.strictObject({
   metricId: identifier, result: z.enum(['pass', 'fail', 'unknown']),
@@ -299,12 +301,17 @@ export const humanReviewInputSchema = z.strictObject({
 export type HumanReviewInput = z.infer<typeof humanReviewInputSchema>;
 export type HumanReview = HumanReviewInput & { id: string; createdAt: string };
 export const draftPatchSchema = z.strictObject({
-  scenarios: z.array(scenarioSchema.extend({ split: z.enum(['dev', 'control']).optional() })).min(1).max(40).optional(),
+  /** Full cards to update or add by id. Omitted cards are always preserved. */
+  scenarios: z.array(scenarioSchema.extend({ split: z.enum(['dev', 'control']).optional() })).min(1).max(40)
+    .refine(cards => unique(cards.map(card => card.id)), 'Повторяются идентификаторы изменяемых карточек.').optional(),
+  removeScenarioIds: z.array(identifier).min(1).max(40)
+    .refine(unique, 'Повторяются идентификаторы удаляемых карточек.').optional(),
   profileEdits: z.array(z.strictObject({ id: identifier, override: profileOverrideSchema.nullable() })).min(1).max(12)
     .refine(edits => unique(edits.map(e => e.id)), 'Duplicate profile edits').optional(),
   agent: agentSchema.optional(), settings: settingsSchema.partial().optional(),
   target: targetSchema.optional(), targetVersion: text.max(200).optional(),
-}).refine(v => Object.keys(v).length > 0, 'Supply a draft change');
+}).refine(v => Object.keys(v).length > 0, 'Supply a draft change')
+  .refine(v => !v.scenarios?.some(card => v.removeScenarioIds?.includes(card.id)), 'Нельзя одновременно изменить и удалить одну карточку.');
 export type DraftPatch = z.infer<typeof draftPatchSchema>;
 export type Phase = 'preparing' | 'review' | 'evaluating' | 'results_review' | 'baseline' | 'improving' | 'control' | 'complete' | 'cancelled' | 'error' | 'interrupted';
 export interface Experiment {
@@ -398,7 +405,7 @@ export interface Tool {
 }
 export interface DialogueMessage { role: 'user' | 'assistant'; content: string }
 export interface TargetSession { respond(message: string): Promise<string>; close(): Promise<void> }
-export const userTurnSchema = z.strictObject({ message: z.string().max(6000), done: z.boolean() }).refine(v => v.done || v.message.trim().length > 0, 'Empty user message');
+export const userTurnSchema = z.strictObject({ done: z.boolean(), message: z.string().max(6000) }).refine(v => v.done || v.message.trim().length > 0, 'Empty user message');
 export type UserTurn = z.infer<typeof userTurnSchema>;
 export interface PrepareInput {
   task: string; sources: Source[]; existingAgent?: AgentSpec; workflow?: 'evaluate' | 'compare'; scenarioCount?: number;
@@ -463,6 +470,7 @@ export function validatePreparation(raw: unknown, sources: Source[], workflow: '
     const states = new Map<string, unknown>();
     const calls = new Map<string, { min: number; max: number }>();
     const phrases = new Map<string, boolean>();
+    let exactAnswer: string | undefined;
     for (const c of s.checks) {
       if (c.kind === 'state_equals') {
         const key = `${c.recordId}.${c.field}`;
@@ -473,6 +481,9 @@ export function validatePreparation(raw: unknown, sources: Source[], workflow: '
         const seen = phrases.get(c.value.toLocaleLowerCase());
         if (seen !== undefined && seen !== required) throw new Error(`Contradictory answer checks in ${s.id}`);
         phrases.set(c.value.toLocaleLowerCase(), required);
+      } else if (c.kind === 'answer_equals') {
+        if (exactAnswer !== undefined && exactAnswer !== c.value) throw new Error(`Contradictory exact answer checks in ${s.id}`);
+        exactAnswer = c.value;
       } else if (c.kind === 'tool_called' || c.kind === 'tool_not_called' || c.kind === 'tool_count') {
         const before = calls.get(c.tool) ?? { min: 0, max: Infinity };
         const min = Math.max(before.min, c.kind === 'tool_count' ? c.min : c.kind === 'tool_called' ? 1 : 0);
@@ -480,6 +491,9 @@ export function validatePreparation(raw: unknown, sources: Source[], workflow: '
         if (min > max) throw new Error(`Contradictory tool checks in ${s.id}`);
         calls.set(c.tool, { min, max });
       }
+    }
+    if (exactAnswer !== undefined && [...phrases].some(([phrase, required]) => !required && exactAnswer.toLocaleLowerCase().includes(phrase))) {
+      throw new Error(`Exact answer contains forbidden wording in ${s.id}`);
     }
     for (const c of s.checks) if (c.kind === 'state_equals') {
       const record = s.initialState.records[c.recordId];

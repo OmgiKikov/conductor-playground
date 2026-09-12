@@ -25,12 +25,17 @@ const familyPlanSchema = z.strictObject({ families: z.array(z.strictObject({
 // With observed profiles the model may only choose a profileId; persona text is copied from the profile later.
 const generatedScenarioSchema = (external: boolean) => scenarioSchema.required({ successCriteria: true, assumptions: true, metrics: true })
   .extend({ user: scenarioSchema.shape.user.required({ maxFollowUps: true }) })
-  .refine(s => s.metrics.some(m => m.subject === 'agent') && (external || s.metrics.some(m => m.subject === 'simulator')), 'Agent-goal and simulator-fidelity metrics are both required')
-  .refine(s => !external || !s.checks.length && !Object.keys(s.initialState.records).length && !s.initialState.writableFields.length && !s.initialState.transientFailures,
-    'Without an external state/tool contract use checks:[] and an empty initialState; assess semantic answers with agent rubrics')
+  .refine(s => external ? s.checks.length > 0 || s.metrics.some(m => m.subject === 'agent')
+    : s.metrics.some(m => m.subject === 'agent') && s.metrics.some(m => m.subject === 'simulator'),
+    'Provide an agent-goal rubric, or literal answer checks for an external goal; sandbox cards also need simulator fidelity')
+  .refine(s => !external || s.checks.every(c => ['answer_equals', 'answer_contains', 'answer_omits'].includes(c.kind))
+    && !Object.keys(s.initialState.records).length && !s.initialState.writableFields.length && !s.initialState.transientFailures,
+    'Without an external state/tool contract use only source-grounded answer checks and an empty initialState; assess semantic answers with agent rubrics')
   .refine(s => !external || s.metrics.length < 8 && s.metrics.every(m => m.subject === 'agent' && m.id !== simulatorFidelity.id),
     'External generation uses at most 7 agent rubrics only; the harness adds user_fidelity for the simulator');
-const simulatorReplySchema = userTurnSchema.describe('A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
+const simulatorReplySchema = z.strictObject({ done: userTurnSchema.shape.done, message: userTurnSchema.shape.message.optional() })
+  .refine(v => v.done || !!v.message?.trim(), 'A continuing user turn needs a message')
+  .describe('To stop immediately, return done:true and omit message. A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
 const authHelp = 'Войдите в Pi через /login или задайте ключ выбранного провайдера, затем выберите доступную модель. Живой прогон никогда не подменяется демо.';
 
 /** Explicit resources avoid global/project extensions, skills, AGENTS files and prompt discovery. */
@@ -123,8 +128,8 @@ async function controlledSession(
     }
     if (event.type !== 'message_end' || event.message.role !== 'assistant') return;
     if (event.message.stopReason !== 'stop' || event.message.content.some(c => c.type === 'toolCall')) {
-      const text = event.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
-      if (text) emit({ type: 'assistant', text });
+      const text = event.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+      if (text.trim()) emit({ type: 'assistant', text });
     }
     if (!pendingUsage) return; // A rejected budget check can produce a synthetic SDK error, with no request dispatched.
     pendingUsage--;
@@ -164,8 +169,8 @@ async function controlledSession(
         if (!last || last.role !== 'assistant' || last.stopReason !== 'stop') {
           throw new Error(`Модель не довела ответ до конца (${last?.role === 'assistant' ? last.stopReason : 'ответа нет'}). Проверьте доступ к провайдеру и лимиты вызовов.`);
         }
-        const output = last.content.filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
-        if (!output) throw new Error('Модель вернула пустой ответ.');
+        const output = last.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+        if (!output.trim()) throw new Error('Модель вернула пустой ответ.');
         return output;
       } catch (error) {
         if (activeSignal.aborted) throw activeSignal.reason;
@@ -443,7 +448,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
         {
           scenario: input.scenario,
           sources: input.sources.map(({ id, name, content }) => ({ id, name, content })),
-          trial: { events: input.trial.events, initialState: input.trial.initialState, finalState: input.trial.finalState },
+          trial: { userMode: input.trial.userMode, events: input.trial.events, initialState: input.trial.initialState, finalState: input.trial.finalState },
         },
         z.strictObject({ assessments: z.array(metricAssessmentSchema).length(metrics.length) }), ctx,
       );
@@ -459,7 +464,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       );
     },
     async userTurn(input, ctx) {
-      return ask(
+      const reply = await ask(
         'Реплика пользователя',
         SIMULATOR_ROLE,
         {
@@ -470,6 +475,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
           messages: input.messages.map(({ role, content }) => ({ role, content })), turn: input.turn,
         }, simulatorReplySchema, ctx,
       );
+      return { ...reply, message: reply.message ?? '' };
     },
   };
 }
