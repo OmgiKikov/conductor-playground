@@ -100,19 +100,26 @@ export async function editDraft(ctx: ExtensionContext, action: Extract<BoardActi
   if (action.section === 'cards' && record.scenarios[action.selected]) {
     const scenario = structuredClone(record.scenarios[action.selected]!);
     const fields = [
+      ['opening', 'Первая реплика'], ['successCriteria', 'Критерий успеха'],
+      ['script', 'Продолжения после первой реплики · по одному в строке'],
+      ['facts', 'Факты, известные пользователю'], ['maxFollowUps', 'Максимум ответов после первой реплики'],
       ['profileId', 'Профиль пользователя · выбрать или убрать'],
       ['title', 'Название'], ['persona', 'Персона'], ['characteristics', 'Характеристики · по одной в строке'],
-      ['goal', 'Цель пользователя'], ['behavior', 'Поведение'], ['facts', 'Факты, известные пользователю'],
-      ['opening', 'Первая реплика'], ['maxFollowUps', 'Максимум ответов после первой реплики'],
-      ['successCriteria', 'Критерий успеха'], ['assumptions', 'Допущения · по одному в строке'],
-      ['tier', 'Ступень · дымовая, регрессия или фронтир'], ['script', 'Скрипт пользователя · по одной реплике в строке'],
+      ['goal', 'Цель пользователя'], ['behavior', 'Поведение'], ['assumptions', 'Допущения · по одному в строке'],
+      ['tier', 'Ступень · дымовая, регрессия или фронтир'],
       ['metrics', 'Метрики · JSON'], ['checks', 'Точные проверки · JSON'], ['initialState', 'Начальное состояние · JSON'],
       ['all', 'Все карточки · JSON'],
     ] as const;
-    const choice = await ctx.ui.select('Что изменить в карточке?', fields.map(([, label]) => label));
+    let choice = await ctx.ui.select('Что изменить в тесте? · можно обсудить обычными словами: a', [...fields.slice(0, 5).map(([, label]) => label), 'Расширенные настройки']);
+    if (choice === 'Расширенные настройки') choice = await ctx.ui.select('Расширенные настройки теста', fields.slice(5).map(([, label]) => label));
     const entry = fields.find(([, label]) => label === choice);
     if (!entry) return;
     const [field, title] = entry;
+    if (field === 'successCriteria') return editPatch('Ожидание и исполняемые проверки · измените их вместе · для правки обычными словами нажмите a на доске',
+      JSON.stringify({ successCriteria: scenario.successCriteria, checks: scenario.checks, metrics: scenario.metrics ?? [] }, null, 2), text => {
+        const expectation = z.strictObject({ successCriteria: z.string().min(1), checks: z.array(z.unknown()), metrics: z.array(z.unknown()) }).parse(JSON.parse(text));
+        return { scenarios: [{ ...scenario, ...expectation }] };
+      });
     if (field === 'profileId') {
       const labels = ['Без профиля и персоны', ...record.profiles.map(p => `${p.id} · ${profileUser(p).persona ?? 'Без персоны'}`)].map(safeText);
       const selected = await ctx.ui.select('Профиль этой карточки', labels);
@@ -140,7 +147,8 @@ export async function editDraft(ctx: ExtensionContext, action: Extract<BoardActi
     return editPatch(title, json ? JSON.stringify(initial ?? [], null, 2)
       : array ? (initial as string[] | undefined)?.join('\n') ?? '' : String(initial ?? ''), changed => {
       if (field === 'maxFollowUps' && !/^\d+$/.test(changed.trim())) throw new Error('Введите целое число от 0 до 15.');
-      object[field] = json ? JSON.parse(changed) : array ? changed.split('\n').map(v => v.trim()).filter(Boolean) : field === 'maxFollowUps' ? Number(changed) : changed;
+      object[field] = json ? JSON.parse(changed) : field === 'script' ? changed === '' ? [] : changed.split('\n')
+        : array ? changed.split('\n').map(v => v.trim()).filter(Boolean) : field === 'maxFollowUps' ? Number(changed) : changed;
       if (field === 'persona' && !changed.trim()) delete object[field];
       return { scenarios: [scenario] };
     });

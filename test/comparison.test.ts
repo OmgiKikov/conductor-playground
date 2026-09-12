@@ -88,10 +88,10 @@ test('user-mode comparison reports pass rates, turns, cost and the failures only
   assert.deepEqual([scripted.trials, scripted.valid, scripted.passed, scripted.passRate], [2, 1, 1, 1]);
   assert.equal(scripted.costUsd, null);
   assert.deepEqual([reactive.trials, reactive.valid, reactive.passed, reactive.passRate, reactive.calls], [2, 2, 1, 0.5, 7]);
-  assert.deepEqual(stat.failedChecks, ['time']);
+  assert.deepEqual(stat.failedChecks, ['s1/check:time']);
   assert.deepEqual(stat.uniqueFailedChecks, []);
-  assert.deepEqual(reactive.failedChecks, ['extra', 'time']);
-  assert.deepEqual(reactive.uniqueFailedChecks, ['extra']);
+  assert.deepEqual(reactive.failedChecks, ['s1/check:extra', 's1/check:time']);
+  assert.deepEqual(reactive.uniqueFailedChecks, ['s1/check:extra']);
   assert.equal(reactive.avgUserTurns, 1.5);
   assert.equal(stat.avgUserTurns, 1);
   const rubricOnly = compareUserModes(record({ trials: [

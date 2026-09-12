@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import {
-  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, fingerprint, goalToScenario, goldenToScenario, humanReviewInputSchema, observedProfileSchema, proposalSchema, settingsSchema, validateFailureModes, validateObservedGoals, validatePreparation,
+  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, experimentSchema, fingerprint, goalToScenario, goldenToScenario, humanReviewInputSchema, observedProfileSchema, proposalSchema, scriptIssue, settingsSchema, validateFailureModes, validateObservedGoals, validatePreparation,
   type CallContext, type CreateInput, type DraftPatch, type Experiment, type HumanReviewInput, type Revision, type Runtime,
 } from './contracts.js';
 import { ExperimentStore } from './store.js';
@@ -38,6 +40,23 @@ export function measurementHash(record: Experiment): string {
 }
 function revision(spec: Revision['spec'], parentId: string | null, hypothesis: string): Revision {
   return { id: fingerprint(spec), parentId, spec: structuredClone(spec), hypothesis, createdAt: new Date().toISOString() };
+}
+
+function freshDraft(previous: Experiment, scenarioIds?: string[]): Experiment {
+  const record = structuredClone(previous);
+  if (scenarioIds) {
+    if (!scenarioIds.length || new Set(scenarioIds).size !== scenarioIds.length
+      || scenarioIds.some(id => !record.scenarios.some(s => s.id === id))) throw new Error('Выберите существующие тесты без повторов.');
+    record.scenarios = record.scenarios.filter(s => scenarioIds.includes(s.id));
+    record.selectedScenarioIds = [...scenarioIds];
+  }
+  Object.assign(record, { id: randomUUID(), parentRunId: previous.id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    phase: 'review', message: 'Тесты готовы. Проверьте подключение и запустите проверку.',
+    trials: [], comparisons: [], iterations: [], humanReviews: [], usage: emptyUsage(),
+    reviewedAt: null, reviewMode: null, manifestHash: null, controlConsumedAt: null, error: null });
+  delete record.resultsReviewedAt; delete record.resultsReviewHash; delete record.failureModes;
+  record.limitations = previous.limitations.filter(note => !note.startsWith('Scripted mode skipped') && !note.startsWith('Не удалось назвать типы провалов:'));
+  return record;
 }
 
 export class ExperimentLab {
@@ -91,7 +110,7 @@ export class ExperimentLab {
     const now = new Date().toISOString();
     const record: Experiment = {
       schemaVersion: '1', id: randomUUID(), task: input.task, mode: input.mode, createdAt: now, updatedAt: now,
-      phase: 'preparing', message: 'Reading materials and preparing requirements and scenarios.',
+      phase: 'preparing', message: 'Подключаю агента и готовлю требования и первый тест.',
       sources: input.materials.map((m, i) => ({ id: `source-${i + 1}`, name: m.name, content: m.content, hash: fingerprint(m.content) })),
       settings: input.settings, requirements: [], questions: [], scenarios: [], revisions: [], selectedRevisionId: null,
       manifestHash: null, reviewedAt: null, reviewMode: null, controlConsumedAt: null, trials: [], comparisons: [], iterations: [],
@@ -135,7 +154,7 @@ export class ExperimentLab {
       Object.assign(record, { requirements: prepared.requirements, questions: prepared.questions, scenarios: prepared.scenarios });
       const baseline = revision(input.existingAgent ?? prepared.agent, null, input.workflow === 'evaluate' ? 'Agent configuration selected for dialogue evaluation.' : 'Original agent before measured improvements.');
       record.revisions.push(baseline); record.selectedRevisionId = baseline.id;
-      await this.checkpoint(record, 'review', 'Draft ready. Review goals, users and metrics before approving a run.');
+      await this.checkpoint(record, 'review', 'Тест готов. Проверьте запрос, ожидаемый результат и план запуска.');
     });
     return structuredClone(record);
   }
@@ -150,6 +169,10 @@ export class ExperimentLab {
       for (const id of removed) if (!beforeCards.has(id)) throw new Error(`Нет карточки для удаления: ${id}`);
       for (const scenario of patch.scenarios ?? []) {
         const before = record.scenarios.find(s => s.id === scenario.id);
+        if (before && scenario.successCriteria !== before.successCriteria
+          && fingerprint([scenario.checks, scenario.metrics ?? []]) === fingerprint([before.checks, before.metrics ?? []])) {
+          throw new Error(`Ожидание «${scenario.title}» изменилось, а исполняемые проверки остались прежними. Измените checks или metrics вместе с successCriteria; описание само по себе не меняет тест.`);
+        }
         if (scenario.profileId && before?.profileId === scenario.profileId && !patch.profileEdits?.some(e => e.id === scenario.profileId)
           && fingerprint([scenario.user.persona, scenario.user.characteristics]) !== fingerprint([before.user.persona, before.user.characteristics])) {
           throw new Error(`Карточка ${scenario.id} связана с профилем ${scenario.profileId}. Измените profileEdits или уберите profileId, чтобы задать отдельную персону.`);
@@ -182,21 +205,41 @@ export class ExperimentLab {
     });
   }
   /** Reuse the exact reviewed materials and cards; only evidence and approvals start afresh. */
-  async repeat(id: string): Promise<Experiment> {
+  async repeat(id: string, scenarioIds?: string[]): Promise<Experiment> {
     return this.change(async () => {
       const previous = await this.store.get(id);
       if (previous.workflow !== 'evaluate' || !previous.reviewedAt || runningPhases.has(previous.phase)) {
         throw new Error('Повторить можно остановленный или завершённый прогон с утверждёнными карточками.');
       }
-      const now = new Date().toISOString();
-      const record: Experiment = {
-        ...structuredClone(previous), id: randomUUID(), parentRunId: previous.id,
-        createdAt: now, updatedAt: now, phase: 'review', message: 'Те же карточки готовы к новому прогону. Проверьте версию агента и подтвердите запуск.',
-        trials: [], comparisons: [], iterations: [], humanReviews: [], usage: emptyUsage(),
-        reviewedAt: null, reviewMode: null, manifestHash: null, controlConsumedAt: null, error: null,
-        limitations: previous.limitations.filter(note => !note.startsWith('Scripted mode skipped') && !note.startsWith('Не удалось назвать типы провалов:')),
-      };
-      delete record.resultsReviewedAt; delete record.resultsReviewHash; delete record.failureModes;
+      const record = freshDraft(previous, scenarioIds);
+      record.targetFingerprint = await targetFingerprint(record.target);
+      await this.store.save(record);
+      return structuredClone(record);
+    });
+  }
+  /** A versionable local definition: provenance survives, run results and approvals do not. */
+  async saveSuite(id: string, file: string, scenarioIds?: string[]): Promise<string> {
+    const previous = await this.get(id);
+    if (previous.workflow !== 'evaluate' || !previous.scenarios.length || runningPhases.has(previous.phase)) throw new Error('Сначала дождитесь готовых тестов.');
+    const definition = freshDraft(previous, scenarioIds);
+    const path = resolve(file);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify({ format: 'agent-lab-suite-1', definition }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    return path;
+  }
+  async loadSuite(file: string, scenarioIds?: string[]): Promise<Experiment> {
+    return this.change(async () => {
+      const raw = JSON.parse(await readFile(file, 'utf8'));
+      if (raw.format !== 'agent-lab-suite-1') throw new Error('Нужен файл тестов Agent Lab, сохранённый через save-suite.');
+      const previous = experimentSchema.parse(raw.definition);
+      if (previous.workflow !== 'evaluate') throw new Error('Файл должен содержать обычные тесты evaluate.');
+      const record = freshDraft(previous, scenarioIds);
+      // Keep the original run as the comparison source, not the exported draft's temporary ID.
+      record.parentRunId = previous.parentRunId;
+      const prepared = validatePreparation({ requirements: record.requirements, questions: record.questions,
+        agent: record.revisions[0]?.spec, scenarios: record.scenarios.map(({ split: _split, ...s }) => s) }, record.sources, 'evaluate', record.profiles);
+      record.scenarios = prepared.scenarios;
+      await preflightTarget(record.target);
       record.targetFingerprint = await targetFingerprint(record.target);
       await this.store.save(record);
       return structuredClone(record);
@@ -224,7 +267,7 @@ export class ExperimentLab {
       if (record.workflow !== 'evaluate' || record.phase !== 'results_review') throw new Error('Нет завершённого набора диалогов, ожидающего аудита.');
       if (resultHash(record) !== expectedHash) throw new Error('Результаты изменились. Откройте их заново, прежде чем подтверждать аудит.');
       const pending = awaitingVerdict(record).size;
-      if (pending) throw new Error(`Нельзя завершить разбор: ${pending} провалившихся диалогов без решающего вердикта. Оцените весь диалог или все проваленные критерии; «неясно» и «невалидно» оставляют вопрос открытым.`);
+      if (pending) throw new Error(`Нельзя завершить разбор: ${pending} диалогов без решения. Оцените проваленные критерии или весь диалог. Если ошибочен сам тест, отметьте весь диалог «Невалидный тест» с причиной; «неясно» оставляет вопрос открытым.`);
       record.resultsReviewedAt = new Date().toISOString(); record.resultsReviewHash = expectedHash;
       await this.checkpoint(record, 'complete', 'Human review complete. Original checks, model estimates and human annotations remain separate.');
       return structuredClone(record);
@@ -236,10 +279,14 @@ export class ExperimentLab {
       if (record.phase !== 'review') throw new Error('Запустить можно только эксперимент, ожидающий проверки. Чтобы поменять набор карточек, создайте новый.');
       if (record.workflow === 'compare' && (record.target.kind !== 'sandbox' || record.settings.userModes.length !== 1)) throw new Error('Автоматическое сравнение поддерживает только песочницу и один режим пользователя.');
       if (!options.approved) throw new Error('Набор карточек замораживается только после вашего подтверждения.');
-      if (record.workflow === 'evaluate' && (options.reviewer !== 'human' || options.expectedHash !== draftHash(record))) {
-        throw new Error('Нужно подтверждение человека. Откройте карточки в Pi и утвердите именно эту версию черновика.');
+      if (record.workflow === 'evaluate' && options.expectedHash !== draftHash(record)) {
+        throw new Error('Нужно подтверждение именно этой версии черновика. Откройте свежие тесты и план запуска.');
       }
       if (record.questions.length) throw new Error('Сначала ответьте на бизнес-вопросы из черновика: добавьте ответы в материалы и подготовьте новый эксперимент.');
+      if (record.settings.userModes.includes('scripted')) for (const scenario of record.scenarios) {
+        const issue = scriptIssue(scenario.user, record.settings.maxTurns);
+        if (issue) throw new Error(`${scenario.title}: ${issue}`);
+      }
       await preflightTarget(record.target);
       if (record.targetFingerprint && record.targetFingerprint !== await targetFingerprint(record.target)) {
         throw new Error('Код агента изменился после подготовки карточек. Обновите подключение в настройках и подтвердите новую версию.');
@@ -249,7 +296,7 @@ export class ExperimentLab {
       if (record.reviewMode === 'automated') record.limitations.push('Generated scenario expectations were checked automatically, without human validation. Results are provisional synthetic evidence.');
       record.manifestHash = measurementHash(record);
       record.phase = record.workflow === 'evaluate' ? 'evaluating' : 'baseline';
-      record.message = record.workflow === 'evaluate' ? 'Running the human-approved dialogue set.' : 'Starting the frozen development comparison.';
+      record.message = record.workflow === 'evaluate' ? 'Выполняю согласованный план проверки.' : 'Starting the frozen development comparison.';
       await this.launch(record, ctx => record.workflow === 'evaluate' ? this.evaluateReviewed(record, ctx) : this.execute(record, ctx), true);
       return structuredClone(record);
     });
@@ -346,7 +393,7 @@ export class ExperimentLab {
       const skipped: string[] = [];
       const prefix = record.settings.userModes.length > 1 ? `[${userMode}] ` : '';
       for (const scenario of scenarios) {
-        if (userMode === 'scripted' && !scenario.user.script?.length) { skipped.push(scenario.id); continue; }
+        if (userMode === 'scripted' && scenario.user.script === undefined) { skipped.push(scenario.id); continue; }
         for (let repeat = 0; repeat < record.settings.repeats; repeat++) {
           guard();
           if (record.targetFingerprint && record.targetFingerprint !== await targetFingerprint(record.target)) throw new Error('Код внешнего агента изменился во время прогона. Создайте повтор с новой версией.');

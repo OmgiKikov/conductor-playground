@@ -37,6 +37,14 @@ export const settingsSchema = z.strictObject({
   userModes: z.array(userModeSchema).min(1).max(3).refine(unique, 'Duplicate user modes').default(['reactive']),
 });
 export type Settings = z.infer<typeof settingsSchema>;
+// A patch must never materialize defaults for keys the caller did not send.
+const settingsPatchSchema = z.strictObject({
+  provider: settingsSchema.shape.provider.removeDefault(), model: settingsSchema.shape.model.removeDefault(),
+  repeats: settingsSchema.shape.repeats.removeDefault(), maxIterations: settingsSchema.shape.maxIterations.removeDefault(),
+  maxTurns: settingsSchema.shape.maxTurns.removeDefault(), maxCalls: settingsSchema.shape.maxCalls.removeDefault(),
+  timeoutMs: settingsSchema.shape.timeoutMs.removeDefault(), maxDurationMs: settingsSchema.shape.maxDurationMs.removeDefault(),
+  userModes: settingsSchema.shape.userModes.removeDefault(),
+}).partial();
 
 /*
  * Who answers the simulated user. The sandbox target is a nested Pi session with trusted tools.
@@ -96,6 +104,16 @@ export const checkSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...checkBase, kind: z.literal('answer_omits'), value: text.max(1000) }),
 ]);
 export type Check = z.infer<typeof checkSchema>;
+export function describeCheck(check: Check): string {
+  if (check.kind === 'state_equals') return `${check.recordId}.${check.field} = ${JSON.stringify(check.value)} в конце диалога`;
+  if (check.kind === 'answer_equals') return `Последний ответ в точности: ${JSON.stringify(check.value)}`;
+  if (check.kind === 'answer_contains') return `В ответах есть: ${JSON.stringify(check.value)} (без учёта регистра)`;
+  if (check.kind === 'answer_omits') return `В ответах нет: ${JSON.stringify(check.value)} (без учёта регистра)`;
+  if (check.kind === 'tool_called') return `Есть вызов ${check.tool}`;
+  if (check.kind === 'tool_not_called') return `Нет вызовов ${check.tool}`;
+  if (check.kind === 'tool_count') return `${check.tool}: от ${check.min} до ${check.max} попыток вызова`;
+  return 'Перед каждым изменением — успешное чтение той же записи';
+}
 export const rubricSchema = z.strictObject({
   id: identifier, name: text.max(120), subject: z.enum(['agent', 'simulator']),
   description: text.max(2000), passCriteria: text.max(2000), failCriteria: text.max(2000), ...stage,
@@ -116,7 +134,8 @@ export const userSchema = z.strictObject({
   goal: text.max(3000), facts: text.max(5000), behavior: text.max(2000), opening: text.max(3000),
   maxFollowUps: z.number().int().min(0).max(15).optional(),
   persona: text.max(2000).optional(), characteristics: z.array(text.max(300)).max(12).optional(),
-  script: z.array(text.max(3000)).max(15).optional(),
+  script: z.array(z.string().min(1).max(3000).refine(v => !!v.trim(), 'Empty user message')).max(15).optional()
+    .describe('Follow-up messages AFTER opening, never include opening itself. [] means opening only. Every line must fit maxFollowUps and maxTurns.'),
 });
 /**
  * The rung a card occupies. smoke: the basics that must never break, whatever else changes.
@@ -138,6 +157,14 @@ export const scenarioSchema = z.strictObject({
   metrics: z.array(rubricSchema).max(8).optional(),
 });
 export type Scenario = z.infer<typeof scenarioSchema> & { split: 'dev' | 'control' };
+
+/** Validate the conversation we will actually send, before spending any target calls. */
+export function scriptIssue(user: Scenario['user'], maxTurns: number): string | undefined {
+  const available = Math.min(user.maxFollowUps ?? maxTurns - 1, maxTurns - 1);
+  if (user.script && user.script.length > available) {
+    return `Скрипт содержит ${user.script.length} продолжения, но лимит допускает ${available}. script содержит только реплики после opening; уберите повтор первой реплики или увеличьте лимит.`;
+  }
+}
 
 /*
  * Real data supplied by the owner:
@@ -308,7 +335,7 @@ export const draftPatchSchema = z.strictObject({
     .refine(unique, 'Повторяются идентификаторы удаляемых карточек.').optional(),
   profileEdits: z.array(z.strictObject({ id: identifier, override: profileOverrideSchema.nullable() })).min(1).max(12)
     .refine(edits => unique(edits.map(e => e.id)), 'Duplicate profile edits').optional(),
-  agent: agentSchema.optional(), settings: settingsSchema.partial().optional(),
+  agent: agentSchema.optional(), settings: settingsPatchSchema.optional(),
   target: targetSchema.optional(), targetVersion: text.max(200).optional(),
 }).refine(v => Object.keys(v).length > 0, 'Supply a draft change')
   .refine(v => !v.scenarios?.some(card => v.removeScenarioIds?.includes(card.id)), 'Нельзя одновременно изменить и удалить одну карточку.');
@@ -327,6 +354,7 @@ export interface Experiment {
   /** Named clusters over the failed dialogues of this run; the bridge from evaluation to fixing. */
   failureModes?: FailureMode[];
   parentRunId?: string;
+  selectedScenarioIds?: string[];
   targetVersion?: string;
   targetFingerprint?: string;
 }
@@ -390,7 +418,7 @@ export const experimentSchema: z.ZodType<Experiment> = z.strictObject({
     verdict: z.enum(['pass', 'fail', 'unknown', 'invalid']), note: text.max(3000),
   })).default([]), resultsReviewedAt: text.optional(), resultsReviewHash: text.optional(),
   failureModes: z.array(failureModeSchema).max(30).optional(),
-  parentRunId: identifier.optional(), targetVersion: text.max(200).optional(), targetFingerprint: text.optional(),
+  parentRunId: identifier.optional(), selectedScenarioIds: z.array(identifier).min(1).max(40).optional(), targetVersion: text.max(200).optional(), targetFingerprint: text.optional(),
 });
 export interface CallContext {
   signal: AbortSignal; timeoutMs: number;

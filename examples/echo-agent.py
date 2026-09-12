@@ -13,9 +13,8 @@ import re
 import sys
 
 
-def handle(request):
+def handle(request, records):
     message = request["message"]
-    records = json.loads(json.dumps(request["initialState"]["records"]))
     match = re.search(r"\b(?:[01]\d|2[0-3]):[0-5]\d\b", message)
     if records and match:
         record_id = next(iter(records))
@@ -32,6 +31,7 @@ def handle(request):
     return {"reply": f"You said: {message}", "events": [], "records": records}
 
 
+records = None  # One process per dialogue: retain state until close, then reset in the next process.
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -39,5 +39,7 @@ for line in sys.stdin:
     request = json.loads(line)
     if request.get("type") == "close":
         break
-    sys.stdout.write(json.dumps(handle(request), ensure_ascii=False) + "\n")
+    if records is None:
+        records = json.loads(json.dumps(request["initialState"]["records"]))
+    sys.stdout.write(json.dumps(handle(request, records), ensure_ascii=False) + "\n")
     sys.stdout.flush()

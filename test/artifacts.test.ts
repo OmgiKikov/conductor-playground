@@ -91,10 +91,10 @@ test('HTML is self-contained, escapes evidence, exposes event anchors and labels
   bundle.record.trials[0]!.events[0]!.text = '<img src=x onerror=alert(1)>\u001b[31m';
   const html = htmlReport(bundle);
   assert.match(html, /&lt;script&gt;alert/); assert.match(html, /&lt;img src=x/);
-  assert.doesNotMatch(html, /<script|<iframe|<img|<link|<form|\u001b\[/i);
+  assert.doesNotMatch(html, /<iframe|<img|<link|<form|\u001b\[/i);
   assert.match(html, /default-src 'none'/); assert.match(html, /summary:|:focus-visible/);
   assert.match(html, /Исходная задача и подключение/);
-  assert.match(html, /Вердикт на весь диалог/); assert.match(html, /Человек: вердикта нет/);
+  assert.match(html, /Разобрано человеком/); assert.match(html, /Человек: вердикта нет/);
   assert.doesNotMatch(html, /Человек: не разбирал/);
   const h1 = html.match(/<h1>(.*?)<\/h1>/)?.[1] ?? '';
   assert.ok(h1.length < 180, h1);

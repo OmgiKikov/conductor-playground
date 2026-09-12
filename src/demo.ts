@@ -99,8 +99,8 @@ export function createDemoRuntime(): Runtime {
       if (input.workflow === 'evaluate') {
         const count = input.scenarioCount ?? 5;
         if (!Number.isInteger(count) || count < 1 || count > 10) throw new Error('The demo scenario count must be an integer from 1 to 10');
-        // Put one example of each mechanism first, then the remaining curated variants.
-        scenarios = [...scenarios.filter((_, i) => i % 2 === 0), ...scenarios.filter((_, i) => i % 2 === 1)].slice(0, count).map(scenario => ({
+        // First show an action, a changed request across turns, and a read-only regression guard.
+        scenarios = [0, 8, 6, 2, 4, 1, 3, 5, 7, 9].map(i => scenarios[i]!).slice(0, count).map(scenario => ({
           ...scenario, provenance: 'synthetic' as const,
           ...(input.profiles?.[0] ? { profileId: input.profiles[0].id } : {}),
           user: { ...scenario.user, persona: 'An appointment holder arranging their own visit.',

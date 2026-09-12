@@ -279,14 +279,14 @@ test('one user card requires exact human approval, runs one unchanged agent, the
   assert.equal(draft.phase, 'review'); assert.equal(draft.scenarios.length, 1); assert.equal(targets, 0);
   assert.ok(draft.scenarios[0]!.user.persona); assert.ok(draft.scenarios[0]!.metrics?.length);
   const originalHash = draftHash(draft);
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'automated', expectedHash: originalHash }), /подтверждение человека/);
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: 'stale' }), /подтверждение человека/);
+  await assert.rejects(lab.start(draft.id, { approved: false, reviewer: 'automated', expectedHash: originalHash }), /подтверждения/);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: 'stale' }), /подтверждение.*версии/);
   const cards = structuredClone(draft.scenarios);
   cards[0]!.user.persona = 'A busy customer with one appointment';
   const edited = await lab.updateDraft(draft.id, originalHash, { scenarios: cards });
   assert.notEqual(draftHash(edited), originalHash); assert.equal(edited.reviewedAt, null);
   await assert.rejects(lab.updateDraft(draft.id, originalHash, { scenarios: cards }), /Черновик изменился/);
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: originalHash }), /подтверждение человека/);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: originalHash }), /подтверждение.*версии/);
   await lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(edited) }); await lab.waitForIdle();
   const result = await lab.get(draft.id);
   assert.equal(result.phase, 'results_review', result.error ?? ''); assert.equal(result.reviewMode, 'human');
@@ -463,7 +463,7 @@ test('profile edits preserve evidence, update linked cards, invalidate approval 
   assert.ok(edited.scenarios.every(s => s.profileId === id && !s.user.persona));
   assert.ok(edited.scenarios.every(s => s.user.characteristics?.[0] === edit.override.characteristics[0]));
   assert.notEqual(draftHash(edited), draftHash(draft)); assert.notEqual(measurementHash(edited), measurementHash(draft));
-  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }), /подтверждение человека/);
+  await assert.rejects(lab.start(draft.id, { approved: true, reviewer: 'human', expectedHash: draftHash(draft) }), /подтверждение.*версии/);
   for (const profileEdits of [[{ id: 'unknown', override: null }], [edit, edit], [{ id, override: { source: 'owner' } }]]) {
     await assert.rejects(lab.updateDraft(draft.id, draftHash(edited), { profileEdits } as never));
     assert.deepEqual(await lab.get(draft.id), JSON.parse(JSON.stringify(edited)), 'a rejected edit must leave the saved draft intact');
@@ -581,7 +581,7 @@ test('repeat keeps the approved suite, discards results and requires fresh appro
   assert.deepEqual(after.trials, []); assert.deepEqual(after.humanReviews, []); assert.equal(after.reviewedAt, null);
   assert.equal(after.targetVersion, 'v2'); assert.equal(after.phase, 'review');
   assert.deepEqual((await lab.get(before.id)).trials, before.trials);
-  await assert.rejects(lab.start(after.id, { approved: true, reviewer: 'automated', expectedHash: draftHash(after) }), /подтверждение человека/);
+  await assert.rejects(lab.start(after.id, { approved: false, reviewer: 'automated', expectedHash: draftHash(after) }), /подтверждения/);
 });
 
 test('rubric-only agent failures reach clustering', async t => {
@@ -641,9 +641,9 @@ test('finalizing requires decisive failure review and preserves original evidenc
   let result = await lab.get(draft.id);
   const original = structuredClone(result.trials);
   assert.equal(awaitingVerdict(result).size, 2);
-  await assert.rejects(lab.reviewResults(result.id, resultHash(result)), /2.*без решающего вердикта/);
+  await assert.rejects(lab.reviewResults(result.id, resultHash(result)), /2.*без решения/);
   result = await lab.addHumanReview(result.id, { trialId: result.trials[0]!.id, verdict: 'unknown', note: 'Нужен разбор.' });
-  await assert.rejects(lab.reviewResults(result.id, resultHash(result)), /без решающего вердикта/);
+  await assert.rejects(lab.reviewResults(result.id, resultHash(result)), /без решения/);
   for (const trial of result.trials) {
     for (const check of trial.checks.filter(c => !c.passed)) result = await lab.addHumanReview(result.id, { trialId: trial.id, checkId: check.id, verdict: 'fail', note: 'Проверено по состоянию.' });
     for (const assessment of trial.assessments?.filter(a => a.result === 'fail') ?? []) result = await lab.addHumanReview(result.id, { trialId: trial.id, metricId: assessment.metricId, verdict: 'fail', note: 'Проверено по трассе.' });
@@ -654,7 +654,7 @@ test('finalizing requires decisive failure review and preserves original evidenc
   assert.deepEqual(completed.trials, original);
   const reopened = await lab.addHumanReview(result.id, { trialId: result.trials[0]!.id, checkId: result.trials[0]!.checks.find(c => !c.passed)!.id, verdict: 'unknown', note: 'Предыдущее решение пересмотрено.' });
   assert.equal(reopened.phase, 'results_review');
-  await assert.rejects(lab.reviewResults(result.id, resultHash(reopened)), /без решающего вердикта/);
+  await assert.rejects(lab.reviewResults(result.id, resultHash(reopened)), /без решения/);
 });
 
 test('the active snapshot names the current card and target wait before a trial finishes', async t => {

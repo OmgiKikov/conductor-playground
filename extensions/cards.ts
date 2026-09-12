@@ -1,6 +1,7 @@
 import type { ExtensionContext, Theme, ThemeColor } from '@earendil-works/pi-coding-agent';
 import { matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from '@earendil-works/pi-tui';
 import type { Experiment, Scenario, Trial } from '../dist/contracts.js';
+import { describeCheck } from '../dist/contracts.js';
 import { awaitingVerdict, evidenceSummary, verdictSummary, isAgentFailure, humanFindings, humanFindingText, repeatResultText, plannedTrials, type RunComparison, type VerdictNote } from '../dist/comparison.js';
 import type { EvidenceBundle } from '../dist/artifacts.js';
 
@@ -17,7 +18,7 @@ const phases: Record<string, string> = {
   error: 'ОШИБКА', interrupted: 'ПРЕРВАНО', baseline: 'БАЗОВАЯ ВЕРСИЯ', improving: 'УЛУЧШЕНИЕ', control: 'КОНТРОЛЬ',
 };
 export const verdicts: Record<string, string> = {
-  pass: 'ПРОЙДЕНО', fail: 'НЕ ПРОЙДЕНО', unknown: 'НЕЯСНО', invalid: 'НЕ ИЗМЕРЕНО', cancelled: 'ОСТАНОВЛЕНО', ungraded: 'ПО РУБРИКАМ',
+  pass: 'ПРОЙДЕНО', fail: 'НЕ ПРОЙДЕНО', unknown: 'НЕЯСНО', invalid: 'НЕВАЛИДНЫЙ ТЕСТ', cancelled: 'ОСТАНОВЛЕНО', ungraded: 'ПО РУБРИКАМ',
 };
 
 /**
@@ -67,8 +68,10 @@ function scenarioLines(scenario: Scenario, record: Experiment, expanded: boolean
   if (!expanded) return [
     line(scenario.title, 'accent', true),
     line(`Первая реплика: «${scenario.user.opening}»`),
+    ...(scenario.user.script !== undefined ? scenario.user.script.map((message, i) => line(`Продолжение ${i + 1}: «${message}»`)) : []),
     line(''), line(`Цель: ${scenario.user.goal}`),
     line(`Успех: ${scenario.successCriteria || scenario.checks.map(c => c.description).join('; ') || 'По рубрикам ниже.'}`),
+    ...scenario.checks.map(c => line(`Проверяется: ${describeCheck(c)}`)),
     line(''), line(`${origin} · ${tierLabels[scenario.tier]} · ${scenario.checks.length} точных проверок · ${scenario.metrics?.length ?? 0} рубрик`, 'muted'),
     ...(profile ? [line(`Профиль ${profile.id}${profile.draftOverride ? ' · правка черновика' : ''}`, 'muted')] : []),
     line('Enter — пользователь, факты, поведение и все критерии', 'muted'),
@@ -84,7 +87,9 @@ function scenarioLines(scenario: Scenario, record: Experiment, expanded: boolean
     line(`Знает: ${scenario.user.facts}`), line(`Первая реплика: «${scenario.user.opening}»`),
     line(`Лимит: ${scenario.user.maxFollowUps ?? Math.max(0, record.settings.maxTurns - 1)} ответов после первой реплики`, 'muted'),
     line(''), line('УСПЕХ', 'accent'), line(scenario.successCriteria || 'Описан проверками и метриками ниже.'),
-    ...scenario.checks.map(c => line(`□ ${c.stage ? `[${c.stage}] ` : ''}${c.description} [${c.id}]`)),
+    ...scenario.checks.map(c => line(`□ ${c.stage ? `[${c.stage}] ` : ''}${c.description} [${c.id}] · ${describeCheck(c)}`)),
+    ...(scenario.user.script !== undefined ? [line('РЕПЛИКИ ПО СЦЕНАРИЮ', 'accent'), line(`1. ${scenario.user.opening}`),
+      ...scenario.user.script.map((message, i) => line(`${i + 2}. ${message}`))] : []),
     ...(scenario.metrics ?? []).flatMap(m => [
       line(`${m.subject === 'simulator' ? 'Симулятор' : 'Агент'} · ${m.stage ? `[${m.stage}] ` : ''}${m.name} [${m.id}]`, 'text', true),
       line(m.description), line(`Прошёл: ${m.passCriteria}`), line(`Не прошёл: ${m.failCriteria}`),
@@ -168,8 +173,26 @@ const tierLabels: Record<string, string> = { smoke: 'дымовые', regression
 const noteText = (note: VerdictNote): string => note.text;
 
 /** The simple layer: what passed, where it is weak, how much to trust it, what to do next. Research statistics live in section 4. */
-function verdictLines(record: Experiment): Line[] {
+function verdictLines(record: Experiment, expanded = false): Line[] {
   const v = verdictSummary(record);
+  if (!expanded) {
+    const finding = v.review.findings[0];
+    const trial = record.trials.find(t => t.outcome === 'invalid') ?? record.trials.find(t => isAgentFailure(record, t));
+    return [line('ИТОГ', 'accent', true), line(v.headline, 'text', true), line(''),
+      ...(finding ? [line(humanFindingText(finding), 'warning')] : []),
+      ...(trial ? [line('ЧТО ТРЕБУЕТ ВНИМАНИЯ', 'accent'),
+        line(record.scenarios.find(s => s.id === trial.scenarioId)?.title ?? trial.scenarioId, 'text', true),
+        line(trial.checks.find(c => !c.passed)?.evidence || trial.checks.find(c => !c.passed)?.description
+          || trial.assessments?.find(a => a.result === 'fail' && record.scenarios.find(s => s.id === trial.scenarioId)?.metrics?.some(m => m.id === a.metricId && m.subject === 'agent'))?.rationale || trial.reason, 'warning'),
+        ...trial.assessments?.filter(a => a.result === 'fail' && record.scenarios.find(s => s.id === trial.scenarioId)?.metrics?.some(m => m.id === a.metricId && m.subject === 'agent'))
+          .slice(0, 1).map(a => line(`Основание: реплики #${a.evidence.join(', #')}`, 'muted')) ?? [],
+        line('3 — открыть диалог и основание оценки', 'muted'),
+      ] : [line('Сохраните полезные тесты и повторите их после следующей правки.')]),
+      line(''), line(`Дальше: ${v.nextSteps[0]?.text ?? 'Повторите тест после изменения агента.'}`),
+      line('a — обсудить результат · r — повторить набор · Enter — все детали', 'accent'),
+      line(`Выполнено ${v.execution.completed}/${v.execution.planned} · ожидают разбора ${v.review.pending} · сбоев ${v.invalid} · тестов отклонено ${v.review.invalid}`, 'muted'),
+    ];
+  }
   const p = v.provenance;
   const examples = record.trials.filter(t => isAgentFailure(record, t)).slice(0, 3);
   return [
@@ -484,7 +507,7 @@ export class LabBoard implements Component {
       detail = statsLines(record);
     } else {
       const agent = record.revisions.find(r => r.id === record.selectedRevisionId)?.spec;
-      detail = [...(record.trials.length ? [...verdictLines(record), line('')] : []), line(record.task, 'text', true),
+      detail = [...(record.trials.length ? [...verdictLines(record, this.expanded), line('')] : []), line(record.task, 'text', true),
         ...(record.error ? [line('НЕ УДАЛОСЬ ЗАВЕРШИТЬ', 'warning'), line(record.error), line('a Обсудить исправление с Pi · исходные данные сохранены'), line('')] : []),
         ...(record.questions.length ? [line('ТРЕБУЮТСЯ УТОЧНЕНИЯ', 'warning'), ...record.questions.map(q => line(`• ${q}`)), line('Нажмите a и ответьте своими словами. Pi подготовит уточнённый черновик.')] : []),
         line(''), line('ПОДКЛЮЧЕНИЕ', 'accent'), line(record.target.kind === 'sandbox' ? agent?.name ?? 'Песочница' : record.target.kind === 'module' ? record.target.path : record.target.kind === 'http' ? record.target.url : [record.target.command, ...record.target.args].join(' ')),
@@ -505,6 +528,7 @@ export class LabBoard implements Component {
         line(''), ...record.limitations.map(v => line(`• ${v}`, 'muted')),
         ...(record.error ? [line(record.error, 'error')] : []),
       ];
+      if (record.trials.length && !this.expanded) detail = verdictLines(record);
     }
     if (this.options.warnings?.length) detail.push(line(''), line('ДИАГНОСТИКА', 'warning'), ...this.options.warnings.map(w => line(w, 'warning')));
     if (this.help) detail = [line('КЛАВИШИ', 'accent', true), line('1 Обзор · 2 Карточки · 3 Диалоги · 4 Статистика · 5 Сравнение'), line('a — правка или разбор словами с Pi · n в списке — новая проверка'), line('↑ ↓ или j k — выбрать карточку или диалог'), line('← → или PgUp PgDn — прокрутить подробности'), line('/ — поиск по списку · u — только неразобранные диалоги'), line('Enter — раскрыть источники, инструменты и состояния'), line('p / n — вердикт на выбранный диалог · v — оценить критерий'), line('r — запустить черновик или создать повтор готового прогона'), line('d — сравнить с предыдущим прогоном · x — экспортировать'), line('c — остановить запуск · Esc — назад · q — закрыть'), line(''), line('Все оценки и подтверждения относятся к показанной версии.', 'muted')];

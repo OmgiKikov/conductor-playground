@@ -6,8 +6,8 @@ import { Text } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 import { z } from 'zod';
 import { ExperimentLab, draftHash, resultHash } from '../dist/experiment.js';
-import { agentSchema, createInputSchema, dialogueSchema, draftPatchSchema, goldenCaseSchema, ownerProfileSchema, settingsSchema, targetSchema, type Experiment, type HumanReviewInput } from '../dist/contracts.js';
-import { awaitingVerdict, evidenceSummary } from '../dist/comparison.js';
+import { agentSchema, createInputSchema, describeCheck, dialogueSchema, draftPatchSchema, fingerprint, goldenCaseSchema, ownerProfileSchema, settingsSchema, targetSchema, type Experiment, type HumanReviewInput, type Trial } from '../dist/contracts.js';
+import { awaitingVerdict, evidenceSummary, plannedTrials } from '../dist/comparison.js';
 import { demoEvaluationInput, demoInput } from '../dist/demo.js';
 import { evidenceBundle, exportArtifacts } from '../dist/artifacts.js';
 import { editDraft, inputError } from './editor.ts';
@@ -22,15 +22,29 @@ const toolDisplay: Pick<ToolDefinition, 'renderCall' | 'renderResult'> = {
       const data = JSON.parse(raw);
       const title = data.error ?? (data.phase === 'review' ? data.message ?? `Готово ${data.scenarioCount} сценариев. Посмотрите их перед запуском.`
         : data.evidence?.verdict?.headline ?? data.message ?? 'Доказательства прочитаны.');
-      return new Text(theme.fg(data.error ? 'error' : 'text', safeText(title)) + (data.id ? '\n/agent-lab — сценарии, диалоги и обсуждение с Pi' : ''), 0, 0);
+      return new Text(theme.fg(data.error ? 'error' : 'text', safeText(title)), 0, 0);
     } catch { return new Text(safeText(raw), 0, 0); }
   },
 };
 const returnToBoard = (ctx: ExtensionContext, id: string) => {
   if (!ctx.hasUI || ctx.mode !== 'tui') return;
-  const text = ctx.ui?.getEditorText?.() ?? '';
-  if (!text.trim() || /^\/agent-lab(?:\s|$)/.test(text)) ctx.ui?.setEditorText?.(`/agent-lab ${id}`);
+  ctx.ui?.setStatus?.('agent-lab', `Agent Lab · ${id.slice(0, 8)} · /agent-lab ${id} — детали`);
 };
+
+function runPlan(record: Experiment): string {
+  const target = record.target.kind === 'sandbox' ? 'Учебная песочница' : record.target.kind === 'http' ? record.target.url
+    : record.target.kind === 'module' ? record.target.path : `${[record.target.command, ...record.target.args].join(' ')}${record.target.cwd ? ` · ${record.target.cwd}` : ''}`;
+  return [
+    ...record.scenarios.map(s => [safeText(s.title), `  Запрос: ${safeText(s.user.opening)}`,
+      ...(record.settings.userModes.includes('scripted') ? (s.user.script ?? []).map((message, i) => `  Продолжение ${i + 1}: ${safeText(message)}`) : []),
+      `  Ожидается: ${safeText(s.successCriteria)}`, ...s.checks.map(c => `  Проверка: ${safeText(describeCheck(c))}`)].join('\n')),
+    '', `Диалогов: ${plannedTrials(record)}. Режимы: ${record.settings.userModes.join(', ')}.`,
+    `До ${record.settings.maxCalls} вызовов, ${Math.round(record.settings.maxDurationMs / 1000)} секунд, ${record.settings.maxTurns} ходов.`,
+    record.mode === 'demo' ? 'Учебный пример: без модели и оплаты.' : `Модель: ${safeText(record.settings.provider)}/${safeText(record.settings.model)}. Стоимость зависит от фактических вызовов.`,
+    `Агент: ${safeText(target)}`, `Версия тестов: ${draftHash(record).slice(0, 12)}`,
+    'Запуск не означает, что вы вручную проверили все ожидания или оценки.',
+  ].join('\n');
+}
 
 function summary(record: Experiment, directory: string) {
   const comparison = record.comparisons.findLast(c => c.split === 'control');
@@ -58,14 +72,21 @@ function summary(record: Experiment, directory: string) {
   };
 }
 
-async function humanAnnotation(ctx: ExtensionContext, record: Experiment, selected: number): Promise<HumanReviewInput | undefined> {
+async function humanAnnotation(ctx: ExtensionContext, record: Experiment, selected: number): Promise<HumanReviewInput[] | undefined> {
   const trial = reviewOrder(record)[selected];
   if (!trial) return;
   const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
-  const targets = [
-    { label: 'Весь диалог', ids: {} },
-    ...(scenario?.metrics ?? []).map(m => ({ label: `Метрика · ${safeText(m.name)} [${m.id}]`, ids: { metricId: m.id } })),
-    ...trial.checks.map(c => ({ label: `Проверка · ${safeText(c.description)} [${c.id}]`, ids: { checkId: c.id } })),
+  const failedCriteria = (t: Trial) => [
+    ...t.checks.filter(c => !c.passed).map(c => `check:${c.id}`),
+    ...(record.scenarios.find(s => s.id === t.scenarioId)?.metrics ?? []).filter(m => m.subject === 'agent'
+      && t.assessments?.some(a => a.metricId === m.id && a.result === 'fail')).map(m => `metric:${m.id}`),
+  ].sort();
+  const similar = failedCriteria(trial).length ? record.trials.filter(t => fingerprint(failedCriteria(t)) === fingerprint(failedCriteria(trial))) : [];
+  const targets: { label: string; ids: { metricId?: string; checkId?: string }; trialIds: string[] }[] = [
+    { label: 'Весь диалог', ids: {}, trialIds: [trial.id] },
+    ...(similar.length > 1 ? [{ label: `Такие же сработавшие проверки · ${similar.length} диалогов`, ids: {}, trialIds: similar.map(t => t.id) }] : []),
+    ...(scenario?.metrics ?? []).map(m => ({ label: `Метрика · ${safeText(m.name)} [${m.id}]`, ids: { metricId: m.id }, trialIds: [trial.id] })),
+    ...trial.checks.map(c => ({ label: `Проверка · ${safeText(c.description)} [${c.id}]`, ids: { checkId: c.id }, trialIds: [trial.id] })),
   ];
   const choice = await ctx.ui.select('Область вашей оценки', targets.map(t => t.label));
   const target = targets.find(t => t.label === choice);
@@ -76,10 +97,13 @@ async function humanAnnotation(ctx: ExtensionContext, record: Experiment, select
   if (!verdict) return;
   const note = await ctx.ui.editor('Пояснение · укажите реплики # и причину согласия или ошибки', '');
   if (note === undefined) return;
-  return { trialId: trial.id, ...target.ids, verdict, note };
+  if (target.trialIds.length > 1 && !await ctx.ui.confirm(`Применить вердикт к ${target.trialIds.length} диалогам?`,
+    similar.map(t => `${safeText(record.scenarios.find(s => s.id === t.scenarioId)?.title)}\n${t.checks.filter(c => !c.passed).map(c => safeText(c.evidence)).join('\n')}`).join('\n\n')
+    + `\n\nВаш вердикт: ${verdicts[verdict]}\nОснование: ${safeText(note)}\nКаждый диалог сохранит отдельную заметку.`)) return;
+  return target.trialIds.map(trialId => ({ trialId, ...target.ids, verdict, note }));
 }
 
-/** Model tools only prepare/read/edit. Consent exists exclusively in the native command handler. */
+/** Conversational execution asks the human to authorize a concrete plan; it never invents human reviews. */
 export default function agentLab(pi: ExtensionAPI) {
   let activeClose: (() => Promise<void>) | undefined;
   const open = (cwd: string) => {
@@ -90,10 +114,22 @@ export default function agentLab(pi: ExtensionAPI) {
     activeClose = close;
     return { lab, close };
   };
+  pi.on('session_start', async (_event, ctx) => {
+    if (process.env.AGENT_LAB_SESSION !== '1' || !ctx.hasUI || ctx.mode !== 'tui') return;
+    ctx.ui.setTitle(`Agent Lab · ${ctx.cwd.split('/').at(-1)}`);
+    ctx.ui.setHeader((_tui, theme) => new Text(theme.bold('Agent Lab') + '\nПроверьте, что сломала правка вашего агента.\n' + safeText(ctx.cwd), 1, 1));
+    ctx.ui.setWidget('agent-lab-start', ['Напишите: «Проверь агента в этой папке» или «Воспроизведи эту ошибку: …»',
+      'Один тест → доказательство → проверка исправления. /agent-lab demo — учебный пример.']);
+  });
+  pi.on('before_agent_start', async (event, ctx) => {
+    if (process.env.AGENT_LAB_SESSION !== '1') return;
+    ctx.ui?.setWidget?.('agent-lab-start', undefined);
+    return { systemPrompt: event.systemPrompt + `\nYou are Agent Lab, a conversational tool for checking changes to the user's real agent. Work in their project. Follow the agent-builder skill. Start with ONE useful test and a concrete expected outcome; inspect the local entry point and requirements yourself. Use the user's language. Keep normal work in this conversation: build, inspect, edit, agent_lab_run, inspect the actual evidence, explain one finding and the next action. agent_lab_run asks the human to authorize the exact plan; execution consent is not a human review of expectations. Never bypass its confirmation through shell or internal APIs. Do not send users to a board just to proceed; /agent-lab is an optional evidence view. Preserve budgets and model. Save useful cases with agent_lab_suite; repeat existing cases after a change instead of regenerating them. Separate a broken test from an agent failure. Do not modify an external agent unless the user asked to fix it. Avoid lectures about personas, rubrics, calibration or tiers unless they explain a finding. Read traces and cite actual event IDs; never invent human verdicts or claim improved quality after changing the tests.` };
+  });
   pi.registerTool({
     ...toolDisplay,
     name: 'agent_lab_build', label: 'Prepare agent and dialogue cards',
-    description: 'Prepare an agent and a small editable set of user simulation cards from task/material contents. Uses current Pi model unless settings override. Stops before all dialogue evaluation: only a human in /agent-lab can review and approve the exact draft. Does not run, improve or approve the agent. mode=demo prepares the built-in scripted example without model calls. Native workflow is evaluation, with 5 cards and 1 repeat by default. target selects the agent under test: the trusted sandbox (default), an http endpoint, a local module adapter, or a local process (command, e.g. python3 agent.py speaking JSON lines). goldenCases become curated cards; dialogues (de-identified real conversations) ground observed user profiles, production cards that open with real users\' own messages, and simulator fidelity. settings.userModes may list static, scripted and reactive to compare what each user side finds. notes carry the owner\'s hints about users in their own words; profiles are owner-written user types. Both are legitimate inputs when no real data exists, and the verdict always states how much of the evidence is synthetic. preset=thorough widens the run without extra settings. Every result leads with a plain verdict: pass count, weak spots, confidence and next steps.',
+    description: 'Prepare an agent and a small editable set of user simulation cards from task/material contents. Uses current Pi model unless settings override. Stops before all dialogue evaluation: use agent_lab_run to show the exact plan and obtain native execution confirmation. Does not run, improve or approve the agent. mode=demo prepares the built-in scripted example without model calls. Native workflow is evaluation, with 1 test, 1 repeat, at most 20 calls and 180 seconds by default. target selects the agent under test: the trusted sandbox (default), an http endpoint, a local module adapter, or a local process (command, e.g. python3 agent.py speaking JSON lines). goldenCases become curated cards; dialogues (de-identified real conversations) ground observed user profiles, production cards that open with real users\' own messages, and simulator fidelity. settings.userModes may list static, scripted and reactive to compare what each user side finds. notes carry the owner\'s hints about users in their own words; profiles are owner-written user types. Both are legitimate inputs when no real data exists, and the verdict always states how much of the evidence is synthetic. preset=thorough widens the run without extra settings. Every result leads with a plain verdict: pass count, weak spots, confidence and next steps.',
     parameters: Type.Object({
       task: Type.Optional(Type.String({ minLength: 1, maxLength: 8000 })),
       materials: Type.Optional(Type.Array(Type.Object({ name: Type.String({ minLength: 1, maxLength: 180 }), content: Type.String({ minLength: 1, maxLength: 120000 }) }, { additionalProperties: false }), { minItems: 1, maxItems: 12 })),
@@ -115,8 +151,8 @@ export default function agentLab(pi: ExtensionAPI) {
       const mode = rest.mode ?? 'live';
       const supplied = (rest.settings ?? {}) as Partial<z.infer<typeof settingsSchema>>;
       const input = createInputSchema.parse({
-        ...(mode === 'demo' ? demoInput() : {}), ...rest, mode, workflow: 'evaluate',
-        settings: { ...(mode === 'demo' ? demoInput().settings : {}), repeats: 1,
+        ...(mode === 'demo' ? demoEvaluationInput() : {}), scenarioCount: mode === 'demo' ? 3 : 1, ...rest, mode, workflow: 'evaluate',
+        settings: { ...(mode === 'demo' ? demoInput().settings : {}), repeats: 1, maxCalls: 20, maxDurationMs: 180000,
           ...(preset === 'thorough' ? { userModes: ['static', 'scripted', 'reactive'], repeats: 2 } : {}), ...supplied,
           provider: supplied.provider || ctx.model?.provider || '', model: supplied.model || ctx.model?.id || '' },
       });
@@ -130,7 +166,7 @@ export default function agentLab(pi: ExtensionAPI) {
       const progress = async () => {
         if (!id || !onUpdate) return;
         const record = await lab.get(id);
-        const text = safeText(`${record.phase}: ${record.message} (${record.scenarios.length} cards; ${record.usage.calls} ${record.mode === 'demo' ? 'scripted role' : 'model'} calls)`);
+        const text = safeText(`${record.phase === 'preparing' ? 'Готовлю требования и тест' : 'Тест готов'}: ${record.message} · вызовов ${record.usage.calls}`);
         if (text !== lastProgress) { lastProgress = text; onUpdate({ content: [{ type: 'text', text }], details: { id, phase: record.phase } }); }
       };
       const cancel = () => { void (id ? lab.cancel(id) : close()).catch(() => {}); };
@@ -199,15 +235,75 @@ export default function agentLab(pi: ExtensionAPI) {
   pi.registerTool({
     ...toolDisplay,
     name: 'agent_lab_repeat', label: 'Prepare another run of the same cards',
-    description: 'Copy a previously approved evaluation into a fresh draft without model generation. Preserves cards, materials and settings, captures current local code identity, clears results and approvals. The human reviews and launches it in /agent-lab.',
-    parameters: Type.Object({ id: Type.String({ pattern: '^[a-zA-Z0-9_-]{1,80}$' }) }, { additionalProperties: false }),
+    description: 'Copy a previously approved evaluation into a fresh draft without model generation. Preserves cards, materials and settings, captures current local code identity, clears results and approvals. Inspect it and use agent_lab_run; /agent-lab is an optional detailed view.',
+    parameters: Type.Object({ id: Type.String({ pattern: '^[a-zA-Z0-9_-]{1,80}$' }), scenarioIds: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 40, description: 'Repeat only these existing tests; omit for the whole regression set.' })) }, { additionalProperties: false }),
     executionMode: 'sequential',
     async execute(_callId, params, signal, _onUpdate, ctx) {
       signal?.throwIfAborted();
       const { lab, close } = open(ctx.cwd);
-      try { await lab.init(); const record = await lab.repeat(params.id); const output = summary(record, lab.store.directory);
+      try { await lab.init(); const record = await lab.repeat(params.id, params.scenarioIds); const output = summary(record, lab.store.directory);
         returnToBoard(ctx, record.id);
         return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: output };
+      } finally { await close(); }
+    },
+  });
+  pi.registerTool({
+    ...toolDisplay, name: 'agent_lab_run', label: 'Run the proposed tests',
+    description: 'Run the exact inspected evaluation draft, with native confirmation of its target, tests and budget. Does not record human review of expectations or results. Stay in the conversation and inspect the evidence after running. Cannot run headlessly or without the human confirmation. Never bypass this tool through shell or internal APIs.',
+    parameters: Type.Object({ id: Type.String(), expectedHash: Type.String({ pattern: '^[a-f0-9]{64}$' }) }, { additionalProperties: false }),
+    executionMode: 'sequential',
+    async execute(_callId, params, toolSignal, onUpdate, ctx) {
+      if (!ctx.hasUI || ctx.mode !== 'tui') throw new Error('Для нового запуска нужен интерактивный терминал. В CI используйте evaluate --input suite.json --yes с явно заданным бюджетом.');
+      const signal = AbortSignal.any([toolSignal, ctx.signal].filter((s): s is AbortSignal => !!s));
+      signal.throwIfAborted();
+      const { lab, close } = open(ctx.cwd);
+      let timer: ReturnType<typeof setInterval> | undefined;
+      let polling: Promise<void> = Promise.resolve();
+      const cancel = () => { void lab.cancel(params.id).catch(() => {}); };
+      try {
+        await lab.init();
+        const draft = await lab.get(params.id);
+        if (draft.workflow !== 'evaluate' || draftHash(draft) !== params.expectedHash) throw new Error('План изменился. Прочитайте актуальный черновик через agent_lab_inspect.');
+        if (!await ctx.ui.confirm('Запустить проверку?', runPlan(draft))) {
+          return { content: [{ type: 'text', text: JSON.stringify({ id: draft.id, cancelled: true, message: 'Запуск отменён. Тесты сохранены; не повторяйте запрос запуска без новой просьбы пользователя.' }) }], details: { cancelled: true } };
+        }
+        signal.throwIfAborted();
+        await lab.start(draft.id, { approved: true, reviewer: 'automated', expectedHash: params.expectedHash });
+        signal.addEventListener('abort', cancel, { once: true });
+        if (signal.aborted) cancel();
+        const progress = async () => {
+          const r = await lab.get(draft.id);
+          onUpdate?.({ content: [{ type: 'text', text: safeText(`Проверено ${r.trials.length} из ${plannedTrials(r)} · ${r.message}`) }], details: { id: r.id, phase: r.phase } });
+        };
+        await progress();
+        timer = setInterval(() => { polling = polling.then(progress).catch(() => {}); }, 750);
+        await lab.waitForIdle(); await progress();
+        const record = await lab.get(draft.id);
+        const bundle = await evidenceBundle(record, lab.store);
+        const output = { ...summary(record, lab.store.directory), comparison: bundle.comparison, artifacts: await exportArtifacts(bundle, lab.store.directory) };
+        returnToBoard(ctx, record.id);
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: output };
+      } finally { clearInterval(timer); signal.removeEventListener('abort', cancel); await polling; await close(); }
+    },
+  });
+  pi.registerTool({
+    ...toolDisplay, name: 'agent_lab_suite', label: 'Save or load reusable tests',
+    description: 'Save selected tests as a versionable .evals/*.json file, or load that file into a fresh draft without model generation. Preserves original provenance and criteria. Clears results and approvals. Saving never overwrites an existing file. Use after a useful finding or when the user wants a regression test. Loading does not run it; inspect then use agent_lab_run.',
+    parameters: Type.Object({ action: Type.Union([Type.Literal('save'), Type.Literal('load')]), file: Type.String({ minLength: 1 }),
+      id: Type.Optional(Type.String()), scenarioIds: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 40 })) }, { additionalProperties: false }),
+    executionMode: 'sequential',
+    async execute(_callId, params, signal, _onUpdate, ctx) {
+      signal?.throwIfAborted();
+      const { lab, close } = open(ctx.cwd);
+      try {
+        await lab.init();
+        let output: unknown;
+        if (params.action === 'save') {
+          if (!params.id) throw new Error('Укажите прогон, из которого сохранить тесты.');
+          const file = await lab.saveSuite(params.id, resolve(ctx.cwd, params.file), params.scenarioIds);
+          output = { file, message: 'Тесты сохранены. Их можно добавить в Git и запускать после каждой правки.', nextStep: `agent-lab evaluate --input ${JSON.stringify(file)} --yes` };
+        } else output = summary(await lab.loadSuite(resolve(ctx.cwd, params.file), params.scenarioIds), lab.store.directory);
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: {} };
       } finally { await close(); }
     },
   });
@@ -257,7 +353,7 @@ export default function agentLab(pi: ExtensionAPI) {
               : await ctx.ui.editor('Папка агента и что проверить · своими словами', '');
             newRequested = false;
             if (!request?.trim()) continue;
-            handoff = { request, context: { task: 'Prepare a new Agent Lab draft. Read the authorized local agent project and relevant materials; infer or prepare its adapter. Use agent_lab_build, then explain the proposed user scenarios in plain language. Do not run dialogues or claim human review. Follow the agent-builder skill.' } };
+            handoff = { request, context: { task: 'Prepare a new Agent Lab draft. Read the authorized local agent project and relevant materials; infer or prepare its adapter. Use agent_lab_build, then explain the proposed user scenarios in plain language. Explain the first test and use agent_lab_run when the user asked to check the agent. Do not claim human review. Follow the agent-builder skill.' } };
             break;
           }
           if (action.type === 'open') { id = action.id; section = undefined; selected = 0; query = ''; pendingOnly = false; beforeId = undefined; reportPath = undefined; continue; }
@@ -283,10 +379,11 @@ export default function agentLab(pi: ExtensionAPI) {
                 scenarioId: action.section === 'cards' ? r.scenarios[action.selected]?.id : undefined, trialId: action.trialId,
                 ...(action.section === 'comparison' ? { comparisonSource: current?.comparisonSource,
                   comparedPair: current?.comparison?.pairs.find(pair => pair.afterTrialId === action.trialId) } : {}),
-                task: 'This user request concerns the selected Agent Lab experiment. Inspect fresh evidence with agent_lab_inspect. For draft corrections, use agent_lab_edit with the current hash and summarize changes. For unresolved business questions or a preparation error, read the original evidence file and prepare a new draft with the supplied corrections; preserve the old one. For results, inspect actual trial traces and report the failure, cited trial/event IDs, whether a human confirmed it, and a concrete next step. Distinguish facts from suspected causes. Never overwrite measured results, invent human verdicts, approve or run a draft. Do not alter the external agent without an explicit request to fix it.' } };
+                task: 'This user request concerns the selected Agent Lab experiment. Inspect fresh evidence with agent_lab_inspect. For draft corrections, use agent_lab_edit with the current hash and summarize changes. For unresolved business questions or a preparation error, read the original evidence file and prepare a new draft with the supplied corrections; preserve the old one. For results, inspect actual trial traces and report the failure, cited trial/event IDs, whether a human confirmed it, and a concrete next step. Distinguish facts from suspected causes. Never overwrite measured results or invent human verdicts. Use agent_lab_run for requested execution with native plan confirmation. Do not alter the external agent without an explicit request to fix it.' } };
               break;
             } else if (action.type === 'repeat') {
-              const next = await lab.repeat(action.record.id);
+              const scenarioId = action.section === 'results' ? action.record.trials.find(t => t.id === action.trialId)?.scenarioId : undefined;
+              const next = await lab.repeat(action.record.id, scenarioId ? [scenarioId] : undefined);
               beforeId = action.record.id; id = next.id; section = 'agent'; selected = 0; query = ''; pendingOnly = false; reportPath = undefined;
             } else if (action.type === 'compare') {
               if (action.record.parentRunId) beforeId = action.record.parentRunId;
@@ -311,13 +408,8 @@ export default function agentLab(pi: ExtensionAPI) {
               const r = action.record;
               if (r.workflow !== 'evaluate') throw new Error('Legacy comparison records cannot run from the evaluation board.');
               const hash = draftHash(r);
-              const scripted = r.settings.userModes.includes('scripted') ? r.scenarios.filter(s => s.user.script?.length).length : 0;
-              const planned = r.settings.userModes.reduce((sum, mode) => sum + (mode === 'scripted' ? scripted : r.scenarios.length), 0) * r.settings.repeats;
-              const target = r.target.kind === 'sandbox' ? 'песочница с доверенными инструментами' : r.target.kind === 'http' ? `внешний агент по HTTP ${safeText(r.target.url)}`
-                : r.target.kind === 'module' ? `внешний агент из модуля ${safeText(r.target.path)}` : `внешний агент как процесс ${safeText([r.target.command, ...r.target.args].join(' '))}`;
-              const message = `Я проверил агента, материалы, цели, пользователей и метрики всех ${r.scenarios.length} карточек.\nЦель: ${target}.\nРежимы пользователя: ${r.settings.userModes.join(', ')}.\nЗапуск: ${planned} диалогов, ${r.settings.repeats} повтор(а), до ${r.settings.maxTurns} ходов, лимит ${r.settings.maxCalls} вызовов.\n${r.mode === 'demo' ? 'Сценарный демо: без модели.' : `Модель: ${safeText(r.settings.provider)}/${safeText(r.settings.model)}. Стоимость заранее неизвестна.`}\nВерсия: ${hash}\nПодтвердить эту версию и запустить?`;
-              if (await ctx.ui.confirm('Проверка карточек человеком', message)) {
-                await lab.start(r.id, { approved: true, reviewer: 'human', expectedHash: hash }); section = 'results'; selected = 0;
+              if (await ctx.ui.confirm('Запустить проверку?', runPlan(r))) {
+                await lab.start(r.id, { approved: true, reviewer: 'automated', expectedHash: hash }); section = 'results'; selected = 0;
                 reportPath = undefined;
               }
             } else if (action.type === 'cancel') {
@@ -328,13 +420,13 @@ export default function agentLab(pi: ExtensionAPI) {
               if (!trial) throw new Error('Диалог не выбран.');
               await lab.addHumanReview(action.record.id, {
                 trialId: trial.id, verdict: action.verdict,
-                note: 'Быстрый вердикт с доски, без пояснения. Нажмите v, чтобы записать основание.',
+                note: 'Быстрый вердикт из терминала, без записанного основания.',
               });
               reportPath = undefined;
             } else if (action.type === 'annotate') {
               const index = action.trialId ? reviewOrder(action.record).findIndex(t => t.id === action.trialId) : action.selected;
-              const review = await humanAnnotation(ctx, action.record, index);
-              if (review) { await lab.addHumanReview(action.record.id, review); reportPath = undefined; }
+              const reviews = await humanAnnotation(ctx, action.record, index);
+              if (reviews) { for (const review of reviews) await lab.addHumanReview(action.record.id, review); reportPath = undefined; }
             } else if (action.type === 'finalize') {
               const r = action.record;
               const pending = awaitingVerdict(r).size;
