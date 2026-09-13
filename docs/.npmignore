@@ -1,0 +1,5 @@
+# Local experiments may contain third-party source material and dialogue traces.
+RELIABILITY.md
+aigw-audit/
+acquiring-mode-pilot-*/
+judge-*/

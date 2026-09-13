@@ -3,13 +3,14 @@ import {
   type ResourceLoader, type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
+import { assessRepeated, JUDGE_RESPONSE_FORMAT } from './judge.js';
 import { z } from 'zod';
 import {
-  agentSchema, failureModeSchema, metricAssessmentSchema, observedGoalSchema, observedProfileSchema, preparationSchema, proposalSchema, requirementSchema, scenarioSchema,
-  TOOL_NAMES, simulatorFidelity, userTurnSchema, validateObservedGoals,
+  agentSchema, failureModeSchema, observedGoalSchema, observedProfileSchema, preparationSchema, proposalSchema, requirementSchema, scenarioSchema,
+  TOOL_NAMES, fingerprint, simulatorFidelity, userTurnSchema, validateObservedGoals,
   type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
-import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
+import { AGENT_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
 const groundingSchema = z.strictObject({
@@ -58,7 +59,7 @@ function resources(systemPrompt: string): ResourceLoader {
 
 async function controlledSession(
   modelRuntime: ModelRuntime, model: Model, systemPrompt: string, tools: Tool[],
-  ctx: CallContext, maxTokens = 16384,
+  ctx: CallContext, maxTokens = 16384, temperature?: number, structuredJudge = false,
 ): Promise<TargetSession> {
   ctx.signal.throwIfAborted();
   if (new Set(tools.map(t => t.name)).size !== tools.length
@@ -100,7 +101,8 @@ async function controlledSession(
       pendingUsage++;
       return await stream(m, { ...context, systemPrompt }, {
         ...options, signal: AbortSignal.any([activeSignal, ...(options?.signal ? [options.signal] : [])]),
-        timeoutMs: ctx.timeoutMs, maxRetries: 0, maxTokens: Math.min(maxTokens, model.maxTokens),
+        timeoutMs: ctx.timeoutMs, maxRetries: 0, maxTokens: Math.min(maxTokens, model.maxTokens), ...(temperature === undefined ? {} : { temperature }),
+        ...(structuredJudge ? { onPayload: (payload: unknown) => ({ ...(payload as Record<string, unknown>), response_format: JUDGE_RESPONSE_FORMAT }) } : {}),
       });
     } catch (error) {
       // Preserve our own budget/cancellation error; provider errors are sanitized at the response boundary.
@@ -167,7 +169,16 @@ async function controlledSession(
         if (boundaryError) throw boundaryError;
         const last = session.messages.slice(start).findLast(m => m.role === 'assistant');
         if (!last || last.role !== 'assistant' || last.stopReason !== 'stop') {
-          throw new Error(`Модель не довела ответ до конца (${last?.role === 'assistant' ? last.stopReason : 'ответа нет'}). Проверьте доступ к провайдеру и лимиты вызовов.`);
+          // Persist only a fixed diagnostic category; SDK errors can contain credentials and URLs.
+          const detail = last?.role === 'assistant' ? last.errorMessage ?? '' : '';
+          const category = /429|rate.?limit/i.test(detail) ? 'rate limit'
+            : /402|credit|balance/i.test(detail) ? 'insufficient credit'
+            : /401|403|unauthorized|forbidden/i.test(detail) ? 'access denied'
+            : /timeout|timed out/i.test(detail) ? 'timeout'
+            : /fetch failed|connection|socket|network/i.test(detail) ? 'connection failure'
+            : /context.?length|too many tokens/i.test(detail) ? 'context limit'
+            : last?.role === 'assistant' ? last.stopReason : 'missing response';
+          throw new Error(`Pi provider response incomplete: ${category}`);
         }
         const output = last.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
         if (!output.trim()) throw new Error('Модель вернула пустой ответ.');
@@ -281,6 +292,10 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
   try { available = await modelRuntime.getAvailable(settings.provider, { signal }); }
   catch { throw new Error(`Не удалось проверить доступ к моделям. ${authHelp}`); }
   if (!available.some(m => m.id === model.id)) throw new Error(authHelp);
+  if (settings.judge) {
+    const judges = await modelRuntime.getAvailable(settings.judge.provider, { signal });
+    if (!judges.some(m => m.id === settings.judge!.model)) throw new Error(`Judge model unavailable: ${settings.judge.provider}/${settings.judge.model}. ${authHelp}`);
+  }
   const ask = <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext,
     review?: (value: z.infer<S>) => string | undefined) =>
     jsonResponse(modelRuntime, model, label, role, input, schema, ctx, review);
@@ -440,19 +455,27 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       );
     },
     async assess(input, ctx) {
-      const metrics = input.scenario.metrics ?? [];
-      if (!metrics.length) return [];
-      const result = await ask(
-        'Оценка диалога',
-        ASSESS_ROLE,
-        {
-          scenario: input.scenario,
-          sources: input.sources.map(({ id, name, content }) => ({ id, name, content })),
-          trial: { userMode: input.trial.userMode, events: input.trial.events, initialState: input.trial.initialState, finalState: input.trial.finalState },
-        },
-        z.strictObject({ assessments: z.array(metricAssessmentSchema).length(metrics.length) }), ctx,
-      );
-      return result.assessments;
+      const judge = settings.judge ?? { provider: settings.provider, model: settings.model };
+      const resolved = modelRuntime.getModel(judge.provider, judge.model);
+      if (!resolved) throw new Error(`Judge model unavailable: ${judge.provider}/${judge.model}`);
+      // Pi's catalog selects the Anthropic-native endpoint for Sonnet. OpenRouter
+      // routing options belong to the Chat Completions adapter; use that adapter
+      // explicitly instead of recording a routing preference the transport ignores.
+      const judgeModel: Model = judge.provider === 'openrouter' ? {
+        ...resolved, api: 'openai-completions', baseUrl: 'https://openrouter.ai/api/v1',
+        compat: { ...resolved.compat, supportsDeveloperRole: false, maxTokensField: 'max_tokens', ...(settings.judge?.upstream ? {
+          openRouterRouting: { only: [settings.judge.upstream], allow_fallbacks: false },
+        } : {}) },
+      } : resolved;
+      return assessRepeated(input, { ...judgeModel,
+        configurationHash: fingerprint({ api: judgeModel.api, baseUrl: judgeModel.baseUrl, compat: judgeModel.compat }),
+        transport: { api: judgeModel.api, upstream: settings.judge?.upstream, structured: judge.provider === 'openrouter' },
+      }, ctx, async (prompt, data, recordPartial) => {
+        const session = await controlledSession(modelRuntime, judgeModel, prompt, [], { ...ctx, onTargetEvent: event => {
+          if (event.type === 'assistant' && event.text) recordPartial(event.text);
+        } }, 16384, 0, judge.provider === 'openrouter');
+        try { return await session.respond(data); } finally { await session.close(); }
+      });
     },
     async openTarget(agent, sources, tools, ctx) {
       agentSchema.parse(agent);

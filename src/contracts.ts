@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
-export const VERSION = '2';
+export const VERSION = '3';
+export const DEFAULT_JUDGE = { provider: 'openrouter', model: 'openai/gpt-5.6-sol', upstream: 'openai' } as const;
 export const TOOL_NAMES = ['search_materials', 'lookup_record', 'update_record'] as const;
 export type ToolName = typeof TOOL_NAMES[number];
 const identifier = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).refine(v => !['__proto__', 'prototype', 'constructor'].includes(v), 'Reserved identifier');
@@ -28,6 +29,8 @@ export type UserMode = z.infer<typeof userModeSchema>;
 export const settingsSchema = z.strictObject({
   provider: z.string().max(120).default(''),
   model: z.string().max(200).default(''),
+  judge: z.strictObject({ provider: z.string().min(1).max(120), model: z.string().min(1).max(200), upstream: z.string().min(1).max(120).optional() })
+    .refine(v => !v.upstream || v.provider === 'openrouter', 'Judge upstream routing requires OpenRouter').optional(),
   repeats: z.number().int().min(1).max(5).default(2),
   maxIterations: z.number().int().min(1).max(5).default(2),
   maxTurns: z.number().int().min(2).max(16).default(6),
@@ -40,6 +43,7 @@ export type Settings = z.infer<typeof settingsSchema>;
 // A patch must never materialize defaults for keys the caller did not send.
 const settingsPatchSchema = z.strictObject({
   provider: settingsSchema.shape.provider.removeDefault(), model: settingsSchema.shape.model.removeDefault(),
+  judge: settingsSchema.shape.judge,
   repeats: settingsSchema.shape.repeats.removeDefault(), maxIterations: settingsSchema.shape.maxIterations.removeDefault(),
   maxTurns: settingsSchema.shape.maxTurns.removeDefault(), maxCalls: settingsSchema.shape.maxCalls.removeDefault(),
   timeoutMs: settingsSchema.shape.timeoutMs.removeDefault(), maxDurationMs: settingsSchema.shape.maxDurationMs.removeDefault(),
@@ -130,6 +134,23 @@ export const metricAssessmentSchema = z.strictObject({
   rationale: text.max(4000), evidence: z.array(z.number().int().nonnegative()).max(30),
 });
 export type MetricAssessment = z.infer<typeof metricAssessmentSchema>;
+/** The fixed opening belongs to the card, not to the reactive actor. */
+export function metricApplies(metric: Rubric, trial: Pick<Trial, 'userMode' | 'events'>): boolean {
+  return metric.id !== 'user_fidelity' || metric.subject !== 'simulator'
+    || trial.userMode === 'reactive' && trial.events.some(event => event.type === 'simulator');
+}
+export const judgeAuditSchema = z.strictObject({
+  protocolHash: text, inputHash: text, provider: text, model: text,
+  transport: z.strictObject({ api: text, upstream: text.optional(), structured: z.boolean() }).optional(),
+  prompt: text, input: text,
+  attempts: z.array(z.strictObject({
+    metricId: identifier.optional(), input: text.optional(),
+    startedAt: text, raw: z.string().optional(), error: text.optional(),
+    assessments: z.array(metricAssessmentSchema).optional(),
+  })).max(16),
+  notApplicable: z.array(identifier),
+});
+export type JudgeAudit = z.infer<typeof judgeAuditSchema>;
 export const userSchema = z.strictObject({
   goal: text.max(3000), facts: text.max(5000), behavior: text.max(2000), opening: text.max(3000),
   maxFollowUps: z.number().int().min(0).max(15).optional(),
@@ -311,7 +332,7 @@ export interface Trial {
   split: 'dev' | 'control'; manifestHash: string; outcome: Outcome; reason: string;
   checks: CheckResult[]; events: TraceEvent[]; initialState: World; finalState: World;
   usage: Usage; elapsedMs: number;
-  assessments?: MetricAssessment[]; assessmentError?: string;
+  assessments?: MetricAssessment[]; assessmentError?: string; judgeAudit?: JudgeAudit;
 }
 export interface Comparison {
   baselineId: string; candidateId: string; manifestHash: string; split: 'dev' | 'control';
@@ -368,6 +389,7 @@ const trialSchema = z.strictObject({
   events: z.array(z.strictObject({ seq: z.number().int().nonnegative(), type: z.enum(['user', 'assistant', 'simulator', 'tool_call', 'tool_result', 'error']), text: z.string().optional(), tool: z.string().max(200).optional(), args: z.unknown().optional(), result: z.unknown().optional(), state: worldSchema.optional() })),
   initialState: worldSchema, finalState: worldSchema, usage: usageSchema, elapsedMs: z.number().finite().nonnegative(),
   assessments: z.array(metricAssessmentSchema).max(8).optional(), assessmentError: z.string().max(4000).optional(),
+  judgeAudit: judgeAuditSchema.optional(),
 });
 const comparisonSchema = z.strictObject({
   baselineId: text, candidateId: text, manifestHash: text, split: z.enum(['dev', 'control']),
@@ -426,6 +448,7 @@ export interface CallContext {
   addUsage(usage: Omit<Usage, 'calls'>): void;
   onTrace?(trialId: string, event: TraceEvent): void;
   onTargetEvent?(event: Omit<TraceEvent, 'seq'>): void;
+  onJudgment?(trialId: string, audit: JudgeAudit): void;
 }
 export interface Tool {
   name: ToolName; description: string; parameters: Record<string, unknown>;

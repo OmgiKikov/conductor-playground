@@ -167,7 +167,7 @@ function trialLines(trial: Trial, record: Experiment, expanded: boolean): Line[]
   return rows;
 }
 
-const confidenceLabels: Record<string, string> = { low: 'низкое', medium: 'среднее', high: 'высокое' };
+const confidenceLabels: Record<string, string> = { low: 'низкая', medium: 'средняя', high: 'высокая' };
 const tierLabels: Record<string, string> = { smoke: 'дымовые', regression: 'регрессия', frontier: 'фронтир' };
 /** Verdict wording comes from the record itself, so the board, the report and the CLI never disagree. */
 const noteText = (note: VerdictNote): string => note.text;
@@ -242,7 +242,7 @@ function statsLines(record: Experiment): Line[] {
   const pct = (v: number | null) => v === null ? 'нет данных' : `${Math.round(v * 100)}%`;
   const num = (v: number | null, digits = 2) => v === null ? 'нет данных' : v.toFixed(digits);
   const rows: Line[] = [line('СТАТИСТИКА · наблюдения, не доказательства', 'accent', true), line(''),
-    line(`Достоверность измерения: ${confidenceLabels[e.verdict.confidence]} · эвристика аудита`, 'accent'),
+    line(`Полнота аудита: ${confidenceLabels[e.verdict.confidence]} · эвристика, не проверка правильности судьи`, 'accent'),
     ...e.verdict.confidenceReasons.map(r => line(`• ${r.text}`, 'muted')), line('')];
   if (e.comparison) rows.push(line('Наблюдаемый результат сравнения', 'accent'), line(e.comparison.observed), line(e.comparison.status, 'muted'), line(''));
   rows.push(line('Повторы одинаковых карточек', 'accent'),
@@ -254,10 +254,11 @@ function statsLines(record: Experiment): Line[] {
     rows.push(line(`${m.userMode}: ${m.passed}/${m.valid} пройдено (${pct(m.passRate)}) · диалогов ${m.trials} · реплик пользователя ${num(m.avgUserTurns, 1)} · вызовов ${m.calls} · стоимость ${m.costUsd === null ? 'неизвестна' : `$${m.costUsd.toFixed(4)}`}`));
     if (m.uniqueFailedChecks.length) rows.push(line(`  провалы, найденные только в этом режиме: ${m.uniqueFailedChecks.join(', ')}`, 'warning'));
   }
-  rows.push(line(''), line('Калибровка судьи · человек против модели, положительный класс = ошибка', 'accent'));
+  rows.push(line(''), line('Сверка с ручными вердиктами · положительный класс = ошибка', 'accent'),
+    line('Валидация на отдельной выборке не подтверждена. Unknown и пропуски остаются в знаменателях TPR/TNR.', 'muted'));
   if (!e.calibration.length) rows.push(line('Метрик и проверок нет.', 'muted'));
   for (const c of e.calibration) {
-    rows.push(line(`${c.key} [${c.subject}]: n=${c.n} · TPR ${pct(c.tpr)} · TNR ${pct(c.tnr)} · согласие ${pct(c.agreement)}${c.n && !c.sufficient ? ' · недостаточно данных (n<60)' : ''}`, c.n ? (c.sufficient ? 'text' : 'warning') : 'muted'));
+    rows.push(line(`${c.key} [${c.subject}]: ручных pass/fail ${c.humanPass}/${c.humanFail} · решено ${c.n}/${c.reviewed} · unknown ${c.abstained} · нет оценки ${c.missing} · TPR ${pct(c.tpr)} · TNR ${pct(c.tnr)}${c.reviewed && !c.sampleSufficient ? ' · мало примеров одного или обоих классов' : ''}`, c.reviewed ? 'text' : 'muted'));
   }
   rows.push(line(''), line('Верность симулятора · реактивные диалоги против реальных', 'accent'));
   if (!e.fidelity) rows.push(line('Реальные диалоги не загружены; верность оценить нельзя.', 'muted'));

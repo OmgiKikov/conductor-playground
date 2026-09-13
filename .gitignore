@@ -5,3 +5,14 @@ dist/
 *.tgz
 .env
 .DS_Store
+
+# Local pilot evidence and runners depend on material outside this public repository.
+/docs/RELIABILITY.md
+/docs/aigw-audit/
+/docs/acquiring-mode-pilot-*/
+/docs/judge-*/
+/output/
+/test/live/acquiring-pilot.py
+/test/live/judge-controls.ts
+/test/live/judge-goal-scope.ts
+/test/live/judge-pilot.ts
