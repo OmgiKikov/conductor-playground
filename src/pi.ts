@@ -5,10 +5,11 @@ import {
 import { Type } from 'typebox';
 import { z } from 'zod';
 import {
-  agentSchema, failureModeSchema, metricAssessmentSchema, observedGoalSchema, observedProfileSchema, preparationSchema, proposalSchema, requirementSchema, scenarioSchema,
-  TOOL_NAMES, simulatorFidelity, userTurnSchema, validateObservedGoals,
-  type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
+  agentSchema, failureModeSchema, observedGoalSchema, observedProfileSchema, preparationSchema, proposalSchema, requirementSchema, scenarioSchema,
+  TOOL_NAMES, VERSION, fingerprint, simulatorFidelity, simulatorWasUsed, userTurnSchema, validateObservedGoals,
+  type CallContext, type MetricAssessment, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
+import { judgeAssessment, judgeInput, judgeResponseSchema } from './judge.js';
 import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
@@ -38,6 +39,9 @@ const simulatorReplySchema = z.strictObject({ done: userTurnSchema.shape.done, m
   .describe('To stop immediately, return done:true and omit message. A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
 const authHelp = 'Войдите в Pi через /login или задайте ключ выбранного провайдера, затем выберите доступную модель. Живой прогон никогда не подменяется демо.';
 
+export const evaluatorVersion = (settings: Settings): string => fingerprint({ protocol: VERSION, judge: ASSESS_ROLE, simulator: SIMULATOR_ROLE,
+  provider: settings.provider, model: settings.model, roles: settings.roles ?? {} });
+
 /** Explicit resources avoid global/project extensions, skills, AGENTS files and prompt discovery. */
 function resources(systemPrompt: string): ResourceLoader {
   const runtime = createExtensionRuntime();
@@ -58,7 +62,7 @@ function resources(systemPrompt: string): ResourceLoader {
 
 async function controlledSession(
   modelRuntime: ModelRuntime, model: Model, systemPrompt: string, tools: Tool[],
-  ctx: CallContext, maxTokens = 16384,
+  ctx: CallContext, maxTokens = 16384, thinkingLevel: 'off' | 'medium' = 'off',
 ): Promise<TargetSession> {
   ctx.signal.throwIfAborted();
   if (new Set(tools.map(t => t.name)).size !== tools.length
@@ -77,7 +81,7 @@ async function controlledSession(
     },
   }));
   const { session } = await createAgentSession({
-    modelRuntime, model, thinkingLevel: 'off', resourceLoader: resources(systemPrompt),
+    modelRuntime, model, thinkingLevel, resourceLoader: resources(systemPrompt),
     tools: tools.map(t => t.name), noTools: 'builtin', customTools,
     sessionManager: SessionManager.inMemory(),
     settingsManager: SettingsManager.inMemory({
@@ -227,7 +231,8 @@ async function jsonResponse<S extends z.ZodType>(
 ): Promise<z.infer<S>> {
   const prompt = `${role}\n${DATA_BOUNDARY}\nReturn exactly one compact JSON object, without markdown fences or pretty-printing whitespace, matching this JSON schema:\n${JSON.stringify(z.toJSONSchema(schema))}`;
   // Only target sessions contribute target trace events; simulator/planner events cannot affect target grades.
-  const session = await controlledSession(modelRuntime, model, prompt, [], { ...ctx, onTargetEvent: undefined });
+  const session = await controlledSession(modelRuntime, model, prompt, [], { ...ctx, onTargetEvent: undefined }, 16384,
+    role === ASSESS_ROLE && model.reasoning ? 'medium' : 'off');
   try {
     let message = JSON.stringify(input);
     let rejection = '';
@@ -281,9 +286,18 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
   try { available = await modelRuntime.getAvailable(settings.provider, { signal }); }
   catch { throw new Error(`Не удалось проверить доступ к моделям. ${authHelp}`); }
   if (!available.some(m => m.id === model.id)) throw new Error(authHelp);
-  const ask = <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext,
-    review?: (value: z.infer<S>) => string | undefined) =>
-    jsonResponse(modelRuntime, model, label, role, input, schema, ctx, review);
+  const ask = async <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext,
+    review?: (value: z.infer<S>) => string | undefined): Promise<z.infer<S>> => {
+    const choice = settings.roles?.[role === ASSESS_ROLE ? 'judge' : role === SIMULATOR_ROLE ? 'simulator' : 'builder'];
+    let selected = model;
+    if (choice) {
+      const override = modelRuntime.getModel(choice.provider, choice.model);
+      const models = await modelRuntime.getAvailable(choice.provider, { signal: ctx.signal });
+      if (!override || !models.some(m => m.id === override.id)) throw new Error(`Модель роли недоступна: ${choice.provider}/${choice.model}. ${authHelp}`);
+      selected = override;
+    }
+    return jsonResponse(modelRuntime, selected, label, role, input, schema, ctx, review);
+  };
   return {
     async prepare(input, ctx) {
       const grounding = await ask(
@@ -440,19 +454,23 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       );
     },
     async assess(input, ctx) {
-      const metrics = input.scenario.metrics ?? [];
-      if (!metrics.length) return [];
-      const result = await ask(
+      const all = input.scenario.metrics ?? [];
+      const metrics = all.filter(m => m.subject === 'agent' || simulatorWasUsed(input.trial));
+      const unmeasured = all.filter(m => !metrics.includes(m)).map(m => ({ metricId: m.id, result: 'unknown' as const, evidence: [], rationale: 'Реактивный симулятор не участвовал; его качество не измерено.' }));
+      if (!metrics.length) return unmeasured;
+      const assessments: MetricAssessment[] = [];
+      for (const metric of metrics) {
+        const result = await ask(
         'Оценка диалога',
         ASSESS_ROLE,
-        {
-          scenario: input.scenario,
-          sources: input.sources.map(({ id, name, content }) => ({ id, name, content })),
-          trial: { userMode: input.trial.userMode, events: input.trial.events, initialState: input.trial.initialState, finalState: input.trial.finalState },
-        },
-        z.strictObject({ assessments: z.array(metricAssessmentSchema).length(metrics.length) }), ctx,
-      );
-      return result.assessments;
+        judgeInput(metric, input.scenario, input.sources, input.trial),
+        judgeResponseSchema, ctx,
+        value => { try { judgeAssessment(metric, input.trial, value); return undefined; }
+          catch (error) { return error instanceof Error ? error.message : 'Invalid assessment evidence'; } },
+        );
+        assessments.push(judgeAssessment(metric, input.trial, result));
+      }
+      return [...assessments, ...unmeasured];
     },
     async openTarget(agent, sources, tools, ctx) {
       agentSchema.parse(agent);

@@ -6,11 +6,15 @@ import { Text } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 import { z } from 'zod';
 import { ExperimentLab, draftHash, resultHash } from '../dist/experiment.js';
-import { agentSchema, createInputSchema, describeCheck, dialogueSchema, draftPatchSchema, fingerprint, goldenCaseSchema, ownerProfileSchema, settingsSchema, targetSchema, type Experiment, type HumanReviewInput, type Trial } from '../dist/contracts.js';
+import { agentSchema, createInputSchema, describeCheck, dialogueSchema, draftPatchSchema, fingerprint, goldenCaseSchema, clarificationSchema, reassessmentSchema, ownerProfileSchema, settingsSchema, targetSchema, type Experiment, type HumanReviewInput, type Trial } from '../dist/contracts.js';
 import { awaitingVerdict, evidenceSummary, plannedTrials } from '../dist/comparison.js';
 import { demoEvaluationInput, demoInput } from '../dist/demo.js';
 import { evidenceBundle, exportArtifacts } from '../dist/artifacts.js';
+import { doctor, listSuites, readConnection, rememberedConnection, rememberConnection } from '../dist/connection.js';
+import { inspectPrompt, promptVersion, proposePrompt } from '../dist/prompt-edit.js';
+import { readData } from '../dist/imports.js';
 import { editDraft, inputError } from './editor.ts';
+import { previewCriteria } from '../dist/preview.js';
 import { activePhases, reviewOrder, safeText, showBoard, verdicts, type BoardAction, type BoardOptions, type Section } from './cards.ts';
 
 const toolDisplay: Pick<ToolDefinition, 'renderCall' | 'renderResult'> = {
@@ -72,7 +76,8 @@ function summary(record: Experiment, directory: string) {
   };
 }
 
-async function humanAnnotation(ctx: ExtensionContext, record: Experiment, selected: number): Promise<HumanReviewInput[] | undefined> {
+async function humanAnnotation(ctx: ExtensionContext, record: Experiment, selected: number, readingMs = 0, reviewTimes?: Map<string, number>): Promise<HumanReviewInput[] | undefined> {
+  const started = performance.now();
   const trial = reviewOrder(record)[selected];
   if (!trial) return;
   const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
@@ -91,16 +96,17 @@ async function humanAnnotation(ctx: ExtensionContext, record: Experiment, select
   const choice = await ctx.ui.select('Область вашей оценки', targets.map(t => t.label));
   const target = targets.find(t => t.label === choice);
   if (!target) return;
-  const choices = ['pass', 'fail', 'unknown', 'invalid'] as const;
-  const answer = await ctx.ui.select('Ваш вердикт · исходная оценка сохранится', choices.map(v => verdicts[v]!));
-  const verdict = choices.find(v => verdicts[v] === answer);
+  const choices = [{ value: 'fail', label: 'Ошибся агент' }, { value: 'invalid', label: 'Ошибся тест' }, { value: 'unknown', label: 'Данных недостаточно' }, { value: 'pass', label: 'Агент выполнил задачу' }] as const;
+  const answer = await ctx.ui.select(`Диалог ${trial.id} · исходная оценка сохранится`, choices.map(v => v.label));
+  const verdict = choices.find(v => v.label === answer)?.value;
   if (!verdict) return;
   const note = await ctx.ui.editor('Пояснение · укажите реплики # и причину согласия или ошибки', '');
   if (note === undefined) return;
   if (target.trialIds.length > 1 && !await ctx.ui.confirm(`Применить вердикт к ${target.trialIds.length} диалогам?`,
     similar.map(t => `${safeText(record.scenarios.find(s => s.id === t.scenarioId)?.title)}\n${t.checks.filter(c => !c.passed).map(c => safeText(c.evidence)).join('\n')}`).join('\n\n')
     + `\n\nВаш вердикт: ${verdicts[verdict]}\nОснование: ${safeText(note)}\nКаждый диалог сохранит отдельную заметку.`)) return;
-  return target.trialIds.map(trialId => ({ trialId, ...target.ids, verdict, note }));
+  return target.trialIds.map(trialId => ({ trialId, ...target.ids, verdict, note,
+    durationMs: Math.min(3600000, Math.round((performance.now() - started) / target.trialIds.length + (reviewTimes?.get(`${record.id}|${trialId}`) ?? (trialId === trial.id ? readingMs : 0)))) }));
 }
 
 /** Conversational execution asks the human to authorize a concrete plan; it never invents human reviews. */
@@ -136,6 +142,7 @@ export default function agentLab(pi: ExtensionAPI) {
       existingAgent: Type.Optional(Type.Unsafe(z.toJSONSchema(agentSchema))),
       settings: Type.Optional(Type.Unsafe(z.toJSONSchema(settingsSchema, { io: 'input' }))),
       scenarioCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
+      connectionFile: Type.Optional(Type.String()), goldenFile: Type.Optional(Type.String()), dialoguesFile: Type.Optional(Type.String()),
       target: Type.Optional(Type.Unsafe(z.toJSONSchema(targetSchema, { io: 'input' }))),
       targetVersion: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: 'Agent release, commit or remote deployment version.' })),
       goldenCases: Type.Optional(Type.Unsafe(z.toJSONSchema(z.array(goldenCaseSchema).max(40), { io: 'input' }))),
@@ -147,11 +154,15 @@ export default function agentLab(pi: ExtensionAPI) {
     }, { additionalProperties: false }),
     executionMode: 'sequential',
     async execute(_callId, params, toolSignal, onUpdate, ctx) {
-      const { preset, ...rest } = params;
+      const { preset, goldenFile, dialoguesFile, connectionFile, ...rest } = params;
       const mode = rest.mode ?? 'live';
       const supplied = (rest.settings ?? {}) as Partial<z.infer<typeof settingsSchema>>;
+      const connection = mode === 'demo' ? undefined : connectionFile ? await readConnection(resolve(ctx.cwd, connectionFile)) : !rest.target ? await rememberedConnection(resolve(ctx.cwd, '.agent-lab')) : undefined;
       const input = createInputSchema.parse({
         ...(mode === 'demo' ? demoEvaluationInput() : {}), scenarioCount: mode === 'demo' ? 3 : 1, ...rest, mode, workflow: 'evaluate',
+        ...(connection ? { target: connection.target, targetVersion: connection.targetVersion } : {}),
+        ...(goldenFile ? { goldenCases: await readData(resolve(ctx.cwd, goldenFile), 'golden') } : {}),
+        ...(dialoguesFile ? { dialogues: await readData(resolve(ctx.cwd, dialoguesFile), 'dialogues') } : {}),
         settings: { ...(mode === 'demo' ? demoInput().settings : {}), repeats: 1, maxCalls: 20, maxDurationMs: 180000,
           ...(preset === 'thorough' ? { userModes: ['static', 'scripted', 'reactive'], repeats: 2 } : {}), ...supplied,
           provider: supplied.provider || ctx.model?.provider || '', model: supplied.model || ctx.model?.id || '' },
@@ -289,7 +300,7 @@ export default function agentLab(pi: ExtensionAPI) {
   pi.registerTool({
     ...toolDisplay, name: 'agent_lab_suite', label: 'Save or load reusable tests',
     description: 'Save selected tests as a versionable .evals/*.json file, or load that file into a fresh draft without model generation. Preserves original provenance and criteria. Clears results and approvals. Saving never overwrites an existing file. Use after a useful finding or when the user wants a regression test. Loading does not run it; inspect then use agent_lab_run.',
-    parameters: Type.Object({ action: Type.Union([Type.Literal('save'), Type.Literal('load')]), file: Type.String({ minLength: 1 }),
+    parameters: Type.Object({ action: Type.Union([Type.Literal('save'), Type.Literal('load'), Type.Literal('list')]), connectionFile: Type.Optional(Type.String()), file: Type.String({ minLength: 1 }),
       id: Type.Optional(Type.String()), scenarioIds: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 40 })) }, { additionalProperties: false }),
     executionMode: 'sequential',
     async execute(_callId, params, signal, _onUpdate, ctx) {
@@ -298,13 +309,128 @@ export default function agentLab(pi: ExtensionAPI) {
       try {
         await lab.init();
         let output: unknown;
-        if (params.action === 'save') {
+        if (params.action === 'list') output = await listSuites(resolve(ctx.cwd, params.file));
+        else if (params.action === 'save') {
           if (!params.id) throw new Error('Укажите прогон, из которого сохранить тесты.');
           const file = await lab.saveSuite(params.id, resolve(ctx.cwd, params.file), params.scenarioIds);
           output = { file, message: 'Тесты сохранены. Их можно добавить в Git и запускать после каждой правки.', nextStep: `agent-lab evaluate --input ${JSON.stringify(file)} --yes` };
-        } else output = summary(await lab.loadSuite(resolve(ctx.cwd, params.file), params.scenarioIds), lab.store.directory);
+        } else output = summary(await lab.loadSuite(resolve(ctx.cwd, params.file), params.scenarioIds, params.connectionFile ? await readConnection(resolve(ctx.cwd, params.connectionFile)) : undefined), lab.store.directory);
         return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: {} };
       } finally { await close(); }
+    },
+  });
+  pi.registerTool({
+    ...toolDisplay, name: 'agent_lab_connection', label: 'Check agent connection',
+    description: 'Inspect a saved connection or run its explicit three-request history/reset probe. Use file for portable JSON config; omit to use the remembered successful connection. check asks the human to approve the concrete requests. Reports actual evidence; never claims trusted state merely from adapter assertions.',
+    parameters: Type.Object({ action: Type.Union([Type.Literal('inspect'), Type.Literal('check')]), file: Type.Optional(Type.String()) }, { additionalProperties: false }),
+    executionMode: 'sequential',
+    async execute(_callId, params, signal, _onUpdate, ctx) {
+      const directory = resolve(ctx.cwd, '.agent-lab');
+      const connection = params.file ? await readConnection(resolve(ctx.cwd, params.file)) : await rememberedConnection(directory);
+      if (!connection) throw new Error('Сохранённого подключения нет. Укажите файл подключения.');
+      let output: unknown = connection;
+      if (params.action === 'check') {
+        if (!connection.probe) throw new Error('Добавьте probe.write/read/reset и initialState в файл подключения.');
+        if (!ctx.hasUI || ctx.mode !== 'tui') throw new Error('Проверка подключения требует native Pi confirmation.');
+        if (!await ctx.ui.confirm('Проверить историю и сброс · 3 запроса?', safeText(JSON.stringify({ target: connection.target, probe: connection.probe }, null, 2)))) return { content: [{ type: 'text', text: 'Проверка отменена.' }], details: {} };
+        const result = await doctor(connection, AbortSignal.any([signal, ctx.signal].filter((s): s is AbortSignal => !!s)));
+        if (result.passed) await rememberConnection(directory, connection);
+        output = result;
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: {} };
+    },
+  });
+  pi.registerTool({
+    ...toolDisplay, name: 'agent_lab_preview', label: 'Check criteria on good and bad answers',
+    description: 'Check supplied good/bad answer examples against the current literal checks and semantic agent rubrics, without calling the target. Saves examples, criteria, judge version, evidence and cost separately. Examples are not measured target trials or human annotations. State/tool checks require recorded traces via reassess.',
+    parameters: Type.Object({ id: Type.String(), scenarioId: Type.String(), good: Type.String({ minLength: 1, maxLength: 20000 }),
+      bad: Type.String({ minLength: 1, maxLength: 20000 }), codeOnly: Type.Optional(Type.Boolean()) }, { additionalProperties: false }),
+    executionMode: 'sequential',
+    async execute(_callId, params, signal, _onUpdate, ctx) {
+      const { lab, close } = open(ctx.cwd);
+      try {
+        await lab.init(); const record = await lab.get(params.id);
+        if (!params.codeOnly && record.scenarios.find(s => s.id === params.scenarioId)?.metrics?.some(m => m.subject === 'agent')) {
+          if (!ctx.hasUI || ctx.mode !== 'tui') throw new Error('Предпросмотр моделью требует интерактивного терминала. CLI: preview --yes.');
+          if (!await ctx.ui.confirm('Проверить два примера по рубрикам?', safeText(`${params.good}\n\n${params.bad}\n\nДо 6 вызовов судьи. Агент не запускается.`))) return { content: [{ type: 'text', text: 'Предпросмотр отменён.' }], details: {} };
+        }
+        const output = await previewCriteria(record, params.scenarioId, { good: params.good, bad: params.bad }, { directory: lab.store.directory,
+          codeOnly: params.codeOnly, signal: AbortSignal.any([signal, ctx.signal].filter((s): s is AbortSignal => !!s)) });
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: output };
+      } finally { await close(); }
+    },
+  });
+  pi.registerTool({
+    ...toolDisplay, name: 'agent_lab_reassess', label: 'Reassess recorded evidence',
+    description: 'Evaluate new checks/rubrics on existing trial traces without calling the target or simulator. Creates a separate immutable result retaining the original run. codeOnly uses no model; judge overrides are optional. This cannot demonstrate an agent improvement. Ask native confirmation before model spending.',
+    parameters: Type.Object({ id: Type.String(), input: Type.Optional(Type.Unsafe(z.toJSONSchema(reassessmentSchema, { io: 'input' }))) }, { additionalProperties: false }),
+    executionMode: 'sequential',
+    async execute(_callId, params, signal, _onUpdate, ctx) {
+      const input = reassessmentSchema.parse(params.input ?? {});
+      const { lab, close } = open(ctx.cwd);
+      const cancel = () => { void close(); };
+      try {
+        await lab.init();
+        const original = await lab.get(params.id);
+        if (!input.codeOnly) {
+          if (!ctx.hasUI || ctx.mode !== 'tui') throw new Error('Переоценка моделью требует native Pi confirmation.');
+          if (!await ctx.ui.confirm('Переоценить сохранённые ответы?', safeText(`Агент не запускается. Диалогов: ${input.trialIds?.length ?? original.trials.length}. До ${original.settings.maxCalls} вызовов, ${original.settings.maxDurationMs / 1000} секунд.\n${JSON.stringify(input, null, 2)}`))) return { content: [{ type: 'text', text: 'Переоценка отменена.' }], details: {} };
+        }
+        signal?.throwIfAborted(); signal?.addEventListener('abort', cancel, { once: true });
+        const draft = await lab.reassess(params.id, input);
+        await lab.waitForIdle();
+        const record = await lab.get(draft.id);
+        const output = { ...summary(record, lab.store.directory), assessmentOf: record.assessmentOf,
+          artifacts: await exportArtifacts(await evidenceBundle(record, lab.store), lab.store.directory) };
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: {} };
+      } finally { signal?.removeEventListener('abort', cancel); await close(); }
+    },
+  });
+  pi.registerTool({
+    ...toolDisplay, name: 'agent_lab_prompt', label: 'Review one prompt change',
+    description: 'propose saves an isolated candidate prompt and diff, citing human-confirmed dev failures. Never use control feedback. apply requires native diff review and creates a draft with the EXACT same capability/regression cards and a candidate promptFile; then use agent_lab_run. Adapter must attest promptHash. Original prompt file is preserved.',
+    parameters: Type.Object({ action: Type.Union([Type.Literal('propose'), Type.Literal('inspect'), Type.Literal('apply')]),
+      id: Type.Optional(Type.String()), file: Type.Optional(Type.String()), candidate: Type.Optional(Type.String({ maxLength: 96000 })),
+      hypothesis: Type.Optional(Type.String({ maxLength: 3000 })), trialIds: Type.Optional(Type.Array(Type.String(), { maxItems: 40 })) }, { additionalProperties: false }),
+    executionMode: 'sequential',
+    async execute(_callId, params, signal, _onUpdate, ctx) {
+      signal?.throwIfAborted();
+      const { lab, close } = open(ctx.cwd);
+      try {
+        await lab.init();
+        let output: unknown;
+        if (params.action === 'propose') {
+          if (!params.id || !params.candidate || !params.hypothesis || !params.trialIds) throw new Error('Нужны id, candidate, hypothesis и trialIds подтверждённых ошибок.');
+          output = await proposePrompt(lab.store.directory, await lab.get(params.id), { candidate: params.candidate, hypothesis: params.hypothesis, trialIds: params.trialIds });
+        } else {
+          if (!params.file) throw new Error('Укажите file предложения.');
+          const file = resolve(ctx.cwd, params.file);
+          const inspected = await inspectPrompt(file);
+          if (params.action === 'inspect') output = inspected;
+          else {
+            if (!ctx.hasUI || ctx.mode !== 'tui') throw new Error('Выбор версии промпта требует native Pi review.');
+            if (!await ctx.ui.confirm('Проверить эту версию промпта?', safeText(inspected.proposal.hypothesis + '\n' + inspected.diff))) return { content: [{ type: 'text', text: 'Изменение отменено.' }], details: {} };
+            output = summary(await promptVersion(lab, file, inspected.reviewHash), lab.store.directory);
+          }
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: {} };
+      } finally { await close(); }
+    },
+  });
+  pi.registerTool({
+    ...toolDisplay, name: 'agent_lab_clarify', label: 'Record owner clarification',
+    description: 'Regenerate a blocked draft from the owner’s actual answers. Preserve the original questions/run and append verbatim answers as a cited material in the new draft. Never invent business decisions or infer a human review.',
+    parameters: Type.Object({ id: Type.String(), answers: Type.Unsafe(z.toJSONSchema(z.array(clarificationSchema).min(1).max(50))) }, { additionalProperties: false }),
+    executionMode: 'sequential',
+    async execute(_callId, params, signal, _onUpdate, ctx) {
+      const { lab, close } = open(ctx.cwd);
+      const cancel = () => { void close(); };
+      try {
+        await lab.init(); signal?.throwIfAborted(); signal?.addEventListener('abort', cancel, { once: true });
+        const record = await lab.clarify(params.id, z.array(clarificationSchema).parse(params.answers));
+        const output = summary(record, lab.store.directory);
+        return { content: [{ type: 'text', text: JSON.stringify(output, null, 2) }], details: {} };
+      } finally { signal?.removeEventListener('abort', cancel); await close(); }
     },
   });
   pi.registerCommand('agent-lab', {
@@ -325,6 +451,8 @@ export default function agentLab(pi: ExtensionAPI) {
         let newRequested = startRequest;
         let demoRequested = args.trim() === 'demo';
         let reportPath: string | undefined;
+        // Elapsed time with the dialogue visible plus its verdict form, including time spent idle.
+        const reviewTimes = new Map<string, number>();
         let notice: BoardOptions['notice'];
         const inform = (message: string, kind: 'info' | 'error' = 'info') => {
           notice = { message: safeText(message), kind };
@@ -333,7 +461,7 @@ export default function agentLab(pi: ExtensionAPI) {
           const record = id ? await lab.get(id) : undefined;
           const bundle = record ? await evidenceBundle(record, lab.store, beforeId) : undefined;
           const action: BoardAction = demoRequested ? { type: 'demo' } : newRequested ? { type: 'new' } : await showBoard(ctx, record
-            ? { record, section, selected, query, pendingOnly, comparison: bundle?.comparison, before: bundle?.before, notice, reportPath,
+            ? { record, section, selected, query, pendingOnly, comparison: bundle?.comparison, before: bundle?.before, notice, reportPath, reviewTimes,
                 warnings: bundle?.warnings, load: async () => evidenceBundle(await lab.get(record.id), lab.store, beforeId) }
             : { records: await lab.list(), notice, warnings: lab.store.diagnostics.map(d => `${d.id}: ${d.message}`) });
           notice = undefined;
@@ -403,7 +531,7 @@ export default function agentLab(pi: ExtensionAPI) {
                 const updated = await lab.updateDraft(action.record.id, draftHash(action.record), patch);
                 reportPath = undefined;
                 inform(updated.message);
-              });
+              }, (scenarioId, examples) => previewCriteria(action.record, scenarioId, examples, { directory: lab.store.directory, signal: ctx.signal }));
             } else if (action.type === 'run') {
               const r = action.record;
               if (r.workflow !== 'evaluate') throw new Error('Legacy comparison records cannot run from the evaluation board.');
@@ -421,12 +549,14 @@ export default function agentLab(pi: ExtensionAPI) {
               await lab.addHumanReview(action.record.id, {
                 trialId: trial.id, verdict: action.verdict,
                 note: 'Быстрый вердикт из терминала, без записанного основания.',
+                durationMs: action.reviewMs,
               });
+              reviewTimes.delete(`${action.record.id}|${trial.id}`);
               reportPath = undefined;
             } else if (action.type === 'annotate') {
               const index = action.trialId ? reviewOrder(action.record).findIndex(t => t.id === action.trialId) : action.selected;
-              const reviews = await humanAnnotation(ctx, action.record, index);
-              if (reviews) { for (const review of reviews) await lab.addHumanReview(action.record.id, review); reportPath = undefined; }
+              const reviews = await humanAnnotation(ctx, action.record, index, action.reviewMs, reviewTimes);
+              if (reviews) { for (const review of reviews) { await lab.addHumanReview(action.record.id, review); reviewTimes.delete(`${action.record.id}|${review.trialId}`); } reportPath = undefined; }
             } else if (action.type === 'finalize') {
               const r = action.record;
               const pending = awaitingVerdict(r).size;

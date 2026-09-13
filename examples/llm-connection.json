@@ -1,0 +1,15 @@
+{
+  "format": "agent-lab-connection-1",
+  "target": { "kind": "module", "path": "./llm-stateful-agent.mjs", "exportName": "createSession", "promptFile": "./llm-prompt.md", "timeoutMs": 120000 },
+  "probe": {
+    "initialState": { "records": { "A": { "time": "09:00", "owner": "Alex" } }, "writableFields": ["time"], "transientFailures": 0 },
+    "write": { "message": "Move appointment A to 11:00.", "reply": "Moved A to 11:00." },
+    "read": { "message": "What is the time of that appointment?", "reply": "A: 11:00." },
+    "reset": { "message": "What is the time of that appointment?", "reply": "Which record?" },
+    "checks": [
+      { "id": "time", "kind": "state_equals", "description": "Time changed in SQLite", "recordId": "A", "field": "time", "value": "11:00" },
+      { "id": "owner", "kind": "state_equals", "description": "Owner preserved", "recordId": "A", "field": "owner", "value": "Alex" },
+      { "id": "read", "kind": "fresh_read_before_update", "description": "Read before changing" }
+    ]
+  }
+}

@@ -7,16 +7,20 @@
  * Returned `records` replace the trial's world before objective checks run; returned `events`
  * appear in the trace. Agent Lab never executes anything else from this module.
  */
-export function createSession({ initialState }) {
+export function createSession({ initialState, sessionId }) {
   const records = structuredClone(initialState.records);
+  let turn = 0;
   return {
     async respond(message) {
+      const observation = { eventsComplete: true, resetConfirmed: true, sessionId, turn: ++turn, version: 'echo-module-1',
+        usage: { calls: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 } };
       const id = Object.keys(records)[0];
       const time = message.match(/\b(?:[01]\d|2[0-3]):[0-5]\d\b/)?.[0];
       if (id && time && 'time' in records[id]) {
         const before = structuredClone(records[id]);
         records[id].time = time;
         return {
+          ...observation,
           reply: `Moved ${id} to ${time}.`,
           events: [
             { tool: 'lookup_record', args: { recordId: id }, result: { ok: true, recordId: id, record: before } },
@@ -25,7 +29,7 @@ export function createSession({ initialState }) {
           records,
         };
       }
-      return { reply: `You said: ${message}`, events: [], records };
+      return { ...observation, reply: `You said: ${message}`, events: [], records };
     },
     async close() {},
   };

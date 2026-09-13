@@ -1,0 +1,27 @@
+name: Agent regression
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - run: npm run build
+      # This checked-in example uses SQLite and no model credentials.
+      # Replace the suite and connection with your reviewed agent tests.
+      - run: node dist/cli.js evaluate --input examples/regression-suite.json --connection examples/connection.json --yes
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: agent-evidence
+          path: .agent-lab/
+          include-hidden-files: true

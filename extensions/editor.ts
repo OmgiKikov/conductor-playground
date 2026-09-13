@@ -1,6 +1,8 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { z } from 'zod';
-import { draftPatchSchema, profileUser, TOOL_NAMES, type DraftPatch, type Profile } from '../dist/contracts.js';
+import { checkSchema, rubricSchema, draftPatchSchema, profileUser, TOOL_NAMES, type DraftPatch, type Profile, type Scenario } from '../dist/contracts.js';
+import { previewAnswer } from '../dist/evaluation.js';
+import type { previewCriteria } from '../dist/preview.js';
 import { safeText, type BoardAction } from './cards.ts';
 
 export function inputError(error: unknown): string {
@@ -31,7 +33,70 @@ async function editValidated<T>(ctx: ExtensionContext, title: string, initial: s
   }
 }
 
-export async function editDraft(ctx: ExtensionContext, action: Extract<BoardAction, { record: unknown }>, save?: (patch: DraftPatch) => Promise<void>): Promise<DraftPatch | undefined> {
+async function expectation(ctx: ExtensionContext, scenario: Scenario): Promise<Scenario | undefined> {
+  const choices = [
+    ...scenario.checks.map(c => ({ label: `Проверка · ${c.description}`, check: c, metric: undefined })),
+    ...(scenario.metrics ?? []).filter(m => m.subject === 'agent').map(m => ({ label: `Рубрика · ${m.name}`, metric: m, check: undefined })),
+  ];
+  const selected = await ctx.ui.select('Какое ожидание изменить?', [...choices.map(c => safeText(c.label)), 'Добавить ожидание']);
+  if (!selected) return;
+  const existing = choices.find(c => safeText(c.label) === selected);
+  const kinds = [
+    ['rubric', 'Смысл ответа · оценка по рубрике'], ['answer_equals', 'Ответ в точности'], ['answer_contains', 'Есть фраза'], ['answer_omits', 'Нет фразы'],
+    ['state_equals', 'Поле итогового состояния'], ['tool_called', 'Инструмент вызван'], ['tool_not_called', 'Инструмент не вызван'],
+    ['tool_count', 'Число вызовов'], ['fresh_read_before_update', 'Чтение перед изменением'],
+  ] as const;
+  const kindLabel = existing ? undefined : await ctx.ui.select('Как проверить?', kinds.map(k => k[1]));
+  const kind = existing?.metric ? 'rubric' : existing?.check?.kind ?? kinds.find(k => k[1] === kindLabel)?.[0];
+  if (!kind) return;
+  const description = await ctx.ui.editor('Ожидаемый результат · своими словами', existing?.check?.description ?? existing?.metric?.description ?? scenario.successCriteria ?? '');
+  if (description === undefined) return;
+  const used = new Set([...scenario.checks, ...(scenario.metrics ?? [])].map(c => c.id));
+  let id = existing?.check?.id ?? existing?.metric?.id ?? 'expectation';
+  while (!existing && used.has(id)) id += '_new';
+  const ask = (title: string, initial = '') => editValidated(ctx, title, initial, value => z.string().min(1).parse(value));
+  if (kind === 'rubric') {
+    const passCriteria = await ask('Когда ответ правильный?', existing?.metric?.passCriteria ?? description);
+    if (passCriteria === undefined) return;
+    const failCriteria = await ask('Что считать ошибкой?', existing?.metric?.failCriteria ?? '');
+    if (failCriteria === undefined) return;
+    const metric = rubricSchema.parse({ ...existing?.metric, id, name: existing?.metric?.name ?? 'Результат', subject: 'agent', description, passCriteria, failCriteria });
+    scenario.metrics = [...(scenario.metrics ?? []).filter(m => m.id !== id), metric];
+  } else {
+    const raw: Record<string, unknown> = { ...existing?.check, id, kind, description };
+    if (kind.startsWith('answer_')) {
+      const value = await ask('Проверяемый текст · пробелы и переносы сохраняются', String(raw.value ?? ''));
+      if (value === undefined) return; raw.value = value;
+    } else if (kind === 'state_equals') {
+      for (const key of ['recordId', 'field'] as const) {
+        const value = await ask(key === 'recordId' ? 'Идентификатор записи' : 'Название поля', String(raw[key] ?? ''));
+        if (value === undefined) return; raw[key] = value;
+      }
+      const type = await ctx.ui.select('Тип значения', ['Текст', 'Число', 'Да / нет', 'null']);
+      if (!type) return;
+      if (type === 'null') raw.value = null;
+      else if (type === 'Да / нет') { const selected = await ctx.ui.select('Значение', ['true', 'false']); if (!selected) return; raw.value = selected === 'true'; }
+      else {
+        const value = await editValidated(ctx, 'Ожидаемое значение', String(raw.value ?? ''), text => type === 'Число' ? z.number().finite().parse(text.trim() ? Number(text) : NaN) : text);
+        if (value === undefined) return; raw.value = value;
+      }
+    } else if (kind.startsWith('tool_')) {
+      const tool = await ask('Имя инструмента', String(raw.tool ?? ''));
+      if (tool === undefined) return; raw.tool = tool;
+      if (kind === 'tool_count') for (const key of ['min', 'max']) {
+        const value = await editValidated(ctx, key === 'min' ? 'Минимум вызовов' : 'Максимум вызовов', String(raw[key] ?? 1), text => z.number().int().min(0).max(1000).parse(text.trim() ? Number(text) : NaN));
+        if (value === undefined) return; raw[key] = value;
+      }
+    }
+    scenario.checks = [...scenario.checks.filter(c => c.id !== id), checkSchema.parse(raw)];
+  }
+  // The visible expectation is derived from all executable agent criteria, so unrelated checks stay explicit.
+  scenario.successCriteria = [...scenario.checks.map(c => c.description), ...(scenario.metrics ?? []).filter(m => m.subject === 'agent').map(m => m.passCriteria)].join(' ');
+  return scenario;
+}
+
+export async function editDraft(ctx: ExtensionContext, action: Extract<BoardAction, { record: unknown }>, save?: (patch: DraftPatch) => Promise<void>,
+  preview?: (scenarioId: string, examples: { good: string; bad: string }) => ReturnType<typeof previewCriteria>): Promise<DraftPatch | undefined> {
   const { record } = action;
   const commit = async (patch: DraftPatch): Promise<DraftPatch> => { await save?.(patch); return patch; };
   const editPatch = (title: string, initial: string, patch: (text: string) => unknown) =>
@@ -81,10 +146,25 @@ export async function editDraft(ctx: ExtensionContext, action: Extract<BoardActi
   if (action.type === 'settings') {
     const choice = await ctx.ui.select('Настройки прогона', [
       'Быстрый · реактивные диалоги, один повтор', 'Полный · три режима, два повтора',
-      'Версия агента · название релиза или коммит', 'Подключение · команда, модуль или HTTP', 'Профили пользователей', 'Лимиты · расширенные настройки',
+      'Модели ролей · сборка, симулятор, судья', 'Версия агента · название релиза или коммит', 'Подключение · команда, модуль или HTTP', 'Профили пользователей', 'Лимиты · расширенные настройки',
     ]);
     if (choice?.startsWith('Быстрый')) return commit({ settings: { userModes: ['reactive'], repeats: 1 } });
     if (choice?.startsWith('Полный')) return commit({ settings: { userModes: ['static', 'scripted', 'reactive'], repeats: 2 } });
+    if (choice?.startsWith('Модели ролей')) {
+      const labels = { builder: 'Подготовка тестов', simulator: 'Симулятор', judge: 'Судья' } as const;
+      const label = await ctx.ui.select('Роль', Object.values(labels));
+      const role = (Object.keys(labels) as (keyof typeof labels)[]).find(key => labels[key] === label);
+      if (!role) return;
+      const provider = await ctx.ui.editor('Провайдер · пусто = общая модель', record.settings.roles[role]?.provider ?? '');
+      if (provider === undefined) return;
+      const roles: NonNullable<NonNullable<DraftPatch['settings']>['roles']> = {};
+      if (!provider.trim()) roles[role] = null;
+      else {
+        const model = await ctx.ui.editor('Идентификатор модели', record.settings.roles[role]?.model ?? record.settings.model);
+        if (model === undefined) return; roles[role] = { provider, model };
+      }
+      return commit(draftPatchSchema.parse({ settings: { roles } }));
+    }
     if (choice?.startsWith('Версия')) return editPatch('Версия агента · например acquiring-v3', record.targetVersion ?? '', targetVersion => ({ targetVersion }));
     if (choice?.startsWith('Подключение')) return editTarget();
     if (choice === 'Профили пользователей') {
@@ -101,6 +181,7 @@ export async function editDraft(ctx: ExtensionContext, action: Extract<BoardActi
     const scenario = structuredClone(record.scenarios[action.selected]!);
     const fields = [
       ['opening', 'Первая реплика'], ['successCriteria', 'Критерий успеха'],
+      ['preview', 'Проверить ожидание на примерах'],
       ['script', 'Продолжения после первой реплики · по одному в строке'],
       ['facts', 'Факты, известные пользователю'], ['maxFollowUps', 'Максимум ответов после первой реплики'],
       ['profileId', 'Профиль пользователя · выбрать или убрать'],
@@ -110,16 +191,39 @@ export async function editDraft(ctx: ExtensionContext, action: Extract<BoardActi
       ['metrics', 'Метрики · JSON'], ['checks', 'Точные проверки · JSON'], ['initialState', 'Начальное состояние · JSON'],
       ['all', 'Все карточки · JSON'],
     ] as const;
-    let choice = await ctx.ui.select('Что изменить в тесте? · можно обсудить обычными словами: a', [...fields.slice(0, 5).map(([, label]) => label), 'Расширенные настройки']);
-    if (choice === 'Расширенные настройки') choice = await ctx.ui.select('Расширенные настройки теста', fields.slice(5).map(([, label]) => label));
+    let choice = await ctx.ui.select('Что изменить в тесте? · можно обсудить обычными словами: a', [...fields.slice(0, 6).map(([, label]) => label), 'Расширенные настройки']);
+    if (choice === 'Расширенные настройки') choice = await ctx.ui.select('Расширенные настройки теста', fields.slice(6).map(([, label]) => label));
     const entry = fields.find(([, label]) => label === choice);
     if (!entry) return;
     const [field, title] = entry;
-    if (field === 'successCriteria') return editPatch('Ожидание и исполняемые проверки · измените их вместе · для правки обычными словами нажмите a на доске',
-      JSON.stringify({ successCriteria: scenario.successCriteria, checks: scenario.checks, metrics: scenario.metrics ?? [] }, null, 2), text => {
-        const expectation = z.strictObject({ successCriteria: z.string().min(1), checks: z.array(z.unknown()), metrics: z.array(z.unknown()) }).parse(JSON.parse(text));
-        return { scenarios: [{ ...scenario, ...expectation }] };
-      });
+    if (field === 'successCriteria') {
+      const edited = await expectation(ctx, scenario);
+      return edited ? commit(draftPatchSchema.parse({ scenarios: [edited] })) : undefined;
+    }
+    if (field === 'preview') {
+      const rows: string[] = [];
+      const examples = { good: '', bad: '' };
+      for (const label of ['Хороший ответ', 'Плохой ответ']) {
+        const answer = await ctx.ui.editor(label, '');
+        if (answer === undefined) return;
+        examples[label === 'Хороший ответ' ? 'good' : 'bad'] = answer;
+        const result = previewAnswer(scenario, answer);
+        rows.push(label, ...result.checks.map(c => `${c.passed ? '✓' : '✕'} ${c.description}: ${c.evidence}`),
+          ...(result.unmeasured.length ? [`Нужны трасса или судья: ${result.unmeasured.join(', ')}. Для сохранённых диалогов используйте agent_lab_reassess.`] : []));
+      }
+      if (preview && scenario.metrics?.some(m => m.subject === 'agent') && await ctx.ui.confirm('Проверить смысл ответов?',
+        'Судья оценит два примера по текущим рубрикам. До 6 модельных вызовов в пределах лимитов; агент не запускается.')) {
+        const result = await preview(scenario.id, examples);
+        rows.length = 0;
+        for (const item of result.results) rows.push(item.label === 'good' ? 'Хороший ответ' : 'Плохой ответ',
+          ...item.checks.map(c => `${c.passed ? '✓' : '✕'} ${c.description}: ${c.evidence}`),
+          ...item.assessments.map(a => `${a.result} · ${a.metricId}: ${a.rationale} [${a.evidence.join(', ')}]`),
+          item.error ?? '', item.matchesExpected === null ? 'Недостаточно данных.' : item.matchesExpected ? 'Совпало с ожиданием примера.' : 'Критерий расходится с ожиданием примера.',
+          ...(item.unmeasured.length ? [`Не измерено: ${item.unmeasured.join(', ')}`] : []));
+        rows.push(`Примеры, версии и расход сохранены: ${result.file}`);
+      }
+      await ctx.ui.select(safeText(rows.join('\n')), ['Закрыть']); return;
+    }
     if (field === 'profileId') {
       const labels = ['Без профиля и персоны', ...record.profiles.map(p => `${p.id} · ${profileUser(p).persona ?? 'Без персоны'}`)].map(safeText);
       const selected = await ctx.ui.select('Профиль этой карточки', labels);

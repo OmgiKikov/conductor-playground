@@ -18,7 +18,8 @@ export function targetEntryPath(target: Target): string | undefined {
 /** Record local code identity without persisting source code, diffs or environment secrets. */
 export async function targetFingerprint(target: Target): Promise<string | undefined> {
   const path = targetEntryPath(target);
-  if (!path) return undefined;
+  const prompt = target.kind !== 'sandbox' && target.promptFile ? await readFile(target.promptFile, 'utf8') : undefined;
+  if (!path) return prompt === undefined ? undefined : fingerprint({ prompt });
   try {
     const entryStat = await stat(path);
     if (!entryStat.isFile()) throw Object.assign(new Error(), { code: 'EISDIR' });
@@ -41,7 +42,7 @@ export async function targetFingerprint(target: Target): Promise<string | undefi
       changes = cached.changes;
     }
     // Fingerprints cover the entry point and tracked Git changes; remote services, untracked dependencies and environment changes need targetVersion.
-    return fingerprint({ content, commit, changes });
+    return fingerprint({ content, commit, changes, prompt });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     throw new Error(code === 'ENOENT' || code === 'ENOTDIR' ? `Не найден файл агента: ${path}. Исправьте путь в подключении.`

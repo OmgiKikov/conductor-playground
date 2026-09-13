@@ -1,4 +1,4 @@
-import { fingerprint, type Comparison, type Experiment, type HumanReview, type Scenario, type Tier, type Trial, type UserMode } from './contracts.js';
+import { fingerprint, simulatorWasUsed, type Comparison, type Experiment, type HumanReview, type Scenario, type Tier, type Trial, type UserMode } from './contracts.js';
 
 /*
  * Pure statistics over persisted records. Nothing here performs I/O or model calls,
@@ -83,9 +83,13 @@ export function compareTrials(input: {
     for (let repeat = 0; repeat < repeats; repeat += 1) {
       const base = trialMap.get(`${baselineId}:${scenario.id}:${repeat}`);
       const candidate = trialMap.get(`${candidateId}:${scenario.id}:${repeat}`);
-      if (base?.length !== 1 || candidate?.length !== 1 || !['pass', 'fail'].includes(base[0]!.outcome) || !['pass', 'fail'].includes(candidate[0]!.outcome)) continue;
-      const a = Number(base[0]!.outcome === 'pass');
-      const b = Number(candidate[0]!.outcome === 'pass');
+      if (base?.length !== 1 || candidate?.length !== 1) continue;
+      if (!trialAssessmentComplete(scenario, base[0]!) || !trialAssessmentComplete(scenario, candidate[0]!)) continue;
+      const was = automaticTrialResult(scenario, base[0]!);
+      const now = automaticTrialResult(scenario, candidate[0]!);
+      if (was === 'unknown' || now === 'unknown') continue;
+      const a = Number(was === 'pass');
+      const b = Number(now === 'pass');
       result.validPairs += 1;
       result.baselinePasses += a;
       result.candidatePasses += b;
@@ -144,8 +148,8 @@ export function compareUserModes(record: Experiment): ModeComparison[] {
   record = observedRecord(record);
   const reviews = latestHumanReviews(record);
   const usable = (t: Trial) => measured(t) && reviews.get(`${t.id}|dialogue`)?.verdict !== 'invalid'
-    && !record.scenarios.find(s => s.id === t.scenarioId)?.metrics?.some(m => m.subject === 'simulator'
-      && t.assessments?.some(a => a.metricId === m.id && a.result !== 'pass'));
+    && !(simulatorWasUsed(t) && record.scenarios.find(s => s.id === t.scenarioId)?.metrics?.some(m => m.subject === 'simulator'
+      && t.assessments?.some(a => a.metricId === m.id && a.result !== 'pass')));
   const criteria = (t: Trial) => new Map<string, 'pass' | 'fail' | 'unknown'>([
     ...t.checks.map(c => [`${t.scenarioId}/check:${c.id}`, c.passed ? 'pass' : 'fail'] as const),
     ...(record.scenarios.find(s => s.id === t.scenarioId)?.metrics ?? []).filter(m => m.subject === 'agent')
@@ -320,11 +324,20 @@ export function isAgentFailure(record: Experiment, trial: Trial): boolean {
   return !['invalid', 'cancelled'].includes(trial.outcome) && (trial.outcome === 'fail'
     || agentRubricResult(record.scenarios.find(s => s.id === trial.scenarioId), trial) === 'fail');
 }
+/** A candidate cannot be accepted on a partially scored agent rubric. */
+export function trialAssessmentComplete(scenario: Scenario, trial: Trial): boolean {
+  const simulated = simulatorWasUsed(trial);
+  return !trial.assessmentError && (scenario.metrics ?? []).filter(m => m.subject === 'agent' || simulated)
+    .every(m => { const result = trial.assessments?.find(a => a.metricId === m.id)?.result;
+      return m.subject === 'simulator' ? result === 'pass' : result === 'pass' || result === 'fail'; });
+}
 /** Combined automatic result for triage, never a replacement for the separate code and rubric scores. */
-function automaticTrialResult(scenario: Scenario | undefined, trial: Trial): 'pass' | 'fail' | 'unknown' {
+export function automaticTrialResult(scenario: Scenario | undefined, trial: Trial): 'pass' | 'fail' | 'unknown' {
   if (!scenario || !measured(trial)) return 'unknown';
+  if (trial.outcome === 'fail') return 'fail';
+  if (trial.assessmentError) return 'unknown';
   const rubric = agentRubricResult(scenario, trial);
-  if (trial.outcome === 'fail' || rubric === 'fail') return 'fail';
+  if (rubric === 'fail') return 'fail';
   return (!scenario.checks.length || trial.outcome === 'pass')
     && (rubric === 'pass' || (rubric === undefined && scenario.checks.length > 0)) ? 'pass' : 'unknown';
 }
@@ -581,6 +594,7 @@ export function verdictSummary(record: Experiment): VerdictSummary {
 export interface EvidenceSummary {
   verdict: VerdictSummary;
   comparison: { observed: string; status: string } | null;
+  pilot: ReturnType<typeof pilotSummary>;
   modes: ModeComparison[]; calibration: CalibrationRow[]; fidelity: FidelityReport | null; notes: string[];
 }
 /** The one object every surface renders: the plain verdict first, observed numbers next, then what they cannot yet support. */
@@ -606,7 +620,7 @@ export function evidenceSummary(record: Experiment): EvidenceSummary {
   notes.push(...record.limitations.filter(l => l.startsWith('Scripted mode skipped')));
   const reactive = modes.find(m => m.userMode === 'reactive');
   if (record.settings.userModes.length > 1 && reactive?.uniqueFailedChecks.length) notes.push(`Критерии с провалом только в реактивном режиме среди сопоставленных попыток (не доказательство дополнительной пользы): ${reactive.uniqueFailedChecks.join(', ')}.`);
-  return { verdict: verdictSummary(record), comparison, modes, calibration, fidelity, notes };
+  return { verdict: verdictSummary(record), comparison, modes, calibration, fidelity, notes, pilot: pilotSummary(record) };
 }
 
 /**
@@ -632,11 +646,13 @@ export interface RunComparison {
 
 /** Expected attempts, including all repeats. Missing/invalid attempts never disappear from a comparison. */
 export function plannedTrials(record: Experiment): number {
+  if (record.assessmentTrialIds) return record.assessmentTrialIds.length;
   return record.scenarios.reduce((sum, s) => sum + record.settings.userModes.filter(m => m !== 'scripted' || s.user.script !== undefined).length * record.settings.repeats, 0);
 }
 const attemptKey = (trial: Trial) => `${trial.scenarioId}|${trial.userMode}|${trial.repeat}`;
 const measured = (trial: Trial) => graded(trial) || trial.outcome === 'ungraded';
 function expectedAttempts(record: Experiment): Set<string> {
+  if (record.assessmentTrialIds) return new Set(record.trials.filter(t => record.assessmentTrialIds!.includes(t.id)).map(attemptKey));
   return new Set(record.scenarios.flatMap(s => record.settings.userModes.filter(m => m !== 'scripted' || s.user.script !== undefined)
     .flatMap(mode => Array.from({ length: record.settings.repeats }, (_, i) => `${s.id}|${mode}|${i}`))));
 }
@@ -705,8 +721,12 @@ export function compareRuns(before: Experiment, after: Experiment): RunCompariso
   if (before.id === after.id) notes.push('Выбран один и тот же прогон.');
   if (before.workflow !== 'evaluate' || after.workflow !== 'evaluate') notes.push('Сравнение поддерживает отдельные оценочные прогоны.');
   if (before.mode !== after.mode) notes.push('Демо и живые прогоны несравнимы.');
-  if (fingerprint(before.target) !== fingerprint(after.target) && after.parentRunId !== before.id) notes.push('Испытуемый в прогонах разный: выберите повтор того же агента.');
+  const rejudgedPair = !!before.assessmentOf && !!after.assessmentOf && before.assessmentOf !== after.assessmentOf
+    && after.sourceEvidence?.runId === after.assessmentOf && after.sourceEvidence.parentRunId === before.assessmentOf;
+  if (fingerprint(before.target) !== fingerprint(after.target) && after.parentRunId !== before.id && !rejudgedPair) notes.push('Испытуемый в прогонах разный: выберите повтор того же агента.');
   if (fingerprint(before.settings) !== fingerprint(after.settings)) notes.push('Настройки, модель, режимы пользователя или число повторов отличаются.');
+  if ((before.assessmentOf || after.assessmentOf) && !rejudgedPair) notes.push('Это переоценка сохранённых ответов. Для сравнения версий переоцените оба исходных прогона в одинаковых условиях.');
+  if (before.evaluatorVersion !== after.evaluatorVersion) notes.push('Версия оценщика или его инструкций отличается. Сначала переоцените сохранённые трассы в одинаковых условиях.');
   if (fingerprint(before.sources) !== fingerprint(after.sources) || fingerprint(before.requirements) !== fingerprint(after.requirements)) notes.push('Материалы или требования изменились.');
   if (result.cards.onlyBefore.length || result.cards.onlyAfter.length) notes.push('Набор карточек изменился.');
   const changed = shared.filter(s => fingerprint(s) !== fingerprint(before.scenarios.find(b => b.id === s.id)));
@@ -769,6 +789,55 @@ export function compareRuns(before: Experiment, after: Experiment): RunCompariso
   const smoke = result.regressed.filter(r => r.tier === 'smoke').length;
   if (smoke) notes.push(`Сломано ${smoke} дымовых карточек: сначала восстановите базовое поведение.`);
   if (compared < TRUSTED_SAMPLE) notes.push(`Сравнение по ${compared} карточкам: разница может быть случайной. Повторы не создают новые ситуации.`);
-  if (before.target.kind !== 'sandbox' && (!before.targetVersion || !after.targetVersion)) notes.push('Не все версии внешнего агента названы. Локальный отпечаток не учитывает удалённые сервисы и переменные окружения.');
+  if (before.target.kind !== 'sandbox' && (!(before.targetVersion || before.targetRelease) || !(after.targetVersion || after.targetRelease))) notes.push('Не все версии внешнего агента названы. Локальный отпечаток не учитывает удалённые сервисы и переменные окружения.');
   return result;
+}
+
+/** Human-confirmed findings and observed spending, grouped by the actual user mode. */
+export function pilotSummary(record: Experiment) {
+  const reviews = latestHumanReviews(record);
+  const findings = humanFindings(record);
+  const badSimulator = (t: Trial) => simulatorWasUsed(t) && (record.scenarios.find(s => s.id === t.scenarioId)?.metrics?.some(m => m.subject === 'simulator'
+    && (t.assessments?.some(a => a.metricId === m.id && a.result === 'fail') || reviews.get(`${t.id}|metric:${m.id}`)?.verdict === 'fail')) ?? false);
+  const valid = (t: Trial) => measured(t) && reviews.get(`${t.id}|dialogue`)?.verdict !== 'invalid' && !badSimulator(t);
+  const modes = record.settings.userModes.map(userMode => {
+    const trials = record.trials.filter(t => t.userMode === userMode);
+    const failures = findings.filter(f => f.verdict === 'fail' && !['simulator', 'test'].includes(f.subject)
+      && trials.some(t => t.id === f.trialId && valid(t)));
+    const keys = [...new Set(failures.map(f => `${trials.find(t => t.id === f.trialId)!.familyId}: ${f.target}`))];
+    const exclusive = [...new Set(failures.filter(f => {
+      const trial = trials.find(t => t.id === f.trialId)!;
+      const scenario = record.scenarios.find(s => s.id === trial.scenarioId)!;
+      const otherModes = record.settings.userModes.filter(m => m !== userMode && (m !== 'scripted' || scenario.user.script !== undefined));
+      return otherModes.length > 0 && otherModes.every(mode => {
+        const peers = record.trials.filter(t => t.scenarioId === trial.scenarioId && t.userMode === mode);
+        return peers.length === record.settings.repeats && peers.every(t => valid(t) && automaticTrialResult(scenario, t) === 'pass'
+          && !findings.some(x => x.trialId === t.id && x.verdict === 'fail' && x.subject !== 'simulator'));
+      });
+    }).map(f => `${trials.find(t => t.id === f.trialId)!.familyId}: ${f.target}`))];
+    const external = trials.filter(t => t.externalUsage);
+    const timed = record.humanReviews.filter(r => trials.some(t => t.id === r.trialId) && r.durationMs !== undefined);
+    return { userMode, trials: trials.length, confirmedFailures: failures.length, confirmedFailureKeys: keys, exclusiveConfirmed: exclusive,
+      simulatorFailures: trials.filter(badSimulator).length, invalid: trials.filter(t => !measured(t)).length,
+      excluded: trials.filter(t => measured(t) && !valid(t)).length,
+      assessmentIncomplete: trials.filter(t => !trialAssessmentComplete(record.scenarios.find(s => s.id === t.scenarioId)!, t)).length,
+      elapsedMs: trials.reduce((n, t) => n + t.elapsedMs, 0), reviewMs: timed.length ? timed.reduce((n, r) => n + r.durationMs!, 0) : null,
+      labCostUsd: trials.some(t => t.usage.costUsd === null) ? null : trials.reduce((n, t) => n + t.usage.costUsd!, 0),
+      externalCostUsd: !trials.length || external.length !== trials.length || external.some(t => t.externalUsage!.costUsd === null)
+        ? null : external.reduce((n, t) => n + t.externalUsage!.costUsd!, 0),
+      externalReportedTrials: external.length, externalCalls: external.reduce((n, t) => n + t.externalUsage!.calls, 0) };
+  });
+  return { modes, conclusion: modes.some(m => m.userMode === 'reactive' && m.exclusiveConfirmed.length)
+    ? 'В этих карточках реактивный режим нашёл дополнительные подтверждённые человеком провалы; результат относится только к измеренной выборке.'
+    : 'Дополнительная польза реактивного режима пока не подтверждена человеком на сопоставимых попытках.',
+    limitation: 'Группы family + критерий не устанавливают независимые причины ошибок. Время разбора — время открытого диалога и формы вердикта, включая простой; старые записи могли учитывать только форму. Расходы внешнего Pi-разговора неизвестны.' };
+}
+
+/** Shared CLI exit status: infrastructure/incomplete measurement takes precedence over an agent failure. */
+export function evaluationExitCode(record: Experiment): 0 | 1 | 2 {
+  const v = verdictSummary(record);
+  const incomplete = !['results_review', 'complete'].includes(record.phase) || v.execution.invalid > 0 || v.execution.cancelled > 0
+    || v.execution.missing > 0 || v.rubric.unknown > 0 || v.simulatorFlagged > 0
+    || record.trials.some(t => t.assessmentError || (t.outcome === 'ungraded' && agentRubricResult(record.scenarios.find(s => s.id === t.scenarioId), t) === undefined));
+  return incomplete ? 2 : record.trials.some(t => isAgentFailure(record, t)) ? 1 : 0;
 }

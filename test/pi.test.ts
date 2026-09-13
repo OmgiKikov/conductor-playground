@@ -54,20 +54,22 @@ function callContext(options: { timeoutMs?: number; signal?: AbortSignal; limit?
   return { ctx, usage };
 }
 
-async function fixture(reply: (request: Request, index: number, options?: Options) => Reply | Promise<Reply>) {
+async function fixture(reply: (request: Request, index: number, options?: Options) => Reply | Promise<Reply>, roleModel = false) {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-pi-'));
   const requests: Request[] = [];
+  const modelsUsed: string[] = [];
   const runtime = await ModelRuntime.create({
     authPath: join(directory, 'auth.json'), modelsPath: null,
     modelsStorePath: join(directory, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false,
   });
   runtime.registerProvider('agent-lab-test', {
     api: 'openai-completions', apiKey: 'fixture-only-not-a-real-key', baseUrl: 'http://127.0.0.1:1',
-    models: [{
-      id: 'test-model', name: 'Offline SDK fixture', reasoning: false, input: ['text'],
+    models: (roleModel ? ['test-model', 'role-model'] : ['test-model']).map(id => ({
+      id, name: 'Offline SDK fixture', reasoning: false, input: ['text'],
       cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }, contextWindow: 200000, maxTokens: 16384,
-    }],
+    })),
     streamSimple(model, request, options) {
+      modelsUsed.push(model.id);
       const index = requests.length;
       requests.push(JSON.parse(JSON.stringify(request)));
       const finished = (async (): Promise<Message> => {
@@ -92,7 +94,7 @@ async function fixture(reply: (request: Request, index: number, options?: Option
     },
   });
   return {
-    runtime, requests, directory,
+    runtime, requests, directory, modelsUsed,
     adapter: await createPiRuntime(settings, runtime),
     async close() { await rm(directory, { recursive: true, force: true }); },
   };
@@ -381,33 +383,37 @@ test('card generation distinguishes the answer being sought from legitimate prio
   } finally { await f.close(); }
 });
 
-test('isolated assessment uses approved rubrics and trace evidence without inheriting deterministic verdicts', async () => {
-  const assessments = [
-    { metricId: 'goal', result: 'pass', rationale: 'The reply provides the support contact.', evidence: [1] },
-    { metricId: 'fidelity', result: 'unknown', rationale: 'No reactive user turn occurred.', evidence: [] },
-  ];
-  const f = await fixture(() => JSON.stringify({ assessments }));
+test('isolated assessment repairs citations, limits static scope and preserves observation boundaries', async () => {
+  const f = await fixture((_request, index) => JSON.stringify({ findings: [{ criterion: reviewFields.metrics[0]!.passCriteria,
+    result: 'pass', rationale: 'The reply provides the support contact.', citations: [{ seq: index ? 1 : 999, quote: 'support@example.test' }] }] }));
   try {
     const scenario: Scenario = { ...plainCard(0), split: 'dev' };
+    scenario.user.script = ['UNDELIVERED_FOLLOWUP_SENTINEL']; scenario.user.maxFollowUps = 1;
     const trial: Trial = {
       id: 'trial_1', revisionId: 'revision_1', scenarioId: scenario.id, familyId: scenario.familyId, repeat: 0,
       split: 'dev', userMode: 'static', manifestHash: 'hash', outcome: 'fail', reason: 'DETERMINISTIC_GRADE_SENTINEL', checks: [],
       events: [{ seq: 0, type: 'user', text: 'How do I contact support?' }, { seq: 1, type: 'assistant', text: 'Email support@example.test.' }],
       initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 1,
+      observation: { state: 'missing', tools: 'partial' },
     };
     const { ctx, usage } = callContext();
-    assert.deepEqual(await f.adapter.assess!({ scenario, sources: [], trial }, ctx), assessments);
-    assert.equal(usage.calls, 1);
+    const scored = await f.adapter.assess!({ scenario, sources: [], trial }, ctx);
+    assert.equal(scored[0]?.result, 'pass'); assert.deepEqual(scored[0]?.evidence, [1]);
+    assert.equal(scored[0]?.findings?.[0]?.citations[0]?.quote, 'support@example.test'); assert.equal(scored[1]?.result, 'unknown');
+    assert.equal(usage.calls, 2, 'An invented citation is repaired in the same bounded judge session');
     assert.deepEqual(f.requests[0]?.tools, []);
     const payload = JSON.stringify(f.requests[0]?.messages);
     assert.match(payload, /passCriteria|support@example.test/);
     assert.match(payload, /userMode.*static/);
     assert.doesNotMatch(payload, /DETERMINISTIC_GRADE_SENTINEL/);
+    assert.doesNotMatch(payload, /UNDELIVERED_FOLLOWUP_SENTINEL/);
+    assert.match(payload, /observation.*missing.*partial/);
+    assert.match(payload, /finalState\\?":null/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /actual event seq number/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /provisional model estimates for human review/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /check each continuation against the stopping rule/);
     assert.deepEqual(await f.adapter.assess!({ scenario: { ...scenario, metrics: undefined }, sources: [], trial }, ctx), []);
-    assert.equal(usage.calls, 1, 'Legacy cards without rubrics do not incur a judge call');
+    assert.equal(usage.calls, 2, 'Legacy cards without rubrics do not incur a judge call');
   } finally { await f.close(); }
 });
 
@@ -659,5 +665,22 @@ test('external semantic cards require an agent rubric when no literal check cove
     assert.deepEqual(prepared.scenarios[0]!.checks, []);
     assert.equal(prepared.scenarios[0]!.metrics!.filter(m => m.subject === 'agent').length, 1);
     assert.equal(prepared.scenarios[0]!.metrics!.filter(m => m.subject === 'simulator').length, 1);
+  } finally { await f.close(); }
+});
+
+
+test('role overrides select the actual SDK model independently for simulation and judging', async () => {
+  const f = await fixture((_request, index) => JSON.stringify(index === 0 ? { message: '', done: true }
+    : { findings: [{ criterion: reviewFields.metrics[0]!.passCriteria, result: 'pass', rationale: 'Recorded reply provides help', citations: [{ seq: 1, quote: 'Here is help' }] }] }), true);
+  try {
+    const adapter = await createPiRuntime(settingsSchema.parse({ ...settings, roles: { judge: { provider: settings.provider, model: 'role-model' } } }), f.runtime);
+    const scenario = { ...plainCard(0), split: 'dev' as const, metrics: [reviewFields.metrics[0]!] };
+    await adapter.userTurn({ user: scenario.user, messages: [{ role: 'user', content: 'Help' }, { role: 'assistant', content: 'Here is help' }], turn: 0 }, callContext().ctx);
+    const trial: Trial = { id: 't', scenarioId: scenario.id, familyId: scenario.familyId, revisionId: 'r', userMode: 'static', repeat: 0, split: 'dev',
+      manifestHash: 'hash', outcome: 'ungraded', reason: '', checks: [], initialState: scenario.initialState, finalState: scenario.initialState,
+      usage: emptyUsage(), elapsedMs: 1, events: [{ seq: 0, type: 'user', text: 'Help' }, { seq: 1, type: 'assistant', text: 'Here is help' }] };
+    const result = await adapter.assess!({ scenario, sources: [], trial }, callContext().ctx);
+    assert.equal(result[0]!.result, 'pass');
+    assert.deepEqual(f.modelsUsed, ['test-model', 'role-model']);
   } finally { await f.close(); }
 });

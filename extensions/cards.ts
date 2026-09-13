@@ -40,8 +40,8 @@ export type BoardAction =
   | { type: 'new' }
   | { type: 'demo' }
   | { type: 'open'; id: string }
-  | { type: 'edit' | 'discuss' | 'settings' | 'run' | 'annotate' | 'finalize' | 'export' | 'openReport' | 'cancel' | 'repeat' | 'compare'; record: Experiment; section: Section; selected: number; query?: string; pendingOnly?: boolean; trialId?: string }
-  | { type: 'verdict'; verdict: 'pass' | 'fail'; record: Experiment; section: Section; selected: number; query?: string; pendingOnly?: boolean; trialId?: string };
+  | { type: 'edit' | 'discuss' | 'settings' | 'run' | 'annotate' | 'finalize' | 'export' | 'openReport' | 'cancel' | 'repeat' | 'compare'; record: Experiment; section: Section; selected: number; query?: string; pendingOnly?: boolean; trialId?: string; reviewMs?: number }
+  | { type: 'verdict'; verdict: 'pass' | 'fail'; record: Experiment; section: Section; selected: number; query?: string; pendingOnly?: boolean; trialId?: string; reviewMs?: number };
 export interface BoardOptions {
   records?: Experiment[];
   record?: Experiment;
@@ -55,6 +55,7 @@ export interface BoardOptions {
   reportPath?: string;
   query?: string;
   pendingOnly?: boolean;
+  reviewTimes?: Map<string, number>;
 }
 type BoardTheme = Pick<Theme, 'fg' | 'bold'>;
 type Line = { text: string; color?: ThemeColor; bold?: boolean };
@@ -123,6 +124,8 @@ function trialLines(trial: Trial, record: Experiment, expanded: boolean): Line[]
     ...findings.map(f => line(expanded ? humanFindingText(f) : humanFindingText(f).slice(0, 240), 'warning')),
     ...(record.workflow !== 'evaluate' ? [line(`Версия агента: ${trial.revisionId}`, 'muted')] : []),
     line(trial.reason),
+    ...(trial.observation ? [line(`Наблюдение: состояние ${trial.observation.state} · события ${trial.observation.tools} · сброс ${trial.observation.resetConfirmed === true ? 'заявлен' : 'не подтверждён'}`, 'muted')] : []),
+    ...(trial.externalUsage ? [line(`Внешний агент: ${trial.externalUsage.calls} вызовов · стоимость ${trial.externalUsage.costUsd === null ? 'неизвестна' : `$${trial.externalUsage.costUsd.toFixed(4)}`}`, 'muted')] : []),
     line(`Модель лаборатории: ${trial.usage.calls} вызовов · ${(trial.elapsedMs / 1000).toFixed(1)} с · стоимость ${trial.usage.costUsd === null ? 'неизвестна' : `$${trial.usage.costUsd.toFixed(4)}`}`, 'muted'),
     ...(record.target.kind !== 'sandbox' ? [line('Вызовы и расходы внешнего агента в эту оценку не входят.', 'muted')] : []),
     line(''), line('ДЕТЕРМИНИРОВАННЫЕ ПРОВЕРКИ', 'accent'),
@@ -254,6 +257,10 @@ function statsLines(record: Experiment): Line[] {
     rows.push(line(`${m.userMode}: ${m.passed}/${m.valid} пройдено (${pct(m.passRate)}) · диалогов ${m.trials} · реплик пользователя ${num(m.avgUserTurns, 1)} · вызовов ${m.calls} · стоимость ${m.costUsd === null ? 'неизвестна' : `$${m.costUsd.toFixed(4)}`}`));
     if (m.uniqueFailedChecks.length) rows.push(line(`  провалы, найденные только в этом режиме: ${m.uniqueFailedChecks.join(', ')}`, 'warning'));
   }
+  if (record.trials.length) {
+  rows.push(line(''), line('Подтверждённые находки и расходы', 'accent'), line(e.pilot.conclusion));
+  for (const m of e.pilot.modes) rows.push(line(`${m.userMode}: групп ${m.confirmedFailureKeys.length} · только здесь ${m.exclusiveConfirmed.length} · сбои симулятора ${m.simulatorFailures} · внешний агент ${m.externalCostUsd === null ? 'цена неизвестна' : '$' + m.externalCostUsd.toFixed(4)} · форма разбора ${m.reviewMs === null ? 'время неизвестно' : (m.reviewMs / 1000).toFixed(1) + ' с'}`));
+  }
   rows.push(line(''), line('Калибровка судьи · человек против модели, положительный класс = ошибка', 'accent'));
   if (!e.calibration.length) rows.push(line('Метрик и проверок нет.', 'muted'));
   for (const c of e.calibration) {
@@ -283,7 +290,7 @@ function comparisonLines(comparison?: RunComparison, before?: Experiment, after?
   const current = after.trials.find(t => t.id === pair.afterTrialId);
   if (!original || !current) return rows;
   const scenario = after.scenarios.find(s => s.id === pair.scenarioId);
-  const version = (r: Experiment) => r.targetVersion ?? r.targetFingerprint?.slice(0, 12) ?? r.id.slice(0, 8);
+  const version = (r: Experiment) => r.targetVersion ?? r.targetRelease ?? r.targetFingerprint?.slice(0, 12) ?? r.id.slice(0, 8);
   const pairRows = [
     line(scenario?.title ?? pair.scenarioId, 'accent', true),
     line(`${pair.userMode} · повтор ${pair.repeat + 1} · ${version(before)} → ${version(after)}`, 'muted'),
@@ -323,6 +330,8 @@ export class LabBoard implements Component {
   private pendingOnly: boolean;
   private searching = false;
   private help = false;
+  private viewedTrial?: string;
+  private viewedAt = performance.now();
 
   constructor(private options: BoardOptions, private theme: BoardTheme, private done: (action: BoardAction) => void,
     private redraw: () => void, private rows: () => number = () => 32) {
@@ -358,7 +367,17 @@ export class LabBoard implements Component {
   }
   dispose() { this.disposed = true; clearInterval(this.timer); }
   invalidate() {}
-  private finish(action: BoardAction) { this.dispose(); this.done(action); }
+  private recordReading(next?: string) {
+    const now = performance.now();
+    const times = this.options.reviewTimes ??= new Map();
+    if (this.viewedTrial) times.set(this.viewedTrial, Math.min(3600000, (times.get(this.viewedTrial) ?? 0) + now - this.viewedAt));
+    this.viewedTrial = next; this.viewedAt = now;
+  }
+  private finish(action: BoardAction) {
+    this.recordReading();
+    if ((action.type === 'verdict' || action.type === 'annotate') && action.trialId) action.reviewMs = Math.round(this.options.reviewTimes?.get(`${action.record.id}|${action.trialId}`) ?? 0);
+    this.dispose(); this.done(action);
+  }
   private comparisonPairs(): RunComparison['pairs'] {
     return this.options.comparison?.pairs ?? [];
   }
@@ -443,6 +462,8 @@ export class LabBoard implements Component {
     width = Math.max(1, Math.floor(width));
     const height = Math.max(4, this.rows());
     const entries = this.entries();
+    const reading = this.section === 'results' && !this.help && !this.searching ? entries[this.selected]?.id : undefined;
+    this.recordReading(reading ? `${this.record!.id}|${reading}` : undefined);
     const sidebar = !this.help && width >= 110 && entries.length > 0 ? 32 : 0;
     const inner = Math.max(1, width - 4 - (sidebar ? sidebar + 3 : 0));
     const paint = (row: Line) => {
@@ -511,7 +532,9 @@ export class LabBoard implements Component {
         ...(record.error ? [line('НЕ УДАЛОСЬ ЗАВЕРШИТЬ', 'warning'), line(record.error), line('a Обсудить исправление с Pi · исходные данные сохранены'), line('')] : []),
         ...(record.questions.length ? [line('ТРЕБУЮТСЯ УТОЧНЕНИЯ', 'warning'), ...record.questions.map(q => line(`• ${q}`)), line('Нажмите a и ответьте своими словами. Pi подготовит уточнённый черновик.')] : []),
         line(''), line('ПОДКЛЮЧЕНИЕ', 'accent'), line(record.target.kind === 'sandbox' ? agent?.name ?? 'Песочница' : record.target.kind === 'module' ? record.target.path : record.target.kind === 'http' ? record.target.url : [record.target.command, ...record.target.args].join(' ')),
-        line(`Версия: ${record.targetVersion ?? record.targetFingerprint?.slice(0, 12) ?? 'не указана'}`, 'muted'),
+        ...(record.assessmentOf ? [line(`Переоценка ${record.assessmentOf} · агент не запускался`, 'warning')] : []),
+        line(`Оценщик: ${record.evaluatorVersion?.slice(0, 12) ?? 'версия не записана'}`, 'muted'),
+        line(`Версия: ${record.targetVersion ?? record.targetRelease ?? record.targetFingerprint?.slice(0, 12) ?? 'не указана'}`, 'muted'),
         ...(this.expanded ? [line(agent?.instructions ?? '')] : []),
         ...(record.target.kind === 'sandbox' ? [line(`Инструменты: ${agent?.tools.join(', ') || 'нет'}`, 'muted')] : []),
         line(''), line('ПЛАН ПРОГОНА', 'accent'), line(`${record.scenarios.length} карточек · ${plannedTrials(record)} диалогов · ${record.settings.userModes.join(' / ')}`),

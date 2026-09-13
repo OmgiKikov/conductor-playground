@@ -8,6 +8,26 @@ import { z } from 'zod';
 import { editDraft, inputError } from '../extensions/editor.ts';
 import { ExperimentLab, draftHash } from '../src/experiment.js';
 import { demoEvaluationInput } from '../src/demo.js';
+import { previewCriteria } from '../src/preview.js';
+
+test('the native example editor invokes the semantic judge and shows both verdicts after confirmation', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-semantic-editor-'));
+  const lab = new ExperimentLab(directory); await lab.init();
+  t.after(async () => { await lab.close(); await rm(directory, { recursive: true, force: true }); });
+  const created = await lab.create(demoEvaluationInput()); await lab.waitForIdle(); const record = await lab.get(created.id);
+  const answers = ['A good answer', 'A bad answer']; let calls = 0; let output = '';
+  const ctx = { signal: new AbortController().signal, ui: {
+    select: async (title: string) => { if (title.startsWith('Что изменить')) return 'Проверить ожидание на примерах'; output = title; return 'Закрыть'; },
+    editor: async () => answers.shift(), confirm: async () => true,
+  } } as unknown as ExtensionContext;
+  await editDraft(ctx, { type: 'edit', record, section: 'cards', selected: 0 }, undefined,
+    (id, examples) => previewCriteria(record, id, examples, { directory, runtime: { async assess({ scenario, trial }, context) {
+      calls++; context.beforeCall();
+      return scenario.metrics.map(m => ({ metricId: m.id, result: trial.events.at(-1).text.includes('good') ? 'pass' : 'fail', evidence: [1], rationale: 'Semantic fixture result' }));
+    } } as never }));
+  assert.equal(calls, 2); assert.match(output, /pass ·/); assert.match(output, /fail ·/); assert.match(output, /Semantic fixture result/);
+  assert.match(output, /версии и расход сохранены/);
+});
 
 test('native editor retains invalid input, validates the correction and changes only the selected card', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-editor-'));
@@ -86,4 +106,33 @@ test('native connection fields preserve argv boundaries, validate changes and re
   choices.push('Подключение агента', 'Аргументы · по одному в строке');
   ctx.ui.editor = async (title, input) => { assert.match(title, /JSON/); assert.deepEqual(JSON.parse(input!).args, ['']); return undefined; };
   assert.equal(await editDraft(ctx, action), undefined, 'unsupported text representations fall back without changing argv');
+});
+
+test('expectations can be edited as fields and previewed without JSON while other criteria survive', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-expectation-'));
+  const lab = new ExperimentLab(directory); await lab.init();
+  t.after(async () => { await lab.close(); await rm(directory, { recursive: true, force: true }); });
+  const created = await lab.create(demoEvaluationInput()); await lab.waitForIdle();
+  const record = await lab.get(created.id);
+  const original = record.scenarios[0]!;
+  const choices = ['Критерий успеха', 'Добавить ожидание', 'Нет фразы'];
+  const fields = ['Не раскрывать секрет', 'internal_key'];
+  const ctx = { ui: { select: async () => choices.shift(), editor: async () => fields.shift() } } as unknown as ExtensionContext;
+  const patch = await editDraft(ctx, { type: 'edit', record, section: 'cards', selected: 0 });
+  const changed = await lab.updateDraft(record.id, draftHash(record), patch!);
+  assert.deepEqual(changed.scenarios[0]!.checks.slice(0, -1), original.checks);
+  assert.deepEqual(changed.scenarios[0]!.metrics, original.metrics);
+  assert.equal(changed.scenarios[0]!.checks.at(-1)?.kind, 'answer_omits');
+  assert.match(changed.scenarios[0]!.successCriteria!, /Не раскрывать секрет/);
+  const previews: string[] = []; const replies = ['Safe answer', 'internal_key']; let selections = 0;
+  ctx.ui.select = async title => { if (++selections === 1) return 'Проверить ожидание на примерах'; previews.push(title); return 'Закрыть'; };
+  ctx.ui.editor = async () => replies.shift();
+  await editDraft(ctx, { type: 'edit', record: changed, section: 'cards', selected: 0 });
+  assert.match(previews[0]!, /✓ Не раскрывать секрет/); assert.match(previews[0]!, /✕ Не раскрывать секрет/);
+  assert.match(previews[0]!, /Нужны трасса или судья/);
+  let roles = await lab.updateDraft(changed.id, draftHash(changed), { settings: { roles: { builder: { provider: 'fixture', model: 'builder' } } } });
+  roles = await lab.updateDraft(roles.id, draftHash(roles), { settings: { roles: { judge: { provider: 'fixture', model: 'judge' } } } });
+  assert.equal(roles.settings.roles.builder?.model, 'builder');
+  roles = await lab.updateDraft(roles.id, draftHash(roles), { settings: { roles: { judge: null } } });
+  assert.equal(roles.settings.roles.judge, undefined); assert.equal(roles.settings.roles.builder?.model, 'builder');
 });

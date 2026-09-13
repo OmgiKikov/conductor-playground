@@ -1,9 +1,9 @@
 import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { Experiment } from './contracts.js';
+import { fingerprint, type Experiment } from './contracts.js';
 import type { ExperimentStore } from './store.js';
-import { compareRuns, evidenceSummary, type EvidenceSummary, type RunComparison } from './comparison.js';
+import { compareRuns, evidenceSummary, judgeCalibration, type CalibrationRow, type EvidenceSummary, type RunComparison } from './comparison.js';
 import { htmlReport, jsonReport, markdownReport } from './report.js';
 
 export interface EvidenceBundle {
@@ -12,6 +12,7 @@ export interface EvidenceBundle {
   before?: Experiment;
   comparison?: RunComparison;
   comparisonSource?: { kind: 'parent' | 'selected'; beforeId: string; afterId: string };
+  calibrationComparison?: { sourceRunId: string; reviewIds: string[]; beforeVersion?: string; afterVersion?: string; before: CalibrationRow[]; after: CalibrationRow[] };
   warnings: string[];
   traceJournal: string;
 }
@@ -24,7 +25,23 @@ export async function evidenceBundle(record: Experiment, store: Pick<ExperimentS
   const parent = beforeId ?? snapshot.parentRunId;
   if (parent) {
     bundle.comparisonSource = { kind: beforeId && beforeId !== snapshot.parentRunId ? 'selected' : 'parent', beforeId: parent, afterId: snapshot.id };
-    try { bundle.before = await store.get(parent); bundle.comparison = compareRuns(bundle.before, snapshot); }
+    try {
+      bundle.before = await store.get(parent); bundle.comparison = compareRuns(bundle.before, snapshot);
+      if (snapshot.assessmentOf === bundle.before.id) {
+        const before = bundle.before;
+        const reviews = before.humanReviews.filter(review => {
+          const original = before.trials.find(t => t.id === review.trialId), current = snapshot.trials.find(t => t.id === review.trialId);
+          if (!original || !current || fingerprint([original.events, original.initialState, original.finalState]) !== fingerprint([current.events, current.initialState, current.finalState])) return false;
+          const a = before.scenarios.find(s => s.id === original.scenarioId), b = snapshot.scenarios.find(s => s.id === current.scenarioId);
+          // A label for a changed criterion is not ground truth for the new criterion.
+          const oldCriterion = review.metricId ? a?.metrics?.find(m => m.id === review.metricId) : a?.checks.find(c => c.id === review.checkId);
+          const newCriterion = review.metricId ? b?.metrics?.find(m => m.id === review.metricId) : b?.checks.find(c => c.id === review.checkId);
+          return oldCriterion && newCriterion && fingerprint(oldCriterion) === fingerprint(newCriterion);
+        });
+        bundle.calibrationComparison = { sourceRunId: before.id, reviewIds: reviews.map(r => r.id), beforeVersion: before.evaluatorVersion,
+          afterVersion: snapshot.evaluatorVersion, before: judgeCalibration({ ...before, humanReviews: reviews }), after: judgeCalibration({ ...snapshot, humanReviews: reviews }) };
+      }
+    }
     catch (error) { bundle.warnings.push(`Базовый прогон ${parent} недоступен. Сравнение не выполнено; текущие доказательства сохранены. ${failureText(error)}`); }
   }
   try { bundle.traceJournal = await store.traceJournal(snapshot.id); }

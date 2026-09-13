@@ -32,6 +32,7 @@ def handle(request, records):
 
 
 records = None  # One process per dialogue: retain state until close, then reset in the next process.
+turn = 0
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -41,5 +42,11 @@ for line in sys.stdin:
         break
     if records is None:
         records = json.loads(json.dumps(request["initialState"]["records"]))
-    sys.stdout.write(json.dumps(handle(request, records), ensure_ascii=False) + "\n")
+    turn += 1
+    reply = handle(request, records)
+    reply.update(eventsComplete=True, resetConfirmed=True, turn=turn, version="echo-python-1",
+                 usage={"calls": 0, "inputTokens": 0, "outputTokens": 0, "costUsd": 0})
+    if request.get("sessionId"):
+        reply["sessionId"] = request["sessionId"]
+    sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
     sys.stdout.flush()
