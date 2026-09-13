@@ -182,7 +182,7 @@ export async function evaluateTrial(input: {
     trial.finalState = structuredClone(state);
     trial.checks = grade(scenario, trial);
     const allPassed = trial.checks.length > 0 && trial.checks.every(check => check.passed);
-    trial.outcome = !stopped ? 'fail' : trial.checks.length === 0 ? 'ungraded' : allPassed ? 'pass' : 'fail';
+    trial.outcome = !stopped ? 'invalid' : trial.checks.length === 0 ? 'ungraded' : allPassed ? 'pass' : 'fail';
     trial.reason ||= !stopped ? 'Разговор не завершился в отведённое число реплик.' : trial.checks.length === 0
       ? 'Диалог дошёл до конца, но объективных проверок в карточке нет: оценки по рубрикам считаются отдельно.'
       : allPassed ? 'Все объективные проверки пройдены.' : 'Часть объективных проверок провалена.';
@@ -214,7 +214,11 @@ export async function evaluateTrial(input: {
       onStage?.('assessment');
       const assessments = z.array(metricAssessmentSchema).parse(await runtime.assess({
         scenario: structuredClone(scenario), sources: structuredClone(sources), trial: structuredClone(trial),
-      }, { ...localCtx, onTargetEvent: undefined, onTrace: undefined }));
+      }, { ...localCtx, onTargetEvent: undefined, onTrace: undefined, onJudgment: (id, audit) => {
+        trial.judgeAudit = structuredClone(audit);
+        try { ctx.onJudgment?.(id, audit); }
+        catch (error) { persistenceFailed = true; persistenceError = error; throw error; }
+      } }));
       ctx.signal.throwIfAborted();
       const metricIds = new Set(scenario.metrics.map(metric => metric.id));
       if (metricIds.size !== scenario.metrics.length || assessments.length !== metricIds.size
@@ -228,6 +232,7 @@ export async function evaluateTrial(input: {
       }
       trial.assessments = assessments;
     } catch (error) {
+      if (persistenceFailed) throw persistenceError;
       trial.assessmentError = (ctx.signal.aborted ? 'Metric assessment cancelled' : error instanceof Error ? error.message : 'Metric assessment failed').slice(0, 4000);
     }
     trial.elapsedMs = Math.round(performance.now() - started);

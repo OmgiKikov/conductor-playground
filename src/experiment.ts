@@ -342,6 +342,7 @@ export class ExperimentLab {
         record.usage.costUsd = usage.costUsd === null || record.usage.costUsd === null ? null : record.usage.costUsd + usage.costUsd;
       },
       onTrace: (trialId, event) => this.store.appendTrace(record.id, trialId, event),
+      onJudgment: (trialId, audit) => this.store.appendJudgment(record.id, trialId, audit),
     };
     active.done = (async () => {
       try {

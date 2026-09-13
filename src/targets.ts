@@ -83,6 +83,7 @@ export const externalReplySchema = z.union([
   z.string().max(20000),
   z.strictObject({
     reply: z.string().max(20000),
+    measurementError: z.string().trim().min(1).max(2000).optional(),
     events: z.array(z.strictObject({ tool: z.string().min(1).max(200), args: z.unknown().optional(), result: z.unknown().optional() })).max(50).default([]),
     records: z.record(identifier, z.record(identifier, scalarSchema)).refine(v => Object.keys(v).length <= 30, 'Too many records').optional(),
   }),
@@ -100,11 +101,15 @@ function applyReply(raw: unknown, state: World, ctx: CallContext, onRecords?: ()
   const parsed = externalReplySchema.safeParse(raw);
   if (!parsed.success) throw new Error(`External agent reply does not match the contract: ${parsed.error.issues.map(i => i.path.join('.') || 'reply').join(', ')}`);
   if (typeof parsed.data === 'string') return parsed.data;
-  const { reply, events, records } = parsed.data;
+  const { reply, events, records, measurementError } = parsed.data;
   if (records) { state.records = structuredClone(records); onRecords?.(); }
   for (const event of events) {
     ctx.onTargetEvent?.({ type: 'tool_call', tool: event.tool, args: event.args });
     ctx.onTargetEvent?.({ type: 'tool_result', tool: event.tool, result: event.result, state });
+  }
+  if (measurementError) {
+    if (reply.trim()) ctx.onTargetEvent?.({ type: 'assistant', text: reply });
+    throw new Error(`Ошибка измерения внешнего агента: ${measurementError}`);
   }
   return reply;
 }

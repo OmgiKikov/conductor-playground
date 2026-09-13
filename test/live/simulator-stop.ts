@@ -1,5 +1,5 @@
 // Opt-in model regression: node --import tsx test/live/simulator-stop.ts PROVIDER MODEL
-// Twelve model calls. No target-agent calls and no business-policy verdicts.
+// Sixteen model calls (eight simulator turns and four pairs of judge calls). No target-agent calls and no business-policy verdicts.
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createPiRuntime } from '../../src/pi.js';
@@ -10,12 +10,12 @@ assert(provider && model, 'Usage: node --import tsx test/live/simulator-stop.ts 
 const sample = JSON.parse(await readFile(new URL('./aigw-stop.json', import.meta.url), 'utf8')) as {
   user: Scenario['user']; events: TraceEvent[]; sourceTrialId: string;
 };
-const settings = settingsSchema.parse({ provider, model, maxCalls: 12, timeoutMs: 120000 });
+const settings = settingsSchema.parse({ provider, model, maxCalls: 16, timeoutMs: 120000 });
 const runtime = await createPiRuntime(settings);
 const usage = emptyUsage();
 const ctx: CallContext = {
   signal: AbortSignal.timeout(900000), timeoutMs: settings.timeoutMs,
-  beforeCall() { assert(usage.calls < 12, 'Model call budget exhausted'); usage.calls++; },
+  beforeCall() { assert(usage.calls < 16, 'Model call budget exhausted'); usage.calls++; },
   addUsage(value) { usage.inputTokens += value.inputTokens; usage.outputTokens += value.outputTokens; usage.costUsd = null; },
 };
 const cases = [
@@ -41,7 +41,7 @@ for (let repeat = 0; repeat < 2; repeat++) {
   }
   const world = { records: {}, writableFields: [], transientFailures: 0 };
   const scenario: Scenario = { id: 'stop', familyId: 'stop', title: 'Simulator stopping rule',
-    provenance: 'synthetic', requirementIds: [], user: sample.user, split: 'dev',
+    provenance: 'synthetic', tier: 'regression', requirementIds: [], user: sample.user, split: 'dev',
     initialState: world, checks: [], metrics: [simulatorFidelity] };
   for (const [expected, events] of [
     ['fail', sample.events],
