@@ -337,7 +337,9 @@ export interface TraceEvent {
   seq: number; type: 'user' | 'assistant' | 'simulator' | 'tool_call' | 'tool_result' | 'error';
   text?: string; tool?: string; args?: unknown; result?: unknown; state?: World;
 }
-export const assessmentEventContent = (event: TraceEvent): string => event.text ?? JSON.stringify({ tool: event.tool, args: event.args, result: event.result, state: event.state });
+export const assessmentEventContent = (event: TraceEvent): string =>
+  event.text !== undefined && [event.tool, event.args, event.result, event.state].every(value => value === undefined) ? event.text
+    : JSON.stringify({ text: event.text, tool: event.tool, args: event.args, result: event.result, state: event.state });
 export interface CheckResult { id: string; description: string; passed: boolean; evidence: string }
 export interface Trial {
   id: string; revisionId: string; scenarioId: string; familyId: string; repeat: number; userMode: UserMode;

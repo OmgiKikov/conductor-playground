@@ -71,6 +71,11 @@ test('judge input withholds case labels, prior grades, unobserved state and unde
   assert.doesNotMatch(JSON.stringify(data), /EXPECTED_FAIL|PRIOR_VERDICT_SECRET|UNDELIVERED|SECRET_STATE/);
   assert.equal(data.trial.finalState, null);
   assert.deepEqual(data.scenario.user.script, []);
+  const observed = judgeInput({ ...input, trial: { ...trial, events: [{ seq: 2, type: 'tool_result', text: 'Update succeeded',
+    tool: 'update_record', result: { ok: false, error: 'Write rejected' } }] } });
+  assert.deepEqual(JSON.parse(observed.trial.events[0]!.content), {
+    text: 'Update succeeded', tool: 'update_record', result: { ok: false, error: 'Write rejected' },
+  }, 'a textual tool summary must not hide the structured result');
 });
 
 test('journal failure stops judgment before another request and original replies survive store reopening', async t => {
