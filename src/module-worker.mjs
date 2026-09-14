@@ -13,7 +13,7 @@ try {
   for await (const line of createInterface({ input: process.stdin })) {
     const request = JSON.parse(line);
     if (request.type === 'open') {
-      session = await factory({ sessionId: request.sessionId, scenarioId: request.scenarioId, initialState: request.initialState });
+      session = await factory({ sessionId: request.sessionId, scenarioId: request.scenarioId, initialState: request.initialState, prompt: request.prompt, promptHash: request.promptHash });
       if (typeof session?.respond !== 'function') throw new Error('Module adapter must return a session with respond(message, messages).');
       process.stdout.write('""\n');
     } else if (request.type === 'close') break;

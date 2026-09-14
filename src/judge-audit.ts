@@ -39,7 +39,7 @@ export async function auditJudge(inputs: Input[], settings: Settings, directory:
   const manifest = { startedAt: new Date().toISOString(), settings, repeats, inputs, humanLabelsUsed: false,
     repetitionsAreConsensusBatches: true, requestsPerMetric: 2,
     requestsPerBatch: inputs.map(i => ({ trialId: i.trial.id, requests: 2 * (i.scenario.metrics ?? []).filter(m => metricApplies(m, i.trial)).length })),
-    sampling: `temperature=0; thinking=off; seed unset; upstream=${settings.judge?.upstream ?? 'provider default'}` };
+    sampling: `temperature=0 for non-reasoning models, provider default otherwise; thinking=medium when supported, off otherwise; seed unset; upstream=${!settings.roles?.judge && settings.judge?.upstream || 'provider default'}` };
   await writeFile(join(directory, 'inputs.json'), JSON.stringify(manifest, null, 2), { mode: 0o600 });
   const actor = runtime ?? await createPiRuntime(settings.judge ? { ...settings, provider: settings.judge.provider, model: settings.judge.model } : settings);
   const signal = AbortSignal.timeout(settings.maxDurationMs);

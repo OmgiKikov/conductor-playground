@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assessRepeated, hasCompleteJudgment, JUDGE_PROTOCOL } from '../src/judge.js';
+import { assessRepeated, hasCompleteJudgment, judgeInput, JUDGE_PROTOCOL } from '../src/judge.js';
 import { auditJudge, repeatability } from '../src/judge-audit.js';
 import { emptyUsage, settingsSchema, simulatorFidelity, type JudgeAudit, type Runtime, type Scenario, type Trial } from '../src/contracts.js';
 import { ExperimentStore } from '../src/store.js';
@@ -17,7 +17,7 @@ const trial: Trial = { id: 'trial', revisionId: 'revision', scenarioId: 'card', 
   initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 1 };
 const input = { scenario, sources: [], trial };
 const model = { provider: 'offline', id: 'test' };
-const row = (passCondition: string, failCondition: string, evidence = [1]) => JSON.stringify({ assessments: [{ metricId: 'goal', passCondition, failCondition, rationale: 'Explicit evidence for both conditions.', evidence }] });
+const row = (passCondition: string, failCondition: string, evidence = [1]) => JSON.stringify({ assessments: [{ metricId: 'goal', passCondition, failCondition, rationale: 'Explicit evidence for both conditions.', evidence, citations: evidence.map(seq => ({ seq, quote: 'Do this.' })) }] });
 
 test('judgment retains raw independent votes, rejects conflicting criteria, and never treats nonreactive fidelity as a pass', async () => {
   for (const [outputs, expected] of [
@@ -55,12 +55,27 @@ test('judgment retains raw independent votes, rejects conflicting criteria, and 
 });
 
 test('malformed, unsupported and invented judgments cannot escape validation or be repaired silently', async () => {
-  for (const raw of ['not json', row('met', 'not_met', [999]), row('met', 'not_met', []), '{"assessments":[]}']) {
+  for (const raw of ['not json', row('met', 'not_met', [999]), row('met', 'not_met', []),
+    row('met', 'not_met').replace('Do this.', 'Fabricated quotation.'), '{"assessments":[]}']) {
     let audit: JudgeAudit | undefined;
     let calls = 0;
     await assert.rejects(assessRepeated(input, model, { signal: new AbortController().signal, timeoutMs: 1000, beforeCall() {}, addUsage() {}, onJudgment(_id, a) { audit = a; } }, async () => { calls++; return raw; }), /Judge response rejected/);
     assert.equal(calls, 2); assert.equal(audit!.attempts[0]!.raw, raw); assert.ok(audit!.attempts.every(a => a.error));
   }
+});
+
+test('judge input withholds case labels, prior grades, unobserved state and undelivered static follow-ups', () => {
+  const data = judgeInput({ ...input, scenario: { ...scenario, id: 'EXPECTED_FAIL', title: 'EXPECTED_FAIL',
+    user: { ...scenario.user, script: ['UNDELIVERED'], maxFollowUps: 1 } },
+    trial: { ...trial, outcome: 'fail', finalState: { ...trial.finalState, records: { SECRET_STATE: { time: '11:00' } } } } });
+  assert.doesNotMatch(JSON.stringify(data), /EXPECTED_FAIL|PRIOR_VERDICT_SECRET|UNDELIVERED|SECRET_STATE/);
+  assert.equal(data.trial.finalState, null);
+  assert.deepEqual(data.scenario.user.script, []);
+  const observed = judgeInput({ ...input, trial: { ...trial, events: [{ seq: 2, type: 'tool_result', text: 'Update succeeded',
+    tool: 'update_record', result: { ok: false, error: 'Write rejected' } }] } });
+  assert.deepEqual(JSON.parse(observed.trial.events[0]!.content), {
+    text: 'Update succeeded', tool: 'update_record', result: { ok: false, error: 'Write rejected' },
+  }, 'a textual tool summary must not hide the structured result');
 });
 
 test('journal failure stops judgment before another request and original replies survive store reopening', async t => {
@@ -112,7 +127,7 @@ test('reactive fidelity applies to actual simulator decisions, including a decis
       const ids = JSON.parse(data).scenario.metrics.map((m: { id: string }) => m.id);
       assert.equal(ids.length, 1, 'each model call assesses exactly one rubric'); requests.push(ids);
       const answer = JSON.parse(row('met', 'not_met'));
-      if (ids[0] === 'user_fidelity') answer.assessments[0] = { ...answer.assessments[0], metricId: 'user_fidelity', evidence: [2] };
+      if (ids[0] === 'user_fidelity') answer.assessments[0] = { ...answer.assessments[0], metricId: 'user_fidelity', evidence: [2], citations: [{ seq: 2, quote: '"done":true' }] };
       return JSON.stringify(answer);
     });
     assert.deepEqual(requests, invoked ? [['goal'], ['goal'], ['user_fidelity'], ['user_fidelity']] : [['goal'], ['goal']]);

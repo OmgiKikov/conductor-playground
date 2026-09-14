@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
-export const VERSION = '3';
+export const VERSION = '6';
 export const DEFAULT_JUDGE = { provider: 'openrouter', model: 'openai/gpt-5.6-sol', upstream: 'openai' } as const;
 export const TOOL_NAMES = ['search_materials', 'lookup_record', 'update_record'] as const;
 export type ToolName = typeof TOOL_NAMES[number];
@@ -26,6 +26,7 @@ export const materialSchema = z.strictObject({ name: text.max(180), content: tex
  */
 export const userModeSchema = z.enum(['reactive', 'scripted', 'static']);
 export type UserMode = z.infer<typeof userModeSchema>;
+export const modelChoiceSchema = z.strictObject({ provider: text.max(120), model: text.max(200) });
 export const settingsSchema = z.strictObject({
   provider: z.string().max(120).default(''),
   model: z.string().max(200).default(''),
@@ -38,6 +39,7 @@ export const settingsSchema = z.strictObject({
   timeoutMs: z.number().int().min(1000).max(120000).default(120000),
   maxDurationMs: z.number().int().min(5000).max(3600000).default(600000),
   userModes: z.array(userModeSchema).min(1).max(3).refine(unique, 'Duplicate user modes').default(['reactive']),
+  roles: z.strictObject({ builder: modelChoiceSchema.optional(), simulator: modelChoiceSchema.optional(), judge: modelChoiceSchema.optional() }).default({}),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 // A patch must never materialize defaults for keys the caller did not send.
@@ -48,27 +50,29 @@ const settingsPatchSchema = z.strictObject({
   maxTurns: settingsSchema.shape.maxTurns.removeDefault(), maxCalls: settingsSchema.shape.maxCalls.removeDefault(),
   timeoutMs: settingsSchema.shape.timeoutMs.removeDefault(), maxDurationMs: settingsSchema.shape.maxDurationMs.removeDefault(),
   userModes: settingsSchema.shape.userModes.removeDefault(),
+  roles: z.strictObject({ builder: modelChoiceSchema.nullable().optional(), simulator: modelChoiceSchema.nullable().optional(), judge: modelChoiceSchema.nullable().optional() }),
 }).partial();
 
 /*
  * Who answers the simulated user. The sandbox target is a nested Pi session with trusted tools.
  * External targets speak a JSON contract (see targets.ts); their secrets stay in environment variables.
  */
+const promptFile = z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute prompt path required').optional();
 export const targetSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('sandbox') }),
   z.strictObject({
-    kind: z.literal('http'), url: z.string().url().max(2000),
+    kind: z.literal('http'), promptFile, url: z.string().url().max(2000),
     headersEnv: z.record(z.string().regex(/^[A-Za-z0-9-]{1,100}$/, 'Invalid header name'), z.string().regex(/^[A-Z_][A-Z0-9_]{0,99}$/, 'Header values must name environment variables')).default({}),
     timeoutMs: z.number().int().min(1000).max(600000).default(60000),
   }),
   z.strictObject({
-    kind: z.literal('module'), path: z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute path required'),
+    kind: z.literal('module'), promptFile, path: z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute path required'),
     exportName: z.string().regex(/^[A-Za-z_$][A-Za-z0-9_$]{0,99}$/).default('createSession'),
     timeoutMs: z.number().int().min(1000).max(600000).optional(),
   }),
   /** A local process (for example `python3 agent.py`) speaking one JSON request/reply per line over stdin/stdout. */
   z.strictObject({
-    kind: z.literal('command'), command: z.string().min(1).max(4000), args: z.array(z.string().max(4000)).max(50).default([]),
+    kind: z.literal('command'), promptFile, command: z.string().min(1).max(4000), args: z.array(z.string().max(4000)).max(50).default([]),
     cwd: z.string().min(1).max(4000).refine(p => p.startsWith('/'), 'Absolute path required').optional(),
     timeoutMs: z.number().int().min(1000).max(600000).default(60000),
   }),
@@ -129,9 +133,15 @@ export const simulatorFidelity: Rubric = {
   passCriteria: 'Пользователь следует карточке, отвечает на необходимые уточнения только известными фактами и соблюдает каждое условие остановки. Если карточка требует закончить после достаточной инструкции, дальнейших реплик нет. Не оценивает агента и не выдумывает его ответы или результаты инструментов.',
   failCriteria: 'Пользователь придумывает факты, знает скрытые ответы или состояние, меняет роль, оценивает агента, пропускает обязательное уточнение или продолжает разговор вопреки карточке. Новый вопрос после достаточной инструкции нарушает требование закончить, даже если все сообщённые факты верны. Неудача агента сама по себе не является провалом симулятора.',
 };
+export const assessmentFindingSchema = z.strictObject({
+  criterion: text.max(2000), result: z.enum(['pass', 'fail', 'unknown']), rationale: text.max(1000),
+  citations: z.array(z.strictObject({ seq: z.number().int().nonnegative(), quote: z.string().min(1).max(2000) })).max(6),
+});
 export const metricAssessmentSchema = z.strictObject({
   metricId: identifier, result: z.enum(['pass', 'fail', 'unknown']),
   rationale: text.max(4000), evidence: z.array(z.number().int().nonnegative()).max(30),
+  findings: z.array(assessmentFindingSchema).min(1).max(12).optional(),
+  citations: z.array(z.strictObject({ seq: z.number().int().nonnegative(), quote: z.string().min(1).max(2000) })).max(30).optional(),
 });
 export type MetricAssessment = z.infer<typeof metricAssessmentSchema>;
 /** The fixed opening belongs to the card, not to the reactive actor. */
@@ -281,6 +291,7 @@ export function goalToScenario(goal: ObservedGoal, profile?: Profile): Omit<Scen
   };
 }
 
+export const clarificationSchema = z.strictObject({ question: text.max(3000), answer: text.max(5000) });
 export const createInputSchema = z.strictObject({
   task: text.max(8000),
   materials: z.array(materialSchema).min(1).max(12),
@@ -326,6 +337,9 @@ export interface TraceEvent {
   seq: number; type: 'user' | 'assistant' | 'simulator' | 'tool_call' | 'tool_result' | 'error';
   text?: string; tool?: string; args?: unknown; result?: unknown; state?: World;
 }
+export const assessmentEventContent = (event: TraceEvent): string =>
+  event.text !== undefined && [event.tool, event.args, event.result, event.state].every(value => value === undefined) ? event.text
+    : JSON.stringify({ text: event.text, tool: event.tool, args: event.args, result: event.result, state: event.state });
 export interface CheckResult { id: string; description: string; passed: boolean; evidence: string }
 export interface Trial {
   id: string; revisionId: string; scenarioId: string; familyId: string; repeat: number; userMode: UserMode;
@@ -333,6 +347,48 @@ export interface Trial {
   checks: CheckResult[]; events: TraceEvent[]; initialState: World; finalState: World;
   usage: Usage; elapsedMs: number;
   assessments?: MetricAssessment[]; assessmentError?: string; judgeAudit?: JudgeAudit;
+  observation?: { state: 'sandbox' | 'reported' | 'missing'; tools: 'sandbox' | 'complete' | 'partial'; resetConfirmed?: boolean; version?: string; toolScope?: string[] };
+  externalUsage?: Usage;
+}
+export const simulatorWasUsed = (trial: Trial) => trial.userMode === 'reactive' && trial.events.some(e => e.type === 'simulator');
+export function validateAssessments(metrics: Rubric[], events: TraceEvent[], raw: unknown): MetricAssessment[] {
+  const assessments = z.array(metricAssessmentSchema).parse(raw);
+  const metricIds = new Set(metrics.map(metric => metric.id));
+  if (metricIds.size !== metrics.length || assessments.length !== metricIds.size
+    || new Set(assessments.map(a => a.metricId)).size !== metricIds.size || assessments.some(a => !metricIds.has(a.metricId))) {
+    throw new Error('Assessment must cover every requested metric exactly once');
+  }
+  const eventIds = new Set(events.map(event => event.seq));
+  for (const assessment of assessments) {
+    if (assessment.evidence.some(seq => !eventIds.has(seq))) throw new Error(`Assessment ${assessment.metricId} cites a nonexistent trace event`);
+    if (assessment.result !== 'unknown' && !assessment.evidence.length) throw new Error(`Assessment ${assessment.metricId} needs trace evidence for pass/fail`);
+    if (assessment.citations) {
+      const cited = new Set(assessment.citations.map(c => c.seq));
+      if (cited.size !== assessment.evidence.length || assessment.evidence.some(seq => !cited.has(seq))) throw new Error('Evidence must match quoted citations.');
+      for (const citation of assessment.citations) {
+        const event = events.find(e => e.seq === citation.seq);
+        if (!event || !assessmentEventContent(event).includes(citation.quote)) throw new Error(`Citation #${citation.seq} is not a verbatim quote from that event's content.`);
+      }
+    }
+    if (!assessment.findings) continue; // Historical assessments retain their original evidence format.
+    const metric = metrics.find(m => m.id === assessment.metricId)!;
+    for (const finding of assessment.findings) {
+      if (![metric.description, metric.passCriteria, metric.failCriteria].some(text => text.includes(finding.criterion))) {
+        throw new Error('Each criterion must be copied verbatim from the supplied rubric; do not invent requirements.');
+      }
+      if (finding.result !== 'unknown' && !finding.citations.length) throw new Error('Every pass/fail finding needs a quoted trace event.');
+      for (const citation of finding.citations) {
+        const event = events.find(e => e.seq === citation.seq);
+        if (!event || !assessmentEventContent(event).includes(citation.quote)) throw new Error(`Citation #${citation.seq} is not a verbatim quote from that event's content.`);
+      }
+    }
+    const expected = assessment.findings.some(f => f.result === 'fail') ? 'fail' : assessment.findings.some(f => f.result === 'unknown') ? 'unknown' : 'pass';
+    const cited = new Set(assessment.findings.flatMap(f => f.citations.map(c => c.seq)));
+    if (assessment.result !== expected || cited.size !== assessment.evidence.length || assessment.evidence.some(seq => !cited.has(seq))) {
+      throw new Error('Assessment result and evidence must match its findings.');
+    }
+  }
+  return assessments;
 }
 export interface Comparison {
   baselineId: string; candidateId: string; manifestHash: string; split: 'dev' | 'control';
@@ -344,10 +400,11 @@ export interface Comparison {
 }
 export const humanReviewInputSchema = z.strictObject({
   trialId: identifier, metricId: identifier.optional(), checkId: identifier.optional(),
-  verdict: z.enum(['pass', 'fail', 'unknown', 'invalid']), note: text.max(3000),
+  verdict: z.enum(['pass', 'fail', 'unknown', 'invalid']), note: text.max(3000), durationMs: z.number().int().nonnegative().max(3600000).optional(),
 }).refine(v => !(v.metricId && v.checkId), 'Review either one metric, one check, or the whole trial');
 export type HumanReviewInput = z.infer<typeof humanReviewInputSchema>;
 export type HumanReview = HumanReviewInput & { id: string; createdAt: string };
+const humanReviewSchema = humanReviewInputSchema.safeExtend({ id: identifier, createdAt: text });
 export const draftPatchSchema = z.strictObject({
   /** Full cards to update or add by id. Omitted cards are always preserved. */
   scenarios: z.array(scenarioSchema.extend({ split: z.enum(['dev', 'control']).optional() })).min(1).max(40)
@@ -360,6 +417,14 @@ export const draftPatchSchema = z.strictObject({
   target: targetSchema.optional(), targetVersion: text.max(200).optional(),
 }).refine(v => Object.keys(v).length > 0, 'Supply a draft change')
   .refine(v => !v.scenarios?.some(card => v.removeScenarioIds?.includes(card.id)), 'Нельзя одновременно изменить и удалить одну карточку.');
+export const reassessmentSchema = z.strictObject({
+  criteria: z.array(z.strictObject({ scenarioId: identifier, successCriteria: text.max(3000).optional(),
+    checks: z.array(checkSchema).max(12).optional(), metrics: z.array(rubricSchema).max(8).optional(),
+  })).max(40).refine(v => unique(v.map(c => c.scenarioId)), 'Duplicate scenario criteria').default([]),
+  trialIds: z.array(identifier).min(1).max(3000).refine(unique, 'Duplicate trial IDs').optional(),
+  judge: settingsSchema.shape.judge, codeOnly: z.boolean().default(false),
+});
+export type ReassessmentInput = z.input<typeof reassessmentSchema>;
 export type DraftPatch = z.infer<typeof draftPatchSchema>;
 export type Phase = 'preparing' | 'review' | 'evaluating' | 'results_review' | 'baseline' | 'improving' | 'control' | 'complete' | 'cancelled' | 'error' | 'interrupted';
 export interface Experiment {
@@ -378,10 +443,17 @@ export interface Experiment {
   selectedScenarioIds?: string[];
   targetVersion?: string;
   targetFingerprint?: string;
+  evaluatorVersion?: string;
+  targetRelease?: string;
+  sourceEvidence?: { runId: string; parentRunId?: string; trials: Trial[]; humanReviews: HumanReview[] };
+  clarifications?: { question: string; answer: string }[];
+  assessmentOf?: string;
+  assessmentTrialIds?: string[];
+  evidenceHash?: string;
 }
-const usageSchema = z.strictObject({ calls: z.number().int().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), costUsd: z.number().finite().nonnegative().nullable() });
+export const usageSchema = z.strictObject({ calls: z.number().int().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), costUsd: z.number().finite().nonnegative().nullable() });
 const revisionSchema = z.strictObject({ id: text, parentId: text.nullable(), spec: agentSchema, hypothesis: z.string(), createdAt: text });
-const trialSchema = z.strictObject({
+export const trialSchema = z.strictObject({
   id: identifier, revisionId: text, scenarioId: identifier, familyId: identifier, repeat: z.number().int().nonnegative(),
   userMode: userModeSchema.default('reactive'),
   split: z.enum(['dev', 'control']), manifestHash: text, outcome: z.enum(['pass', 'fail', 'ungraded', 'invalid', 'cancelled']), reason: z.string(),
@@ -389,6 +461,8 @@ const trialSchema = z.strictObject({
   events: z.array(z.strictObject({ seq: z.number().int().nonnegative(), type: z.enum(['user', 'assistant', 'simulator', 'tool_call', 'tool_result', 'error']), text: z.string().optional(), tool: z.string().max(200).optional(), args: z.unknown().optional(), result: z.unknown().optional(), state: worldSchema.optional() })),
   initialState: worldSchema, finalState: worldSchema, usage: usageSchema, elapsedMs: z.number().finite().nonnegative(),
   assessments: z.array(metricAssessmentSchema).max(8).optional(), assessmentError: z.string().max(4000).optional(),
+  observation: z.strictObject({ state: z.enum(['sandbox', 'reported', 'missing']), tools: z.enum(['sandbox', 'complete', 'partial']), resetConfirmed: z.boolean().optional(), version: text.max(200).optional(), toolScope: z.array(z.string().max(200)).max(50).optional() }).optional(),
+  externalUsage: usageSchema.optional(),
   judgeAudit: judgeAuditSchema.optional(),
 });
 const comparisonSchema = z.strictObject({
@@ -437,10 +511,14 @@ export const experimentSchema: z.ZodType<Experiment> = z.strictObject({
   usage: usageSchema, error: z.string().nullable(), limitations: z.array(z.string()),
   humanReviews: z.array(z.strictObject({
     id: identifier, createdAt: text, trialId: identifier, metricId: identifier.optional(), checkId: identifier.optional(),
-    verdict: z.enum(['pass', 'fail', 'unknown', 'invalid']), note: text.max(3000),
+    verdict: z.enum(['pass', 'fail', 'unknown', 'invalid']), note: text.max(3000), durationMs: z.number().int().nonnegative().max(3600000).optional(),
   })).default([]), resultsReviewedAt: text.optional(), resultsReviewHash: text.optional(),
   failureModes: z.array(failureModeSchema).max(30).optional(),
   parentRunId: identifier.optional(), selectedScenarioIds: z.array(identifier).min(1).max(40).optional(), targetVersion: text.max(200).optional(), targetFingerprint: text.optional(),
+  clarifications: z.array(clarificationSchema).max(100).optional(),
+  assessmentOf: identifier.optional(), assessmentTrialIds: z.array(identifier).max(3000).optional(), evidenceHash: text.optional(),
+  evaluatorVersion: text.optional(), targetRelease: text.max(200).optional(),
+  sourceEvidence: z.strictObject({ runId: identifier, parentRunId: identifier.optional(), trials: z.array(trialSchema).max(40), humanReviews: z.array(humanReviewSchema).max(1000) }).optional(),
 });
 export interface CallContext {
   signal: AbortSignal; timeoutMs: number;

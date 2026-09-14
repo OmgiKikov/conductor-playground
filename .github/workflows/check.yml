@@ -13,3 +13,14 @@ jobs:
       - run: npm test
       - run: npm run typecheck
       - run: npm pack --dry-run
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Saved regression suite
+        run: node dist/cli.js evaluate --input examples/regression-suite.json --connection examples/connection.json --data-dir .agent-lab/ci --yes
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-lab-evidence
+          path: .agent-lab/ci
+          if-no-files-found: ignore

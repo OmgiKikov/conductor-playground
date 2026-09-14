@@ -11,6 +11,22 @@ import { markdownReport } from '../src/report.js';
 
 const theme = { fg: (_: string, value: string) => value, bold: (value: string) => value };
 
+test('a quick verdict includes time spent reading the selected dialogue', async () => {
+  const record = await fixture(); record.phase = 'results_review'; record.reviewedAt = new Date().toISOString();
+  const scenario = record.scenarios[0]!;
+  record.trials = [{ id: 'timed', revisionId: 'revision-1', scenarioId: scenario.id, familyId: scenario.familyId,
+    repeat: 0, userMode: 'static', split: 'dev', manifestHash: 'hash', outcome: 'ungraded', reason: '', checks: [],
+    events: [{ seq: 0, type: 'assistant', text: 'Recorded answer' }], initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 10 }];
+  let action: BoardAction | undefined;
+  const reviewTimes = new Map([[`${record.id}|timed`, 100]]);
+  const board = new LabBoard({ record, section: 'results', reviewTimes }, theme, value => { action = value; }, () => {});
+  board.render(120);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  board.handleInput('n');
+  assert.equal(action?.type, 'verdict');
+  if (action?.type === 'verdict') { assert.equal(action.trialId, 'timed'); assert.ok(action.reviewMs! >= 115); }
+});
+
 test('coincident replies with different scores are visible in Pi and exported reports', async () => {
   const before = await fixture();
   before.id = 'before'; before.phase = 'results_review';

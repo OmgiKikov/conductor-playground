@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
 import {
-  emptyUsage, userTurnSchema, metricAssessmentSchema, scriptIssue,
+  emptyUsage, userTurnSchema, scriptIssue, metricApplies, validateAssessments,
   type CallContext, type CheckResult, type DialogueMessage, type Revision,
   type Runtime, type Scenario, type Settings, type Source, type Target, type TargetSession, type TraceEvent, type Trial, type UserMode,
 } from './contracts.js';
@@ -65,7 +64,25 @@ const stages: Record<string, string> = {
   assessment: 'оценка по рубрикам',
 };
 
-function grade(scenario: Scenario, trial: Trial): CheckResult[] {
+export function grade(scenario: Scenario, trial: Trial): CheckResult[] {
+  if (scenario.checks.some(c => c.kind === 'state_equals') && trial.observation?.state === 'missing') {
+    throw new Error('Внешний агент не сообщил итоговое состояние. Проверки состояния не измерены.');
+  }
+  if (scenario.checks.some(c => c.kind.startsWith('tool_') || c.kind === 'fresh_read_before_update') && trial.observation?.tools === 'partial') {
+    throw new Error('Адаптер не подтвердил полноту событий инструментов (eventsComplete). Проверки действий не измерены.');
+  }
+  for (const check of scenario.checks) if (check.kind === 'state_equals') {
+    const observed = trial.finalState.records[check.recordId];
+    if (!observed || !Object.hasOwn(observed, check.field)) throw new Error(`Не наблюдалось поле ${check.recordId}.${check.field}. Проверка не измерена.`);
+    if (trial.observation && trial.observation.state !== 'sandbox' && trial.observation.resetConfirmed !== true) throw new Error('Адаптер не подтвердил сброс исходного состояния (resetConfirmed).');
+  }
+  const scope = trial.observation?.toolScope;
+  if (scope) for (const check of scenario.checks) {
+    const tools = check.kind === 'fresh_read_before_update' ? ['lookup_record', 'update_record'] : 'tool' in check ? [check.tool] : [];
+    if (tools.some(tool => !scope.some(pattern => pattern.endsWith('*') ? tool.startsWith(pattern.slice(0, -1)) : tool === pattern))) {
+      throw new Error('Проверяемый инструмент не входит в заявленную полную область событий адаптера.');
+    }
+  }
   const answers = trial.events.filter(e => e.type === 'assistant').map(e => e.text ?? '').join('\n').toLocaleLowerCase();
   return scenario.checks.map(check => {
     let passed: boolean;
@@ -93,6 +110,16 @@ function grade(scenario: Scenario, trial: Trial): CheckResult[] {
   });
 }
 
+export function previewAnswer(scenario: Scenario, answer: string) {
+  const checks = scenario.checks.filter(c => c.kind.startsWith('answer_'));
+  const trial: Trial = { id: 'preview', revisionId: 'preview', scenarioId: scenario.id, familyId: scenario.familyId,
+    userMode: 'static', repeat: 0, split: 'dev', manifestHash: 'preview', outcome: 'ungraded', reason: '', checks: [],
+    events: [{ seq: 1, type: 'assistant', text: answer }], initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 0 };
+  return { checks: grade({ ...scenario, checks }, trial), unmeasured: [
+    ...scenario.checks.filter(c => !checks.includes(c)).map(c => c.description), ...(scenario.metrics ?? []).map(m => m.name),
+  ] };
+}
+
 export async function evaluateTrial(input: {
   runtime: Runtime; revision: Revision; scenario: Scenario; repeat: number; manifestHash: string;
   sources: Source[]; settings: Settings; ctx: CallContext; userMode: UserMode; target: Target;
@@ -105,6 +132,7 @@ export async function evaluateTrial(input: {
     id: randomUUID(), revisionId: revision.id, scenarioId: scenario.id, familyId: scenario.familyId, userMode,
     repeat, split: scenario.split, manifestHash, outcome: 'invalid', reason: '', checks: [], events: [],
     initialState: structuredClone(state), finalState: structuredClone(state), usage: emptyUsage(), elapsedMs: 0,
+    observation: { state: target.kind === 'sandbox' ? 'sandbox' : 'missing', tools: target.kind === 'sandbox' ? 'sandbox' : 'complete' },
   };
   const localCtx: CallContext = {
     ...ctx,
@@ -147,7 +175,33 @@ export async function evaluateTrial(input: {
       const tools = sandbox(state, sources, emit, localCtx).filter(tool => revision.spec.tools.includes(tool.name));
       session = await runtime.openTarget(structuredClone(revision.spec), structuredClone(sources), tools, localCtx);
     } else {
-      session = await openExternalTarget({ target, sessionId: trial.id, scenarioId: scenario.id, state, history: () => structuredClone(messages), ctx: localCtx, onRecords: () => { reportedState = true; } });
+      let responseCount = 0;
+      let usageComplete = true;
+      session = await openExternalTarget({ target, sessionId: trial.id, scenarioId: scenario.id, state, history: () => structuredClone(messages), ctx: localCtx,
+        onRecords: () => { reportedState = true; },
+        onReply(reply) {
+          responseCount++;
+          const observation = trial.observation!;
+          observation.state = typeof reply !== 'string' && reply.records !== undefined ? 'reported' : 'missing';
+          if (typeof reply === 'string' || reply.eventsComplete !== true) observation.tools = 'partial';
+          if (typeof reply === 'string' || !reply.usage) {
+            usageComplete = false;
+            if (trial.externalUsage) trial.externalUsage.costUsd = null;
+          }
+          if (typeof reply === 'string') return;
+          if (reply.eventScope) observation.toolScope = observation.toolScope ? observation.toolScope.filter(tool => reply.eventScope!.includes(tool)) : [...reply.eventScope];
+          if (reply.sessionId !== undefined && reply.sessionId !== trial.id || reply.turn !== undefined && reply.turn !== responseCount) throw new Error('Адаптер вернул неверный идентификатор сессии или номер хода.');
+          if (responseCount === 1) observation.resetConfirmed = reply.resetConfirmed;
+          if (reply.version) {
+            if (observation.version && observation.version !== reply.version) throw new Error('Версия внешнего агента изменилась внутри диалога.');
+            observation.version = reply.version;
+          }
+          if (reply.usage) {
+            const usage = trial.externalUsage ??= emptyUsage();
+            usage.calls += reply.usage.calls; usage.inputTokens += reply.usage.inputTokens; usage.outputTokens += reply.usage.outputTokens;
+            usage.costUsd = !usageComplete || usage.costUsd === null || reply.usage.costUsd === null ? null : usage.costUsd + reply.usage.costUsd;
+          }
+        } });
     }
     let userMessage = scenario.user.opening;
     for (let turn = 0; turn < settings.maxTurns; turn += 1) {
@@ -180,6 +234,7 @@ export async function evaluateTrial(input: {
       finalUserReply = user.done;
     }
     trial.finalState = structuredClone(state);
+    stage = 'проверка наблюдений';
     trial.checks = grade(scenario, trial);
     const allPassed = trial.checks.length > 0 && trial.checks.every(check => check.passed);
     trial.outcome = !stopped ? 'invalid' : trial.checks.length === 0 ? 'ungraded' : allPassed ? 'pass' : 'fail';
@@ -212,25 +267,10 @@ export async function evaluateTrial(input: {
       if (!runtime.assess) throw new Error('Metric assessment is unavailable for this runtime');
       ctx.signal.throwIfAborted();
       onStage?.('assessment');
-      const assessments = z.array(metricAssessmentSchema).parse(await runtime.assess({
-        scenario: structuredClone(scenario), sources: structuredClone(sources), trial: structuredClone(trial),
-      }, { ...localCtx, onTargetEvent: undefined, onTrace: undefined, onJudgment: (id, audit) => {
-        trial.judgeAudit = structuredClone(audit);
+      trial.assessments = await assessTrial(runtime, scenario, sources, trial, { ...localCtx, onJudgment: (id, audit) => {
         try { ctx.onJudgment?.(id, audit); }
         catch (error) { persistenceFailed = true; persistenceError = error; throw error; }
-      } }));
-      ctx.signal.throwIfAborted();
-      const metricIds = new Set(scenario.metrics.map(metric => metric.id));
-      if (metricIds.size !== scenario.metrics.length || assessments.length !== metricIds.size
-        || new Set(assessments.map(a => a.metricId)).size !== metricIds.size || assessments.some(a => !metricIds.has(a.metricId))) {
-        throw new Error('Assessment must cover every requested metric exactly once');
-      }
-      const eventIds = new Set(trial.events.map(event => event.seq));
-      for (const assessment of assessments) {
-        if (assessment.evidence.some(seq => !eventIds.has(seq))) throw new Error(`Assessment ${assessment.metricId} cites a nonexistent trace event`);
-        if (assessment.result !== 'unknown' && assessment.evidence.length === 0) throw new Error(`Assessment ${assessment.metricId} needs trace evidence for pass/fail`);
-      }
-      trial.assessments = assessments;
+      } });
     } catch (error) {
       if (persistenceFailed) throw persistenceError;
       trial.assessmentError = (ctx.signal.aborted ? 'Metric assessment cancelled' : error instanceof Error ? error.message : 'Metric assessment failed').slice(0, 4000);
@@ -238,4 +278,20 @@ export async function evaluateTrial(input: {
     trial.elapsedMs = Math.round(performance.now() - started);
   }
   return trial;
+}
+
+/** Shared by live evaluation and reassessment of immutable recorded evidence. */
+export async function assessTrial(runtime: Runtime, scenario: Scenario, sources: Source[], trial: Trial, ctx: CallContext) {
+  if (!runtime.assess) throw new Error('Metric assessment is unavailable for this runtime');
+  const metrics = scenario.metrics ?? [];
+  const assessments = validateAssessments(metrics, trial.events, await runtime.assess({
+    scenario: structuredClone(scenario), sources: structuredClone(sources), trial: structuredClone(trial),
+  }, { ...ctx, onTargetEvent: undefined, onTrace: undefined, onJudgment: (id, audit) => {
+    trial.judgeAudit = structuredClone(audit);
+    ctx.onJudgment?.(id, audit);
+  } }));
+  ctx.signal.throwIfAborted();
+  return assessments.map(assessment => !metricApplies(metrics.find(m => m.id === assessment.metricId)!, trial)
+    ? { metricId: assessment.metricId, result: 'unknown' as const, evidence: [], rationale: 'Реактивный симулятор не участвовал в этом диалоге; его качество не измерено.' }
+    : assessment);
 }

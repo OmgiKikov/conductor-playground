@@ -149,7 +149,7 @@ test('headless model tools prepare and edit only; approvals and human assessment
   const ctx = { cwd: directory, model: undefined, mode: 'print', hasUI: false } as ExtensionContext;
   const updates: string[] = [];
   try {
-    assert.deepEqual([...tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat', 'agent_lab_run', 'agent_lab_suite']);
+    assert.deepEqual([...tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat', 'agent_lab_run', 'agent_lab_suite', 'agent_lab_connection', 'agent_lab_preview', 'agent_lab_reassess', 'agent_lab_prompt', 'agent_lab_clarify']);
     const report = output(await tools.get('agent_lab_build')!.execute('build-1', { mode: 'demo', scenarioCount: 2 }, undefined,
       value => { updates.push(JSON.stringify(value)); }, ctx));
     assert.equal(report.phase, 'review'); assert.equal(report.workflow, 'evaluate');
@@ -251,7 +251,7 @@ test('native command demo fixture requires two separate confirmations and preser
         assert.match(message, /[a-f0-9]{12}/, 'a readable fingerprint identifies the exact plan; start checks the full hash');
         return confirmations.length === 2 || confirmations.length === 4;
       },
-      select: async (_title: string, choices: string[]) => { selection++; return selection === 1 ? choices[0] : choices[1]; },
+      select: async (_title: string, choices: string[]) => { selection++; return selection === 1 ? choices[0] : choices.find(c => c === 'Ошибся агент'); },
       editor: async () => 'Human fixture: disagreement with the model; see #1.',
       notify: (message: string, type: string) => { if (type === 'error') errors.push(message); },
     } as unknown as ExtensionContext['ui'];
@@ -301,7 +301,7 @@ test('actual Pi SDK loader imports native cards, preparation-only tools and embe
     await loader.reload();
     const loaded = loader.getExtensions();
     assert.deepEqual(loaded.errors, []); assert.equal(loaded.extensions.length, 1);
-    assert.deepEqual([...loaded.extensions[0]!.tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat', 'agent_lab_run', 'agent_lab_suite']);
+    assert.deepEqual([...loaded.extensions[0]!.tools.keys()], ['agent_lab_build', 'agent_lab_inspect', 'agent_lab_edit', 'agent_lab_repeat', 'agent_lab_run', 'agent_lab_suite', 'agent_lab_connection', 'agent_lab_preview', 'agent_lab_reassess', 'agent_lab_prompt', 'agent_lab_clarify']);
     assert.ok(loaded.extensions[0]!.commands.has('agent-lab'));
     assert.deepEqual(loader.getAgentsFiles().agentsFiles, []);
     const skills = loader.getSkills();

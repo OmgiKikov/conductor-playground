@@ -2,16 +2,17 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import {
-  VERSION, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, experimentSchema, fingerprint, goalToScenario, goldenToScenario, humanReviewInputSchema, observedProfileSchema, proposalSchema, scriptIssue, settingsSchema, validateFailureModes, validateObservedGoals, validatePreparation,
-  type CallContext, type CreateInput, type DraftPatch, type Experiment, type HumanReviewInput, type Revision, type Runtime,
+  VERSION, profileUser, clarificationSchema, agentSchema, createInputSchema, draftPatchSchema, emptyUsage, experimentSchema, fingerprint, goalToScenario, goldenToScenario, humanReviewInputSchema, observedProfileSchema, proposalSchema, scriptIssue, settingsSchema, validateFailureModes, validateObservedGoals, validatePreparation,
+  reassessmentSchema, type ReassessmentInput, type CallContext, type CreateInput, type DraftPatch, type Experiment, type HumanReviewInput, type Revision, type Runtime,
 } from './contracts.js';
 import { ExperimentStore } from './store.js';
-import { evaluateTrial } from './evaluation.js';
-import { awaitingVerdict, compareTrials, isAgentFailure, plannedTrials } from './comparison.js';
+import { assessTrial, evaluateTrial, grade } from './evaluation.js';
+import { automaticTrialResult, trialAssessmentComplete, awaitingVerdict, compareTrials, isAgentFailure, plannedTrials } from './comparison.js';
 import { targetFingerprint } from './target-version.js';
+import { portableTarget, rememberConnection, resolveTarget, suiteEvidence, type Connection } from './connection.js';
 import { preflightTarget } from './targets.js';
 import { createDemoRuntime } from './demo.js';
-import { createPiRuntime } from './pi.js';
+import { createPiRuntime, evaluatorVersion } from './pi.js';
 
 /*
  * Phase machine owned by ExperimentLab. Every transition is an atomic checkpoint.
@@ -28,7 +29,7 @@ export function draftHash(record: Experiment): string {
     settings: record.settings, target: record.target, requirements: record.requirements, questions: record.questions,
     goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles, notes: record.notes,
     scenarios: record.scenarios, agent: record.revisions[0]?.spec,
-    targetVersion: record.targetVersion, targetFingerprint: record.targetFingerprint });
+    targetVersion: record.targetVersion, targetFingerprint: record.targetFingerprint, evaluatorVersion: record.evaluatorVersion });
 }
 export function resultHash(record: Experiment): string {
   return fingerprint({ draft: draftHash(record), trials: record.trials, humanReviews: record.humanReviews ?? [] });
@@ -36,7 +37,7 @@ export function resultHash(record: Experiment): string {
 export function measurementHash(record: Experiment): string {
   return fingerprint({ version: VERSION, workflow: record.workflow, task: record.task, baseline: record.revisions[0], mode: record.mode, sources: record.sources, requirements: record.requirements, scenarios: record.scenarios, settings: record.settings,
     target: record.target, goldenCases: record.goldenCases, dialogues: record.dialogues, profiles: record.profiles, notes: record.notes,
-    targetVersion: record.targetVersion, targetFingerprint: record.targetFingerprint });
+    targetVersion: record.targetVersion, targetFingerprint: record.targetFingerprint, evaluatorVersion: record.evaluatorVersion });
 }
 function revision(spec: Revision['spec'], parentId: string | null, hypothesis: string): Revision {
   return { id: fingerprint(spec), parentId, spec: structuredClone(spec), hypothesis, createdAt: new Date().toISOString() };
@@ -55,6 +56,8 @@ function freshDraft(previous: Experiment, scenarioIds?: string[]): Experiment {
     trials: [], comparisons: [], iterations: [], humanReviews: [], usage: emptyUsage(),
     reviewedAt: null, reviewMode: null, manifestHash: null, controlConsumedAt: null, error: null });
   delete record.resultsReviewedAt; delete record.resultsReviewHash; delete record.failureModes;
+  delete record.targetRelease; delete record.assessmentOf; delete record.assessmentTrialIds; delete record.evidenceHash;
+  record.evaluatorVersion = evaluatorVersion(record.settings);
   record.limitations = previous.limitations.filter(note => !note.startsWith('Scripted mode skipped') && !note.startsWith('Не удалось назвать типы провалов:'));
   return record;
 }
@@ -117,6 +120,7 @@ export class ExperimentLab {
       usage: emptyUsage(), error: null,
       workflow: input.workflow, humanReviews: [],
       target: input.target, goldenCases: input.goldenCases, dialogues: input.dialogues, profiles: input.profiles, notes: input.notes,
+      evaluatorVersion: evaluatorVersion(input.settings),
       ...(input.targetVersion ? { targetVersion: input.targetVersion } : {}),
       limitations: [
         input.target.kind === 'sandbox' ? 'Tools operate on isolated test records, not production systems. Only instructions and registered tool permissions are edited.' : 'External agent state and tool events are reported by its adapter. Isolation and reset of external services are the responsibility of that adapter.',
@@ -150,13 +154,36 @@ export class ExperimentLab {
       }, ctx);
       const production = observedGoals.map(goal => goalToScenario(goal, record.profiles.find(p => p.id === goal.profileId)));
       const golden = record.goldenCases.map(goldenToScenario);
-      const prepared = validatePreparation({ ...generated, scenarios: [...generated.scenarios, ...production, ...golden] }, record.sources, input.workflow, record.profiles);
+      const synthetic = generated.scenarios.map(s => ({ ...s, provenance: 'synthetic' as const }));
+      const prepared = validatePreparation({ ...generated, scenarios: [...synthetic, ...production, ...golden] }, record.sources, input.workflow, record.profiles);
       Object.assign(record, { requirements: prepared.requirements, questions: prepared.questions, scenarios: prepared.scenarios });
       const baseline = revision(input.existingAgent ?? prepared.agent, null, input.workflow === 'evaluate' ? 'Agent configuration selected for dialogue evaluation.' : 'Original agent before measured improvements.');
       record.revisions.push(baseline); record.selectedRevisionId = baseline.id;
       await this.checkpoint(record, 'review', 'Тест готов. Проверьте запрос, ожидаемый результат и план запуска.');
     });
     return structuredClone(record);
+  }
+  async clarify(id: string, answers: { question: string; answer: string }[]): Promise<Experiment> {
+    this.ensureIdle();
+    const previous = await this.get(id);
+    if (previous.phase !== 'review' || !previous.questions.length) throw new Error('Нет вопросов в незапущенном черновике.');
+    const parsed = answers.map(answer => clarificationSchema.parse(answer));
+    if (new Set(parsed.map(a => a.question)).size !== previous.questions.length || parsed.length !== previous.questions.length
+      || parsed.some(a => !previous.questions.includes(a.question))) throw new Error('Ответьте на каждый вопрос черновика ровно один раз.');
+    const created = await this.create(createInputSchema.parse({ task: previous.task, mode: previous.mode, workflow: previous.workflow,
+      materials: [...previous.sources.map(s => ({ name: s.name, content: s.content })), { name: 'Ответы владельца на вопросы черновика',
+        content: parsed.map(a => `Вопрос: ${a.question}\nОтвет владельца: ${a.answer}`).join('\n\n') }],
+      settings: previous.settings, target: previous.target, targetVersion: previous.targetVersion, existingAgent: previous.revisions[0]?.spec,
+      goldenCases: previous.goldenCases, dialogues: previous.dialogues, profiles: previous.profiles.filter(p => p.source === 'owner').map(p => { const { draftOverride: _, persona: __, ...base } = p; return { ...base, ...profileUser(p) }; }),
+      notes: previous.notes, scenarioCount: previous.scenarios.filter(s => s.provenance === 'synthetic').length,
+    }));
+    await this.waitForIdle();
+    return this.change(async () => {
+      const record = await this.store.get(created.id);
+      record.parentRunId = previous.id;
+      record.clarifications = [...previous.clarifications ?? [], ...parsed];
+      await this.store.save(record); return structuredClone(record);
+    });
   }
   async updateDraft(id: string, expectedHash: string, raw: DraftPatch): Promise<Experiment> {
     return this.change(async () => {
@@ -169,6 +196,7 @@ export class ExperimentLab {
       for (const id of removed) if (!beforeCards.has(id)) throw new Error(`Нет карточки для удаления: ${id}`);
       for (const scenario of patch.scenarios ?? []) {
         const before = record.scenarios.find(s => s.id === scenario.id);
+        if (scenario.provenance !== (before?.provenance ?? 'synthetic')) throw new Error('Происхождение карточки нельзя повысить правкой. Golden и production добавляются через импорт исходных данных.');
         if (before && scenario.successCriteria !== before.successCriteria
           && fingerprint([scenario.checks, scenario.metrics ?? []]) === fingerprint([before.checks, before.metrics ?? []])) {
           throw new Error(`Ожидание «${scenario.title}» изменилось, а исполняемые проверки остались прежними. Измените checks или metrics вместе с successCriteria; описание само по себе не меняет тест.`);
@@ -191,7 +219,9 @@ export class ExperimentLab {
       const prepared = validatePreparation({ requirements: record.requirements, questions: record.questions, agent, scenarios }, record.sources, record.workflow ?? 'compare', record.profiles);
       record.scenarios = prepared.scenarios;
       if (patch.agent) record.revisions = [revision(patch.agent, null, 'Agent configuration reviewed in the draft.')];
-      record.settings = settingsSchema.parse({ ...record.settings, ...patch.settings });
+      record.settings = settingsSchema.parse({ ...record.settings, ...patch.settings,
+        roles: Object.fromEntries(Object.entries({ ...record.settings.roles, ...patch.settings?.roles }).filter(([, value]) => value !== null)) });
+      record.evaluatorVersion = evaluatorVersion(record.settings);
       if (patch.target) record.target = patch.target;
       if (patch.targetVersion) record.targetVersion = patch.targetVersion;
       await preflightTarget(record.target);
@@ -222,16 +252,18 @@ export class ExperimentLab {
     const previous = await this.get(id);
     if (previous.workflow !== 'evaluate' || !previous.scenarios.length || runningPhases.has(previous.phase)) throw new Error('Сначала дождитесь готовых тестов.');
     const definition = freshDraft(previous, scenarioIds);
+    if (previous.trials.length) definition.sourceEvidence = suiteEvidence(previous, definition.scenarios.map(s => s.id));
     const path = resolve(file);
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, JSON.stringify({ format: 'agent-lab-suite-1', definition }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    await writeFile(path, JSON.stringify({ format: 'agent-lab-suite-1', definition: { ...definition, target: portableTarget(definition.target, dirname(path)) } }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
     return path;
   }
-  async loadSuite(file: string, scenarioIds?: string[]): Promise<Experiment> {
+  async loadSuite(file: string, scenarioIds?: string[], connection?: Connection): Promise<Experiment> {
     return this.change(async () => {
       const raw = JSON.parse(await readFile(file, 'utf8'));
       if (raw.format !== 'agent-lab-suite-1') throw new Error('Нужен файл тестов Agent Lab, сохранённый через save-suite.');
-      const previous = experimentSchema.parse(raw.definition);
+      const previous = experimentSchema.parse({ ...raw.definition, target: connection?.target ?? resolveTarget(raw.definition.target, dirname(resolve(file))),
+        ...(connection?.targetVersion ? { targetVersion: connection.targetVersion } : {}) });
       if (previous.workflow !== 'evaluate') throw new Error('Файл должен содержать обычные тесты evaluate.');
       const record = freshDraft(previous, scenarioIds);
       // Keep the original run as the comparison source, not the exported draft's temporary ID.
@@ -242,6 +274,73 @@ export class ExperimentLab {
       await preflightTarget(record.target);
       record.targetFingerprint = await targetFingerprint(record.target);
       await this.store.save(record);
+      return structuredClone(record);
+    });
+  }
+  /** A separate result over the same facts. No target session or simulator is opened. */
+  async reassess(id: string, raw: ReassessmentInput = {}): Promise<Experiment> {
+    return this.change(async () => {
+      const input = reassessmentSchema.parse(raw);
+      const previous = await this.store.get(id);
+      if (previous.workflow !== 'evaluate' || runningPhases.has(previous.phase) || !previous.trials.length) throw new Error('Нужен завершённый прогон с сохранёнными трассами.');
+      if (input.trialIds?.some(id => !previous.trials.some(t => t.id === id))) throw new Error('Неизвестный исходный диалог.');
+      const record = freshDraft(previous);
+      for (const criteria of input.criteria) {
+        const scenario = record.scenarios.find(s => s.id === criteria.scenarioId);
+        if (!scenario) throw new Error(`Нет карточки ${criteria.scenarioId}`);
+        const { scenarioId: _, ...patch } = criteria;
+        Object.assign(scenario, patch);
+      }
+      const prepared = validatePreparation({ requirements: record.requirements, questions: record.questions, agent: record.revisions[0]?.spec,
+        scenarios: record.scenarios.map(({ split: _, ...s }) => s) }, record.sources, 'evaluate', record.profiles);
+      record.scenarios = prepared.scenarios;
+      if (input.judge) { record.settings.judge = input.judge; delete record.settings.roles.judge; }
+      record.evaluatorVersion = evaluatorVersion(record.settings);
+      record.assessmentOf = previous.id;
+      const trials = previous.trials.filter(t => !input.trialIds || input.trialIds.includes(t.id));
+      record.assessmentTrialIds = trials.map(t => t.id);
+      record.evidenceHash = fingerprint(trials.map(t => ({ id: t.id, events: t.events, initialState: t.initialState, finalState: t.finalState, observation: t.observation })));
+      record.sourceEvidence = suiteEvidence(previous, record.scenarios.map(s => s.id));
+      record.targetRelease = previous.targetRelease;
+      record.reviewedAt = new Date().toISOString(); record.reviewMode = 'automated';
+      record.manifestHash = measurementHash(record);
+      record.limitations.push('Переоценка сохранённых фактов: агент и симулятор не запускались. Смена критериев или судьи не доказывает улучшение агента.');
+      record.phase = 'evaluating';
+      await this.launch(record, async ctx => {
+        const runtime = input.codeOnly ? undefined : await this.runtime(record);
+        for (const original of trials) {
+          ctx.signal.throwIfAborted();
+          const trial = structuredClone(original);
+          const scenario = record.scenarios.find(s => s.id === trial.scenarioId)!;
+          trial.usage = emptyUsage(); delete trial.externalUsage; delete trial.assessments; delete trial.assessmentError; delete trial.judgeAudit;
+          trial.manifestHash = record.manifestHash!;
+          if (record.target.kind !== 'sandbox' && !trial.observation) trial.observation = { state: 'missing', tools: 'partial' };
+          const started = performance.now();
+          for (const event of trial.events) this.store.appendTrace(record.id, trial.id, event);
+          if (!['invalid', 'cancelled'].includes(original.outcome)) {
+            try {
+              trial.checks = [];
+              trial.checks = grade(scenario, trial);
+              // Preserve execution failures (empty answer / turn budget), independent of new criteria.
+              const executionFailed = original.outcome === 'fail' && original.checks.every(c => c.passed);
+              trial.outcome = executionFailed || trial.checks.some(c => !c.passed) ? 'fail' : trial.checks.length ? 'pass' : 'ungraded';
+              trial.reason = executionFailed ? original.reason : 'Точные проверки пересчитаны по сохранённым фактам.';
+              if (scenario.metrics?.length && runtime) trial.assessments = await assessTrial(runtime, scenario, record.sources, trial, { ...ctx,
+                beforeCall() { ctx.beforeCall(); trial.usage.calls++; },
+                addUsage(usage) { ctx.addUsage(usage); trial.usage.inputTokens += usage.inputTokens; trial.usage.outputTokens += usage.outputTokens;
+                  trial.usage.costUsd = usage.costUsd === null || trial.usage.costUsd === null ? null : trial.usage.costUsd + usage.costUsd; } });
+              else if (scenario.metrics?.length) trial.assessmentError = 'Только точные проверки; рубрики не переоценивались.';
+            } catch (error) {
+              trial.assessmentError = (error instanceof Error ? error.message : String(error)).slice(0, 4000);
+              if (!trial.checks.length || ctx.signal.aborted) trial.outcome = ctx.signal.aborted ? 'cancelled' : 'invalid';
+            }
+          }
+          trial.elapsedMs = Math.round(performance.now() - started);
+          record.trials.push(trial);
+          await this.checkpoint(record, 'evaluating', `Переоценено ${record.trials.length}/${trials.length}. Агент не запускался.`);
+        }
+        await this.checkpoint(record, 'results_review', 'Переоценка готова. Исходные трассы, оценки и ручные решения сохранены в исходном прогоне.');
+      }, true);
       return structuredClone(record);
     });
   }
@@ -288,6 +387,7 @@ export class ExperimentLab {
         if (issue) throw new Error(`${scenario.title}: ${issue}`);
       }
       await preflightTarget(record.target);
+      if (record.evaluatorVersion && record.evaluatorVersion !== evaluatorVersion(record.settings)) throw new Error('Версия оценщика изменилась. Обновите черновик и проверьте условия запуска.');
       if (record.targetFingerprint && record.targetFingerprint !== await targetFingerprint(record.target)) {
         throw new Error('Код агента изменился после подготовки карточек. Обновите подключение в настройках и подтвердите новую версию.');
       }
@@ -410,6 +510,10 @@ export class ExperimentLab {
               record.message = `${progress} · ${stage}`;
             } }, userMode, target: record.target });
           record.trials.push(trial);
+          if (trial.observation?.version) {
+            if (record.targetRelease && record.targetRelease !== trial.observation.version) throw new Error('Внешний агент сообщил разные версии в одном прогоне. Сравнение недоступно.');
+            record.targetRelease = trial.observation.version;
+          }
           completed++;
           await this.checkpoint(record, record.phase, `${label}${prefix}${scenario.title} · ${repeat + 1}/${record.settings.repeats}`);
           if (record.targetFingerprint && record.targetFingerprint !== await targetFingerprint(record.target)) throw new Error('Код внешнего агента изменился во время диалога. Результат сохранён, но сравнение недоступно.');
@@ -429,6 +533,9 @@ export class ExperimentLab {
     await this.runSuite(record, runtime, agent, 'dev', '', ctx);
     this.frozenGuard(record, record.manifestHash, ctx)();
     await this.nameFailureModes(record, runtime, ctx);
+    if (record.target.kind !== 'sandbox' && record.trials.some(t => !['invalid', 'cancelled'].includes(t.outcome))) {
+      await rememberConnection(this.store.directory, { format: 'agent-lab-connection-1', target: record.target, targetVersion: record.targetVersion });
+    }
     await this.checkpoint(record, 'results_review', 'Диалоги и оценки готовы. Разберите провалы и проверьте поведение симулятора, прежде чем принимать результат.');
   }
   /**
@@ -476,7 +583,9 @@ export class ExperimentLab {
       guard();
       const currentTrials = record.trials.filter(t => t.revisionId === best.id && t.split === 'dev');
       if (currentTrials.some(t => t.outcome === 'invalid' || t.outcome === 'cancelled')) throw new Error('Development trials are invalid; inspect the evidence before improving.');
-      if (currentTrials.every(t => t.outcome === 'pass')) break;
+      const outcomes = currentTrials.map(t => automaticTrialResult(record.scenarios.find(s => s.id === t.scenarioId), t));
+      if (outcomes.includes('unknown') || currentTrials.some(t => !trialAssessmentComplete(record.scenarios.find(s => s.id === t.scenarioId)!, t))) throw new Error('Development assessment is incomplete; inspect the evaluator before improving.');
+      if (outcomes.every(outcome => outcome === 'pass')) break;
       await this.checkpoint(record, 'improving', `Building candidate ${iteration + 1}/${record.settings.maxIterations} from development evidence only.`);
       const proposal = proposalSchema.parse(await runtime.improve({
         task: record.task, sources: structuredClone(record.sources), requirements: structuredClone(record.requirements), agent: structuredClone(best.spec),

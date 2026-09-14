@@ -1,0 +1,12 @@
+{
+  "format": "agent-lab-connection-1",
+  "target": { "kind": "command", "command": "python3", "args": ["stateful-agent.py"], "cwd": ".", "timeoutMs": 5000 },
+  "targetVersion": "sqlite-reference-1",
+  "probe": {
+    "initialState": { "records": { "A": { "time": "09:00" } }, "writableFields": ["time"] },
+    "write": { "message": "Move A to 14:00", "reply": "Moved A to 14:00." },
+    "read": { "message": "What time is it now?", "reply": "A: 14:00." },
+    "reset": { "message": "What time is A?", "reply": "A: 09:00." },
+    "checks": [{ "id": "state", "kind": "state_equals", "description": "The database contains the new time", "recordId": "A", "field": "time", "value": "14:00" }]
+  }
+}

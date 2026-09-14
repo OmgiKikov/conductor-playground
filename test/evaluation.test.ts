@@ -540,8 +540,8 @@ test('external module targets bypass the sandbox and are graded on reported reco
   const silent = join(directory, 'silent.mjs');
   await writeFile(silent, 'export function createSession() { return { async respond() { return "Done, moved it."; } }; }\n');
   const unreported = await run(direct, silent);
-  assert.equal(unreported.outcome, 'fail');
-  assert.match(unreported.reason, /Состояние внешний агент не сообщил/);
+  assert.equal(unreported.outcome, 'invalid');
+  assert.match(unreported.reason, /не сообщил итоговое состояние/);
   assert.equal(unreported.finalState.records.A101!.time, '09:00');
   const broken = join(directory, 'broken.mjs');
   await writeFile(broken, 'export function createSession() { return { async respond() { throw new Error("adapter boom"); } }; }\n');

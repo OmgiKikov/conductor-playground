@@ -3,14 +3,14 @@ import {
   type ResourceLoader, type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import { assessRepeated, JUDGE_RESPONSE_FORMAT } from './judge.js';
+import { assessRepeated, JUDGE_PROTOCOL, JUDGE_RESPONSE_FORMAT } from './judge.js';
 import { z } from 'zod';
 import {
   agentSchema, failureModeSchema, observedGoalSchema, observedProfileSchema, preparationSchema, proposalSchema, requirementSchema, scenarioSchema,
-  TOOL_NAMES, fingerprint, simulatorFidelity, userTurnSchema, validateObservedGoals,
+  TOOL_NAMES, VERSION, fingerprint, simulatorFidelity, userTurnSchema, validateObservedGoals,
   type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
-import { AGENT_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
+import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
 const groundingSchema = z.strictObject({
@@ -39,6 +39,9 @@ const simulatorReplySchema = z.strictObject({ done: userTurnSchema.shape.done, m
   .describe('To stop immediately, return done:true and omit message. A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
 const authHelp = 'Войдите в Pi через /login или задайте ключ выбранного провайдера, затем выберите доступную модель. Живой прогон никогда не подменяется демо.';
 
+export const evaluatorVersion = (settings: Settings): string => fingerprint({ protocol: VERSION, judge: JUDGE_PROTOCOL, simulator: SIMULATOR_ROLE,
+  provider: settings.provider, model: settings.model, roles: settings.roles ?? {}, judgeModel: settings.judge });
+
 /** Explicit resources avoid global/project extensions, skills, AGENTS files and prompt discovery. */
 function resources(systemPrompt: string): ResourceLoader {
   const runtime = createExtensionRuntime();
@@ -59,7 +62,7 @@ function resources(systemPrompt: string): ResourceLoader {
 
 async function controlledSession(
   modelRuntime: ModelRuntime, model: Model, systemPrompt: string, tools: Tool[],
-  ctx: CallContext, maxTokens = 16384, temperature?: number, structuredJudge = false,
+  ctx: CallContext, maxTokens = 16384, temperature?: number, structuredJudge = false, thinkingLevel: 'off' | 'medium' = 'off',
 ): Promise<TargetSession> {
   ctx.signal.throwIfAborted();
   if (new Set(tools.map(t => t.name)).size !== tools.length
@@ -78,7 +81,7 @@ async function controlledSession(
     },
   }));
   const { session } = await createAgentSession({
-    modelRuntime, model, thinkingLevel: 'off', resourceLoader: resources(systemPrompt),
+    modelRuntime, model, thinkingLevel, resourceLoader: resources(systemPrompt),
     tools: tools.map(t => t.name), noTools: 'builtin', customTools,
     sessionManager: SessionManager.inMemory(),
     settingsManager: SettingsManager.inMemory({
@@ -292,13 +295,18 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
   try { available = await modelRuntime.getAvailable(settings.provider, { signal }); }
   catch { throw new Error(`Не удалось проверить доступ к моделям. ${authHelp}`); }
   if (!available.some(m => m.id === model.id)) throw new Error(authHelp);
-  if (settings.judge) {
-    const judges = await modelRuntime.getAvailable(settings.judge.provider, { signal });
-    if (!judges.some(m => m.id === settings.judge!.model)) throw new Error(`Judge model unavailable: ${settings.judge.provider}/${settings.judge.model}. ${authHelp}`);
-  }
-  const ask = <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext,
-    review?: (value: z.infer<S>) => string | undefined) =>
-    jsonResponse(modelRuntime, model, label, role, input, schema, ctx, review);
+  const ask = async <S extends z.ZodType>(label: string, role: string, input: unknown, schema: S, ctx: CallContext,
+    review?: (value: z.infer<S>) => string | undefined): Promise<z.infer<S>> => {
+    const choice = settings.roles?.[role === ASSESS_ROLE ? 'judge' : role === SIMULATOR_ROLE ? 'simulator' : 'builder'];
+    let selected = model;
+    if (choice) {
+      const override = modelRuntime.getModel(choice.provider, choice.model);
+      const models = await modelRuntime.getAvailable(choice.provider, { signal: ctx.signal });
+      if (!override || !models.some(m => m.id === override.id)) throw new Error(`Модель роли недоступна: ${choice.provider}/${choice.model}. ${authHelp}`);
+      selected = override;
+    }
+    return jsonResponse(modelRuntime, selected, label, role, input, schema, ctx, review);
+  };
   return {
     async prepare(input, ctx) {
       const grounding = await ask(
@@ -455,7 +463,8 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       );
     },
     async assess(input, ctx) {
-      const judge = settings.judge ?? { provider: settings.provider, model: settings.model };
+      const judge = settings.roles?.judge ?? settings.judge ?? { provider: settings.provider, model: settings.model };
+      const upstream = settings.roles?.judge ? undefined : settings.judge?.upstream;
       const resolved = modelRuntime.getModel(judge.provider, judge.model);
       if (!resolved) throw new Error(`Judge model unavailable: ${judge.provider}/${judge.model}`);
       // Pi's catalog selects the Anthropic-native endpoint for Sonnet. OpenRouter
@@ -463,17 +472,18 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       // explicitly instead of recording a routing preference the transport ignores.
       const judgeModel: Model = judge.provider === 'openrouter' ? {
         ...resolved, api: 'openai-completions', baseUrl: 'https://openrouter.ai/api/v1',
-        compat: { ...resolved.compat, supportsDeveloperRole: false, maxTokensField: 'max_tokens', ...(settings.judge?.upstream ? {
-          openRouterRouting: { only: [settings.judge.upstream], allow_fallbacks: false },
+        compat: { ...resolved.compat, supportsDeveloperRole: false, maxTokensField: 'max_tokens', ...(upstream ? {
+          openRouterRouting: { only: [upstream], allow_fallbacks: false },
         } : {}) },
       } : resolved;
       return assessRepeated(input, { ...judgeModel,
-        configurationHash: fingerprint({ api: judgeModel.api, baseUrl: judgeModel.baseUrl, compat: judgeModel.compat }),
-        transport: { api: judgeModel.api, upstream: settings.judge?.upstream, structured: judge.provider === 'openrouter' },
+        configurationHash: fingerprint({ api: judgeModel.api, baseUrl: judgeModel.baseUrl, compat: judgeModel.compat,
+          temperature: judgeModel.reasoning ? 'default' : 0, thinking: judgeModel.reasoning ? 'medium' : 'off' }),
+        transport: { api: judgeModel.api, upstream, structured: judge.provider === 'openrouter' },
       }, ctx, async (prompt, data, recordPartial) => {
         const session = await controlledSession(modelRuntime, judgeModel, prompt, [], { ...ctx, onTargetEvent: event => {
           if (event.type === 'assistant' && event.text) recordPartial(event.text);
-        } }, 16384, 0, judge.provider === 'openrouter');
+        } }, 16384, judgeModel.reasoning ? undefined : 0, judge.provider === 'openrouter', judgeModel.reasoning ? 'medium' : 'off');
         try { return await session.respond(data); } finally { await session.close(); }
       });
     },

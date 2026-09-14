@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, stat } from 'node:fs/promises';
+import { access, readFile, stat } from 'node:fs/promises';
 import { delimiter, extname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { scalarSchema, type CallContext, type DialogueMessage, type Target, type TargetSession, type World } from './contracts.js';
+import { fingerprint, scalarSchema, usageSchema, type CallContext, type DialogueMessage, type Target, type TargetSession, type World } from './contracts.js';
 import { targetEntryPath } from './target-version.js';
 
 function httpHeaders(target: Extract<Target, { kind: 'http' }>): Record<string, string> {
@@ -21,6 +21,7 @@ function httpHeaders(target: Extract<Target, { kind: 'http' }>): Record<string, 
 /** Static readiness only: never imports, starts, or sends a request to the target. Actual execution still handles drift/errors. */
 export async function preflightTarget(target: Target): Promise<void> {
   if (target.kind === 'sandbox') return;
+  if (target.promptFile) await readPrompt(target.promptFile);
   if (target.kind === 'http') { httpHeaders(target); return; }
   const entry = targetEntryPath(target);
   if (entry) {
@@ -86,6 +87,12 @@ export const externalReplySchema = z.union([
     measurementError: z.string().trim().min(1).max(2000).optional(),
     events: z.array(z.strictObject({ tool: z.string().min(1).max(200), args: z.unknown().optional(), result: z.unknown().optional() })).max(50).default([]),
     records: z.record(identifier, z.record(identifier, scalarSchema)).refine(v => Object.keys(v).length <= 30, 'Too many records').optional(),
+    promptHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    eventScope: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:/-]*\*?$/).max(200)).min(1).max(50).optional(),
+    eventsComplete: z.boolean().optional(), resetConfirmed: z.boolean().optional(),
+    version: z.string().trim().min(1).max(200).optional(),
+    sessionId: z.string().min(1).max(100).optional(), turn: z.number().int().positive().optional(),
+    usage: usageSchema.optional(),
   }),
 ]);
 export type ExternalReply = z.infer<typeof externalReplySchema>;
@@ -94,12 +101,15 @@ export interface ExternalTargetInput {
   state: World; history: () => DialogueMessage[]; ctx: CallContext;
   /** Called whenever the agent's harness reports records; the runner uses it to label reported state. */
   onRecords?: () => void;
+  onReply?(reply: ExternalReply): void;
+  prompt?: string;
 }
 type SessionInput<K extends ExternalTargetInput['target']['kind']> = Omit<ExternalTargetInput, 'target'> & { target: Extract<Target, { kind: K }> };
 
-function applyReply(raw: unknown, state: World, ctx: CallContext, onRecords?: () => void): string {
+function applyReply(raw: unknown, state: World, ctx: CallContext, onRecords?: () => void, onReply?: ExternalTargetInput['onReply']): string {
   const parsed = externalReplySchema.safeParse(raw);
   if (!parsed.success) throw new Error(`External agent reply does not match the contract: ${parsed.error.issues.map(i => i.path.join('.') || 'reply').join(', ')}`);
+  onReply?.(parsed.data);
   if (typeof parsed.data === 'string') return parsed.data;
   const { reply, events, records, measurementError } = parsed.data;
   if (records) { state.records = structuredClone(records); onRecords?.(); }
@@ -128,7 +138,7 @@ async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> 
       try {
         response = await fetch(target.url, {
           method: 'POST', headers, signal,
-          body: JSON.stringify({ sessionId, scenarioId, initialState, messages: history(), message }),
+          body: JSON.stringify({ sessionId, scenarioId, initialState, messages: history(), message, ...(input.prompt !== undefined ? { prompt: input.prompt, promptHash: fingerprint(input.prompt) } : {}) }),
         });
       } catch (error) {
         if (ctx.signal.aborted) throw ctx.signal.reason;
@@ -151,7 +161,7 @@ async function httpSession(input: SessionInput<'http'>): Promise<TargetSession> 
       const text = Buffer.concat(chunks).toString('utf8');
       let body: unknown;
       try { body = JSON.parse(text); } catch { throw new Error('Ответ внешнего агента не является корректным JSON.'); }
-      return applyReply(body, state, ctx, input.onRecords);
+      return applyReply(body, state, ctx, input.onRecords, input.onReply);
     },
     async close() { closed = true; },
   };
@@ -225,8 +235,8 @@ async function commandSession(input: SessionInput<'command'> & { initialize?: bo
   };
   const session: TargetSession = {
     async respond(message) {
-      const body = await exchange({ type: 'respond', sessionId, scenarioId, initialState, messages: history(), message });
-      return applyReply(body, state, ctx, input.onRecords);
+      const body = await exchange({ type: 'respond', sessionId, scenarioId, initialState, messages: history(), message, ...(input.prompt !== undefined ? { prompt: input.prompt, promptHash: fingerprint(input.prompt) } : {}) });
+      return applyReply(body, state, ctx, input.onRecords, input.onReply);
     },
     async close() {
       if (closed) return;
@@ -244,13 +254,28 @@ async function commandSession(input: SessionInput<'command'> & { initialize?: bo
     },
   };
   if (input.initialize) {
-    try { await exchange({ type: 'open', sessionId, scenarioId, initialState }); }
+    try { await exchange({ type: 'open', sessionId, scenarioId, initialState, prompt: input.prompt, promptHash: input.prompt === undefined ? undefined : fingerprint(input.prompt) }); }
     catch (error) { kill(); await session.close(); throw error; }
   }
   return session;
 }
 
+export async function readPrompt(file: string): Promise<string> {
+  const info = await stat(file);
+  if (!info.isFile() || info.size > 96000) throw new Error('Промпт должен быть текстовым файлом до 96 КБ.');
+  const prompt = await readFile(file, 'utf8');
+  if (!prompt.trim() || prompt.includes('\0')) throw new Error('Пустой или бинарный prompt-файл.');
+  return prompt;
+}
 export async function openExternalTarget(input: ExternalTargetInput): Promise<TargetSession> {
+  if (input.target.promptFile) {
+    const prompt = await readPrompt(input.target.promptFile);
+    const original = input.onReply;
+    input = { ...input, prompt, onReply(reply) {
+      if (typeof reply === 'string' || reply.promptHash !== fingerprint(prompt)) throw new Error('Адаптер не подтвердил применение выбранного промпта (promptHash).');
+      original?.(reply);
+    } };
+  }
   switch (input.target.kind) {
     case 'http': return httpSession({ ...input, target: input.target });
     case 'module': return moduleSession({ ...input, target: input.target });

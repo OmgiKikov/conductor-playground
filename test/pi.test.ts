@@ -54,20 +54,22 @@ function callContext(options: { timeoutMs?: number; signal?: AbortSignal; limit?
   return { ctx, usage };
 }
 
-async function fixture(reply: (request: Request, index: number, options?: Options) => Reply | Promise<Reply>) {
+async function fixture(reply: (request: Request, index: number, options?: Options) => Reply | Promise<Reply>, roleModel = false) {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-pi-'));
   const requests: Request[] = [];
+  const modelsUsed: string[] = [];
   const runtime = await ModelRuntime.create({
     authPath: join(directory, 'auth.json'), modelsPath: null,
     modelsStorePath: join(directory, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false,
   });
   runtime.registerProvider('agent-lab-test', {
     api: 'openai-completions', apiKey: 'fixture-only-not-a-real-key', baseUrl: 'http://127.0.0.1:1',
-    models: [{
-      id: 'test-model', name: 'Offline SDK fixture', reasoning: false, input: ['text'],
+    models: (roleModel ? ['test-model', 'role-model'] : ['test-model']).map(id => ({
+      id, name: 'Offline SDK fixture', reasoning: false, input: ['text'],
       cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }, contextWindow: 200000, maxTokens: 16384,
-    }],
+    })),
     streamSimple(model, request, options) {
+      modelsUsed.push(model.id);
       const index = requests.length;
       requests.push(JSON.parse(JSON.stringify(request)));
       const finished = (async (): Promise<Message> => {
@@ -92,7 +94,7 @@ async function fixture(reply: (request: Request, index: number, options?: Option
     },
   });
   return {
-    runtime, requests, directory,
+    runtime, requests, directory, modelsUsed,
     adapter: await createPiRuntime(settings, runtime),
     async close() { await rm(directory, { recursive: true, force: true }); },
   };
@@ -383,17 +385,19 @@ test('card generation distinguishes the answer being sought from legitimate prio
 
 test('isolated assessment uses approved rubrics and trace evidence without inheriting deterministic verdicts', async () => {
   const assessments = [
-    { metricId: 'goal', result: 'pass', rationale: 'The reply provides the support contact.', evidence: [1] },
-    { metricId: 'fidelity', result: 'unknown', rationale: 'No reactive user turn occurred.', evidence: [] },
+    { metricId: 'goal', result: 'pass', rationale: 'The reply provides the support contact.', evidence: [1], citations: [{ seq: 1, quote: 'support@example.test' }] },
+    { metricId: 'fidelity', result: 'unknown', rationale: 'No reactive user turn occurred.', evidence: [], citations: [] },
   ];
   const f = await fixture((_request, index, options) => { assert.equal(options?.temperature, 0); return JSON.stringify({ assessments: assessments.slice(Math.floor(index / 2), Math.floor(index / 2) + 1).map(({ result, ...row }) => ({ ...row, passCondition: result === 'pass' ? 'met' : 'unclear', failCondition: result === 'pass' ? 'not_met' : 'unclear' })) }); });
   try {
     const scenario: Scenario = { ...plainCard(0), split: 'dev' };
+    scenario.user.script = ['UNDELIVERED_FOLLOWUP_SENTINEL']; scenario.user.maxFollowUps = 1;
     const trial: Trial = {
       id: 'trial_1', revisionId: 'revision_1', scenarioId: scenario.id, familyId: scenario.familyId, repeat: 0,
       split: 'dev', userMode: 'static', manifestHash: 'hash', outcome: 'fail', reason: 'DETERMINISTIC_GRADE_SENTINEL', checks: [],
       events: [{ seq: 0, type: 'user', text: 'How do I contact support?' }, { seq: 1, type: 'assistant', text: 'Email support@example.test.' }],
       initialState: scenario.initialState, finalState: scenario.initialState, usage: emptyUsage(), elapsedMs: 1,
+      observation: { state: 'missing', tools: 'partial' },
     };
     const { ctx, usage } = callContext();
     assert.deepEqual((await f.adapter.assess!({ scenario, sources: [], trial }, ctx)).map(a => ({ ...a, rationale: a.rationale.replace(/^Совпало 2\/2 оценок этой рубрики в свежих сессиях; это не проверка правильности\. /, '') })), assessments);
@@ -404,6 +408,9 @@ test('isolated assessment uses approved rubrics and trace evidence without inher
     assert.match(payload, /passCriteria|support@example.test/);
     assert.match(payload, /userMode.*static/);
     assert.doesNotMatch(payload, /DETERMINISTIC_GRADE_SENTINEL/);
+    assert.doesNotMatch(payload, /UNDELIVERED_FOLLOWUP_SENTINEL/);
+    assert.match(payload, /observation.*missing.*partial/);
+    assert.match(payload, /finalState\\?":null/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /actual event seq number/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /provisional model estimates for human review/);
     assert.match(f.requests[0]?.systemPrompt ?? '', /check each continuation against the stopping rule/);
@@ -663,6 +670,23 @@ test('external semantic cards require an agent rubric when no literal check cove
   } finally { await f.close(); }
 });
 
+
+test('role overrides select the actual SDK model independently for simulation and judging', async () => {
+  const f = await fixture((_request, index) => JSON.stringify(index === 0 ? { message: '', done: true }
+    : { assessments: [{ metricId: 'goal', passCondition: 'met', failCondition: 'not_met', rationale: 'Recorded reply provides help', evidence: [1], citations: [{ seq: 1, quote: 'Here is help' }] }] }), true);
+  try {
+    const adapter = await createPiRuntime(settingsSchema.parse({ ...settings, roles: { judge: { provider: settings.provider, model: 'role-model' } } }), f.runtime);
+    const scenario = { ...plainCard(0), split: 'dev' as const, metrics: [reviewFields.metrics[0]!] };
+    await adapter.userTurn({ user: scenario.user, messages: [{ role: 'user', content: 'Help' }, { role: 'assistant', content: 'Here is help' }], turn: 0 }, callContext().ctx);
+    const trial: Trial = { id: 't', scenarioId: scenario.id, familyId: scenario.familyId, revisionId: 'r', userMode: 'static', repeat: 0, split: 'dev',
+      manifestHash: 'hash', outcome: 'ungraded', reason: '', checks: [], initialState: scenario.initialState, finalState: scenario.initialState,
+      usage: emptyUsage(), elapsedMs: 1, events: [{ seq: 0, type: 'user', text: 'Help' }, { seq: 1, type: 'assistant', text: 'Here is help' }] };
+    const result = await adapter.assess!({ scenario, sources: [], trial }, callContext().ctx);
+    assert.equal(result[0]!.result, 'pass');
+    assert.deepEqual(f.modelsUsed, ['test-model', 'role-model', 'role-model']);
+  } finally { await f.close(); }
+});
+
 for (const judge of [{ provider: 'openrouter', model: 'anthropic/claude-sonnet-4.6', upstream: 'anthropic' }, DEFAULT_JUDGE])
 test(`OpenRouter ${judge.model} sends the pinned provider and isolated rubric on the wire`, async () => {
   const f = await fixture(() => { throw new Error('The planner provider must not assess'); });
@@ -677,8 +701,8 @@ test(`OpenRouter ${judge.model} sends the pinned provider and isolated rubric on
       const body = JSON.parse(String(init?.body)); requests.push({ url, body });
       assert.equal(body.model, judge.model);
       assert.deepEqual(body.provider, { only: [judge.upstream], allow_fallbacks: false });
-      if (judge.model === DEFAULT_JUDGE.model) assert.deepEqual(body.reasoning, { effort: 'none' });
-      assert.equal(body.temperature, 0);
+      if (judge.model === DEFAULT_JUDGE.model) assert.deepEqual(body.reasoning, { effort: 'medium' });
+      assert.equal(body.temperature, f.runtime.getModel(judge.provider, judge.model)!.reasoning ? undefined : 0);
       assert.equal(body.max_tokens, 16384); assert.equal(body.max_completion_tokens, undefined);
       assert.equal(body.messages[0].role, 'system');
       assert.equal(body.response_format.type, 'json_schema'); assert.equal(body.response_format.json_schema.strict, true);
@@ -687,8 +711,8 @@ test(`OpenRouter ${judge.model} sends the pinned provider and isolated rubric on
       const data = JSON.parse(typeof content === 'string' ? content : content.map((c: any) => c.text ?? '').join(''));
       assert.equal(data.scenario.metrics.length, 1, 'the actual HTTP request isolates each rubric');
       const answer = JSON.stringify({ assessments: [
-        { metricId: 'goal', passCondition: 'met', failCondition: 'not_met', rationale: 'The instruction is present.', evidence: [1] },
-        { metricId: 'fidelity', passCondition: 'unclear', failCondition: 'unclear', rationale: 'No dynamic turn.', evidence: [] },
+        { metricId: 'goal', passCondition: 'met', failCondition: 'not_met', rationale: 'The instruction is present.', evidence: [1], citations: [{ seq: 1, quote: 'Instruction' }] },
+        { metricId: 'fidelity', passCondition: 'unclear', failCondition: 'unclear', rationale: 'No dynamic turn.', evidence: [], citations: [] },
       ].filter(m => m.metricId === data.scenario.metrics[0].id) });
       return new Response(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 0, model: body.model,
         choices: [{ index: 0, delta: { role: 'assistant', content: answer }, finish_reason: 'stop' }],

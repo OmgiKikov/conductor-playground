@@ -156,7 +156,7 @@ test('human agreement separates criterion definitions and judge protocols even w
     const t = trial(`t${i}`, card.id, 'reactive', 'ungraded', { assessments: [] });
     t.assessments = await assessRepeated({ scenario: card, sources: [], trial: t }, { provider: 'offline', id: 'test', configurationHash },
       { signal: new AbortController().signal, timeoutMs: 1000, beforeCall() {}, addUsage() {}, onJudgment(_id, audit) { t.judgeAudit = audit; } },
-      async () => JSON.stringify({ assessments: [{ metricId: 'goal', passCondition: 'met', failCondition: 'not_met', rationale: 'Fixture evidence', evidence: [1] }] }));
+      async () => JSON.stringify({ assessments: [{ metricId: 'goal', passCondition: 'met', failCondition: 'not_met', rationale: 'Fixture evidence', evidence: [1], citations: [{ seq: 1, quote: t.events.find(e => e.seq === 1)!.text! }] }] }));
     r.trials.push(t); r.humanReviews.push(review(`h${i}`, t.id, 'pass', { metricId: 'goal' }));
   }
   const rows = judgeCalibration(r);
@@ -643,6 +643,7 @@ test('live rubric comparisons require recorded compatible judge protocols and a 
   const after = structuredClone(before); after.id = 'after'; after.trials[0]!.id = 'b'; after.trials[0]!.events[1]!.text = 'Better answer'; after.trials[0]!.assessments![0]!.result = 'pass';
   assert.equal(compareRuns(before, after).comparable, false, 'legacy single votes cannot establish improvement');
   for (const run of [before, after]) {
+    for (const a of run.trials[0]!.assessments!) a.citations = a.evidence.map(seq => ({ seq, quote: run.trials[0]!.events.find(e => e.seq === seq)!.text! }));
     const data = judgeInput({ scenario: card, sources: run.sources, trial: run.trials[0]! });
     run.trials[0]!.judgeAudit = { protocolHash: 'protocol-v1', inputHash: fingerprint(data), provider: 'offline', model: 'judge', prompt: 'prompt', input: JSON.stringify(data),
       attempts: [0, 1].map(() => ({ startedAt: 'now', raw: JSON.stringify({ assessments: run.trials[0]!.assessments!.map(({ result, ...v }) => ({ ...v, passCondition: result === 'pass' ? 'met' : 'not_met', failCondition: result === 'fail' ? 'met' : 'not_met' })) }), assessments: structuredClone(run.trials[0]!.assessments!) })), notApplicable: [] };

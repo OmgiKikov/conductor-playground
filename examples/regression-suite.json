@@ -1,0 +1,376 @@
+{
+  "format": "agent-lab-suite-1",
+  "definition": {
+    "schemaVersion": "1",
+    "id": "2fd33a98-4966-4443-b8f2-1e1fa353d503",
+    "task": "Build an appointment assistant that consults policy, reads appointments, and reliably changes the requested time without altering unrelated fields.",
+    "mode": "demo",
+    "createdAt": "2026-09-13T18:27:34.156Z",
+    "updatedAt": "2026-09-13T18:27:34.156Z",
+    "workflow": "evaluate",
+    "phase": "review",
+    "message": "Тесты готовы. Проверьте подключение и запустите проверку.",
+    "sources": [
+      {
+        "id": "source-1",
+        "name": "Appointment policy",
+        "content": "Appointment policy\nBefore changing an appointment, read its current record and update only its time field to the user’s requested time.\nRead-only requests must leave every record unchanged.\nIf the appointment ID or desired time is missing, ask the user to provide it before making a change.\nIf an update returns a retryable error, retry it up to two more times and confirm success only after a successful tool result.\nIf the user changes their preferred time during the conversation, the final record must reflect their last request.",
+        "hash": "19f4dc5d426c37c8cb0a81870e45ce29dd740d29eafe8b766fea3c343741f9f0"
+      }
+    ],
+    "settings": {
+      "provider": "",
+      "model": "",
+      "repeats": 2,
+      "maxIterations": 1,
+      "maxTurns": 6,
+      "maxCalls": 300,
+      "timeoutMs": 120000,
+      "maxDurationMs": 600000,
+      "userModes": [
+        "static"
+      ],
+      "roles": {}
+    },
+    "target": {
+      "kind": "command",
+      "command": "python3",
+      "args": [
+        "stateful-agent.py"
+      ],
+      "cwd": ".",
+      "timeoutMs": 5000
+    },
+    "requirements": [
+      {
+        "id": "change",
+        "text": "Before changing an appointment, read its current record and update only its time field to the user’s requested time.",
+        "sourceId": "source-1",
+        "quote": "Before changing an appointment, read its current record and update only its time field to the user’s requested time.",
+        "critical": true
+      },
+      {
+        "id": "read",
+        "text": "Read-only requests must leave every record unchanged.",
+        "sourceId": "source-1",
+        "quote": "Read-only requests must leave every record unchanged.",
+        "critical": true
+      },
+      {
+        "id": "clarify",
+        "text": "If the appointment ID or desired time is missing, ask the user to provide it before making a change.",
+        "sourceId": "source-1",
+        "quote": "If the appointment ID or desired time is missing, ask the user to provide it before making a change.",
+        "critical": true
+      },
+      {
+        "id": "retry",
+        "text": "If an update returns a retryable error, retry it up to two more times and confirm success only after a successful tool result.",
+        "sourceId": "source-1",
+        "quote": "If an update returns a retryable error, retry it up to two more times and confirm success only after a successful tool result.",
+        "critical": true
+      },
+      {
+        "id": "preference",
+        "text": "If the user changes their preferred time during the conversation, the final record must reflect their last request.",
+        "sourceId": "source-1",
+        "quote": "If the user changes their preferred time during the conversation, the final record must reflect their last request.",
+        "critical": true
+      }
+    ],
+    "questions": [],
+    "scenarios": [
+      {
+        "id": "a_direct",
+        "familyId": "a_direct",
+        "title": "Move an appointment",
+        "requirementIds": [
+          "change"
+        ],
+        "provenance": "synthetic",
+        "tier": "regression",
+        "user": {
+          "goal": "Move appointment A101 to 14:00.",
+          "facts": "Your appointment ID is A101. Your desired time is 14:00.",
+          "behavior": "Finish when the assistant answers the request.",
+          "opening": "Please move appointment A101 to 14:00.",
+          "maxFollowUps": 0,
+          "persona": "An appointment holder arranging their own visit.",
+          "characteristics": [
+            "Uses concise requests",
+            "Ends after the assigned request is answered"
+          ]
+        },
+        "initialState": {
+          "records": {
+            "A101": {
+              "time": "09:00",
+              "owner": "Sample customer",
+              "status": "booked"
+            }
+          },
+          "writableFields": [
+            "time"
+          ],
+          "transientFailures": 0
+        },
+        "checks": [
+          {
+            "id": "time",
+            "description": "The final appointment time matches the user request",
+            "kind": "state_equals",
+            "recordId": "A101",
+            "field": "time",
+            "value": "14:00"
+          },
+          {
+            "id": "owner",
+            "description": "The appointment owner is preserved",
+            "kind": "state_equals",
+            "recordId": "A101",
+            "field": "owner",
+            "value": "Sample customer"
+          },
+          {
+            "id": "status",
+            "description": "The booking remains active",
+            "kind": "state_equals",
+            "recordId": "A101",
+            "field": "status",
+            "value": "booked"
+          },
+          {
+            "id": "lookup",
+            "description": "The assistant looked up the actual record",
+            "kind": "tool_called",
+            "tool": "lookup_record"
+          }
+        ],
+        "successCriteria": "Move appointment A101 to 14:00. Preserve the appointment owner and booking status, and report only actions supported by tool results.",
+        "assumptions": [
+          "This is a curated, scripted appointment demo.",
+          "The user is authorized to access their fixture appointment."
+        ],
+        "metrics": [],
+        "split": "dev"
+      }
+    ],
+    "goldenCases": [],
+    "dialogues": [],
+    "profiles": [],
+    "notes": "",
+    "revisions": [
+      {
+        "id": "2f9b50da15c00d83d8437371651bb476e01dd5c7668311b1868246a174809a38",
+        "parentId": null,
+        "spec": {
+          "name": "Appointment assistant",
+          "instructions": "Consult appointment policy. Read the appointment before changing it. Ask for missing appointment IDs or desired times. Update only the time field. Retry retryable errors up to two times. Never claim an update succeeded without its successful tool result. Handle changed user preferences and read-only questions.",
+          "tools": [
+            "search_materials",
+            "lookup_record"
+          ]
+        },
+        "hypothesis": "Agent configuration selected for dialogue evaluation.",
+        "createdAt": "2026-09-13T18:27:33.827Z"
+      }
+    ],
+    "selectedRevisionId": "2f9b50da15c00d83d8437371651bb476e01dd5c7668311b1868246a174809a38",
+    "manifestHash": null,
+    "reviewedAt": null,
+    "reviewMode": null,
+    "controlConsumedAt": null,
+    "trials": [],
+    "comparisons": [],
+    "iterations": [],
+    "usage": {
+      "calls": 0,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "costUsd": 0
+    },
+    "error": null,
+    "limitations": [
+      "Tools operate on isolated test records, not production systems. Only instructions and registered tool permissions are edited.",
+      "Scenario expectations require human review. Text matching checks measure literal content, not semantic correctness.",
+      "Synthetic simulations do not establish performance with real users. Model rubric assessments are provisional and require human review.",
+      "Model costs are observed usage estimates; unknown costs remain unknown. Call limits are not hard provider billing caps.",
+      "Scripted demonstration: user/target behavior and the missing-tool repair are deterministic fixtures, not a measured LLM improvement.",
+      "Generated scenario expectations were checked automatically, without human validation. Results are provisional synthetic evidence."
+    ],
+    "humanReviews": [],
+    "targetVersion": "sqlite-reference-1",
+    "targetFingerprint": "d7a979f98897db4c08a18cedc59d2fc15cd1d8841d87a918c0ada69e2dbe4964",
+    "evaluatorVersion": "d38025eed6044f4f4de2b9dd2133496c78c8d9ff3644d468e54fc6529f62f918",
+    "parentRunId": "12267a2b-4002-4817-b4df-304a8d850298",
+    "sourceEvidence": {
+      "runId": "12267a2b-4002-4817-b4df-304a8d850298",
+      "trials": [
+        {
+          "id": "96f87913-9785-44a5-8943-32872321fd41",
+          "revisionId": "2f9b50da15c00d83d8437371651bb476e01dd5c7668311b1868246a174809a38",
+          "scenarioId": "a_direct",
+          "familyId": "a_direct",
+          "repeat": 0,
+          "userMode": "static",
+          "split": "dev",
+          "manifestHash": "2a45199deec2db5cecbb94fdbbf9044cfbc8fa8a5facb70178692dbe470ce62c",
+          "outcome": "pass",
+          "reason": "Все объективные проверки пройдены. Состояние сообщил сам агент, доверенный код его не наблюдал.",
+          "checks": [
+            {
+              "id": "time",
+              "description": "The final appointment time matches the user request",
+              "passed": true,
+              "evidence": "A101.time: expected \"14:00\", observed \"14:00\""
+            },
+            {
+              "id": "owner",
+              "description": "The appointment owner is preserved",
+              "passed": true,
+              "evidence": "A101.owner: expected \"Sample customer\", observed \"Sample customer\""
+            },
+            {
+              "id": "status",
+              "description": "The booking remains active",
+              "passed": true,
+              "evidence": "A101.status: expected \"booked\", observed \"booked\""
+            },
+            {
+              "id": "lookup",
+              "description": "The assistant looked up the actual record",
+              "passed": true,
+              "evidence": "lookup_record was attempted 1 time(s)"
+            }
+          ],
+          "events": [
+            {
+              "seq": 0,
+              "type": "user",
+              "text": "Please move appointment A101 to 14:00."
+            },
+            {
+              "seq": 1,
+              "type": "tool_call",
+              "tool": "lookup_record",
+              "args": {
+                "recordId": "A101"
+              }
+            },
+            {
+              "seq": 2,
+              "type": "tool_result",
+              "tool": "lookup_record",
+              "result": {
+                "ok": true,
+                "recordId": "A101",
+                "record": {
+                  "time": "09:00",
+                  "owner": "Sample customer",
+                  "status": "booked"
+                }
+              },
+              "state": {
+                "records": {
+                  "A101": {
+                    "time": "14:00",
+                    "owner": "Sample customer",
+                    "status": "booked"
+                  }
+                },
+                "writableFields": [
+                  "time"
+                ],
+                "transientFailures": 0
+              }
+            },
+            {
+              "seq": 3,
+              "type": "tool_call",
+              "tool": "update_record",
+              "args": {
+                "recordId": "A101",
+                "changes": {
+                  "time": "14:00"
+                }
+              }
+            },
+            {
+              "seq": 4,
+              "type": "tool_result",
+              "tool": "update_record",
+              "result": {
+                "ok": true,
+                "recordId": "A101"
+              },
+              "state": {
+                "records": {
+                  "A101": {
+                    "time": "14:00",
+                    "owner": "Sample customer",
+                    "status": "booked"
+                  }
+                },
+                "writableFields": [
+                  "time"
+                ],
+                "transientFailures": 0
+              }
+            },
+            {
+              "seq": 5,
+              "type": "assistant",
+              "text": "Moved A101 to 14:00."
+            }
+          ],
+          "initialState": {
+            "records": {
+              "A101": {
+                "time": "09:00",
+                "owner": "Sample customer",
+                "status": "booked"
+              }
+            },
+            "writableFields": [
+              "time"
+            ],
+            "transientFailures": 0
+          },
+          "finalState": {
+            "records": {
+              "A101": {
+                "time": "14:00",
+                "owner": "Sample customer",
+                "status": "booked"
+              }
+            },
+            "writableFields": [
+              "time"
+            ],
+            "transientFailures": 0
+          },
+          "usage": {
+            "calls": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "costUsd": 0
+          },
+          "elapsedMs": 87,
+          "observation": {
+            "state": "reported",
+            "tools": "complete",
+            "resetConfirmed": true,
+            "version": "sqlite-reference-1"
+          },
+          "externalUsage": {
+            "calls": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "costUsd": 0
+          }
+        }
+      ],
+      "humanReviews": []
+    }
+  }
+}

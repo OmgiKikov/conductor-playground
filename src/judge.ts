@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import { fingerprint, metricApplies, metricAssessmentSchema, type CallContext, type JudgeAudit, type MetricAssessment, type Runtime } from './contracts.js';
+import { assessmentEventContent, fingerprint, metricApplies, metricAssessmentSchema, validateAssessments, type CallContext, type JudgeAudit, type MetricAssessment, type Runtime } from './contracts.js';
 import { ASSESS_ROLE, DATA_BOUNDARY } from './prompts.js';
 
 const condition = z.enum(['met', 'not_met', 'unclear']);
-const responseSchema = z.strictObject({ assessments: z.array(metricAssessmentSchema.omit({ result: true }).extend({
+const responseSchema = z.strictObject({ assessments: z.array(metricAssessmentSchema.omit({ result: true, findings: true }).required({ citations: true }).extend({
   passCondition: condition, failCondition: condition,
 })).max(8) });
 // Anthropic's grammar supports the object shape, but not these size/range bounds.
@@ -16,15 +16,20 @@ export const JUDGE_PROMPT = `${ASSESS_ROLE}\n${DATA_BOUNDARY}
 Evaluate passCriteria and failCriteria INDEPENDENTLY against the same evidence. Report met, not_met or unclear for EACH condition. Do not choose which condition takes precedence. If both apply, preserve both as met. An unspecified scope or priority is unclear; never invent one. Explain both conditions in rationale. A condition that is not exercised is unclear, not automatically met or not_met.
 Return exactly one compact JSON object, without markdown fences, matching this schema:
 ${JSON.stringify(z.toJSONSchema(responseSchema))}`;
-export const JUDGE_PROTOCOL = fingerprint({ version: 5, prompt: JUDGE_PROMPT, responseFormat: JUDGE_RESPONSE_FORMAT, applicability: 'reactive-actor-was-called', repeatsPerMetric: 2, aggregation: 'per-metric-unanimous-exclusive-conditions', repair: false, temperature: 0, thinking: 'off', maxTokens: 16384 });
+export const JUDGE_PROTOCOL = fingerprint({ version: 6, prompt: JUDGE_PROMPT, responseFormat: JUDGE_RESPONSE_FORMAT, applicability: 'reactive-actor-was-called', repeatsPerMetric: 2, aggregation: 'per-metric-unanimous-exclusive-conditions', repair: false, temperature: '0 for non-reasoning models; otherwise default', thinking: 'medium for reasoning models; otherwise off', maxTokens: 16384 });
 type Input = Parameters<NonNullable<Runtime['assess']>>[0];
 
 /** This is the complete, frozen judge input. Prior verdicts, usage and run identity are deliberately absent. */
 export function judgeInput(input: Input) {
   return {
-    scenario: input.scenario,
+    scenario: { metrics: input.scenario.metrics, successCriteria: input.scenario.successCriteria, checks: input.scenario.checks,
+      user: input.trial.userMode === 'static' ? { ...input.scenario.user, script: [], maxFollowUps: 0 } : input.scenario.user },
+    evaluationScope: input.trial.userMode === 'static' ? 'Opening and first answer ONLY. Planned follow-ups were not delivered. Never penalize the agent for their absence.' : 'Evaluate only delivered requests, within the rubric stage.',
     sources: input.sources.map(({ id, name, content }) => ({ id, name, content })),
-    trial: { userMode: input.trial.userMode, events: input.trial.events, initialState: input.trial.initialState, finalState: input.trial.finalState },
+    trial: { userMode: input.trial.userMode,
+      events: input.trial.events.map(event => ({ seq: event.seq, type: event.type, content: assessmentEventContent(event) })),
+      observation: input.trial.observation ?? { state: 'missing', tools: 'partial' }, initialState: input.trial.initialState,
+      finalState: input.trial.observation && input.trial.observation.state !== 'missing' ? input.trial.finalState : null },
   };
 }
 
@@ -40,7 +45,7 @@ function parseJudgment(raw: string, input: Input, metrics: NonNullable<Input['sc
       : failCondition === 'met' && passCondition === 'not_met' ? 'fail' : 'unknown';
     if (row.evidence.some(seq => !events.has(seq))) throw new Error(`Assessment ${row.metricId} cites a nonexistent trace event`);
     if (result !== 'unknown' && !row.evidence.length) throw new Error(`Assessment ${row.metricId} needs trace evidence for pass/fail`);
-    return { ...row, result };
+    return validateAssessments(metrics.filter(m => m.id === row.metricId), input.trial.events, [{ ...row, result }])[0]!;
   });
 }
 
