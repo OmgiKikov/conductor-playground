@@ -227,7 +227,7 @@ test('simulator protocol/provider errors are invalid; exhausting target turns is
   const failed = await f.evaluate(legacy, f.candidate, { ...f.runtime, async userTurn() { throw new Error('Provider offline'); } });
   assert.equal(failed.outcome, 'invalid');
   const neverDone = await f.evaluate(legacy, f.candidate, { ...f.runtime, async userTurn() { return { message: 'Please confirm again.', done: false }; } });
-  assert.equal(neverDone.outcome, 'fail');
+  assert.equal(neverDone.outcome, 'invalid');
   assert.match(neverDone.reason, /не завершился в отведённое число реплик/);
 });
 
@@ -361,7 +361,7 @@ test('an incomplete or invalid dialogue is not sent to the rubric assessor', asy
   const actor = targetRuntime(f.runtime, async () => '');
   actor.assess = async () => { assessments += 1; return []; };
   const incomplete = await f.evaluate(scenario, f.candidate, actor);
-  assert.equal(incomplete.outcome, 'fail');
+  assert.equal(incomplete.outcome, 'invalid');
   actor.openTarget = async () => { throw new Error('Target provider offline'); };
   const invalid = await f.evaluate(scenario, f.candidate, actor);
   assert.equal(invalid.outcome, 'invalid');
@@ -548,4 +548,19 @@ test('external module targets bypass the sandbox and are graded on reported reco
   const invalid = await run(direct, broken);
   assert.equal(invalid.outcome, 'invalid');
   assert.match(invalid.reason, /ответ испытуемого: .*adapter boom/);
+  const unavailable = join(directory, 'unavailable.mjs');
+  await writeFile(unavailable, `export function createSession() { return { async respond() { return {
+    reply: 'Нет данных для ответа.', measurementError: 'В фикстуре отсутствует lookup_record.',
+    events: [{ tool: 'lookup_record', result: { fixtureMissing: true } }]
+  }; } }; }`);
+  let assessed = false;
+  const infrastructure = await evaluateTrial({ runtime: { ...runtime, async assess() { assessed = true; throw new Error('must not grade'); } },
+    revision: f.baseline, scenario: { ...direct, metrics: [{ id: 'goal', name: 'Goal', subject: 'agent', description: 'Goal', passCriteria: 'Done', failCriteria: 'Not done' }] },
+    repeat: 0, manifestHash: 'frozen', sources: f.sources, settings: f.input.settings, ctx: context(), userMode: 'static',
+    target: { kind: 'module', path: unavailable, exportName: 'createSession' } });
+  assert.equal(infrastructure.outcome, 'invalid');
+  assert.equal(assessed, false, 'an adapter-reported measurement error cannot become an agent verdict');
+  assert.deepEqual(infrastructure.events.map(e => e.type), ['user', 'tool_call', 'tool_result', 'assistant', 'error']);
+  assert.equal(infrastructure.events[3]!.text, 'Нет данных для ответа.');
+  assert.match(infrastructure.reason, /В фикстуре отсутствует lookup_record/);
 });

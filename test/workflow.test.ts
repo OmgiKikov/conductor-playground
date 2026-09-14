@@ -228,8 +228,12 @@ test('reassessment never opens the target, preserves original evidence, versions
   const invalid = await lab.reassess(original.id); await lab.waitForIdle();
   assert.match((await lab.get(invalid.id)).trials[0].assessmentError, /nonexistent/);
   assert.equal(opens, 1);
-  const judged = await lab.reassess(original.id, { judge: { provider: 'fixture', model: 'other-judge' } }); await lab.waitForIdle();
-  assert.notEqual((await lab.get(judged.id)).evaluatorVersion, original.evaluatorVersion);
+  const judge = { provider: 'openrouter', model: 'other-judge', upstream: 'openai' };
+  const judged = await lab.reassess(original.id, { judge }); await lab.waitForIdle();
+  const judgedResult = await lab.get(judged.id);
+  assert.notEqual(judgedResult.evaluatorVersion, original.evaluatorVersion);
+  assert.deepEqual(judgedResult.settings.judge, judge);
+  assert.equal(judgedResult.settings.roles.judge, undefined);
 });
 
 test('rejudged version pairs remain comparable and calibration refers to unchanged original human labels', async t => {

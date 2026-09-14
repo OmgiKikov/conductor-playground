@@ -2,15 +2,17 @@
 // node examples/check-judge.mjs --provider openrouter --model anthropic/claude-haiku-4.5 --output /tmp/judge.json
 import { parseArgs } from 'node:util';
 import { readFile, writeFile } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { emptyUsage, fingerprint, scenarioSchema, settingsSchema, trialSchema } from '../dist/contracts.js';
 import { createPiRuntime, evaluatorVersion } from '../dist/pi.js';
 
-const { values } = parseArgs({ options: { provider: { type: 'string' }, model: { type: 'string' }, output: { type: 'string' } } });
+const { values } = parseArgs({ options: { provider: { type: 'string' }, model: { type: 'string' }, upstream: { type: 'string' }, output: { type: 'string' } } });
 if (!values.provider || !values.model || !values.output) throw new Error('Provide --provider, --model and a new --output JSON path. This runs real model calls.');
 const cases = JSON.parse(await readFile(new URL('./judge-cases.json', import.meta.url), 'utf8'));
-const settings = settingsSchema.parse({ provider: values.provider, model: values.model });
+const settings = settingsSchema.parse({ provider: values.provider, model: values.model,
+  judge: { provider: values.provider, model: values.model, ...(values.upstream ? { upstream: values.upstream } : {}) } });
 const output = resolve(values.output);
 const report = { format: 'agent-lab-judge-check-1', createdAt: new Date().toISOString(), kind: 'synthetic_engineering',
   note: 'Authored test expectations, not owner labels or independent production validation. Cases were not supplied as few-shot anchors.',
@@ -34,11 +36,17 @@ for (const c of cases) {
     initialState: scenario.initialState, finalState: { ...scenario.initialState, records: c.finalRecords ?? scenario.initialState.records },
     observation: { state: c.finalRecords ? 'reported' : 'missing', tools: c.finalRecords ? 'complete' : 'partial', ...(c.finalRecords ? { resetConfirmed: true } : {}) } });
   const input = { scenario, trial, sources: [{ id: 'policy', name: 'Explicit test policy', content: c.policy, hash: fingerprint(c.policy) }] };
-  let assessments, error;
-  try { assessments = await runtime.assess(input, ctx); }
+  let assessments, error, judgeAudit, persistenceError;
+  try { assessments = await runtime.assess(input, { ...ctx, onJudgment(_id, audit) {
+    judgeAudit = audit;
+    // Keep every original response before the judge parses it, including a pending interrupted request.
+    try { writeFileSync(output, JSON.stringify({ ...report, activeCase: { id: c.id, expected, input, judgeAudit } }, null, 2) + '\n'); }
+    catch (e) { persistenceError = e; throw e; }
+  } }); }
   catch (e) { error = e instanceof Error ? e.message : 'Judge failed'; }
+  if (persistenceError) throw persistenceError;
   const actual = assessments?.[0]?.result;
-  report.results.push({ id: c.id, expected, actual, matches: actual === expected && !error, error, input, assessments });
+  report.results.push({ id: c.id, expected, actual, matches: actual === expected && !error, error, input, assessments, judgeAudit });
   await writeFile(output, JSON.stringify(report, null, 2) + '\n');
   console.log(JSON.stringify({ id: c.id, expected, actual, error }));
 }

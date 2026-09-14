@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { awaitingVerdict, compareRuns, compareUserModes, evidenceSummary, humanFindings, isAgentFailure, judgeCalibration, repeatResults, simulatorFidelity, verdictSummary } from '../src/comparison.js';
-import { emptyUsage, settingsSchema, type Experiment, type HumanReview, type MetricAssessment, type Outcome, type Scenario, type TraceEvent, type Trial, type UserMode } from '../src/contracts.js';
+import { assessRepeated, judgeInput } from '../src/judge.js';
+import { emptyUsage, fingerprint, settingsSchema, type Experiment, type HumanReview, type MetricAssessment, type Outcome, type Scenario, type TraceEvent, type Trial, type UserMode } from '../src/contracts.js';
 
 /** Sample size at which the verdict is allowed to call itself trusted. */
 const TRUSTED = 30;
@@ -40,7 +41,7 @@ function trial(id: string, scenarioId: string, userMode: UserMode, outcome: Outc
     id, revisionId: 'rev', scenarioId, familyId: scenarioId, repeat: 0, userMode, split: 'dev', manifestHash: 'h', outcome, reason: '',
     checks: ['time', 'extra'].map(check => ({ id: check, description: check, passed: !failed.has(check), evidence: '' })),
     events: options.events ?? dialogue(['hello']), initialState: world, finalState: world,
-    usage: { ...emptyUsage(), calls: options.calls ?? 1, costUsd: options.costUsd === undefined ? 0.01 : options.costUsd }, elapsedMs: 1, assessments: options.assessments,
+    usage: { ...emptyUsage(), calls: options.calls ?? 1, costUsd: options.costUsd === undefined ? 0.01 : options.costUsd }, elapsedMs: 1, assessments: options.assessments === undefined ? [{ metricId: 'fidelity', result: 'pass', rationale: 'Fixture simulator follows its card.', evidence: [0] }] : options.assessments,
   };
 }
 const review = (id: string, trialId: string, verdict: HumanReview['verdict'], target: { metricId?: string; checkId?: string } = {}, createdAt = '2026-09-08T00:00:00Z'): HumanReview => ({ id, trialId, verdict, note: 'n', createdAt, ...target });
@@ -59,14 +60,22 @@ test('identical replies with flipped rubric scores require review without rewrit
   const original = structuredClone([before, after]);
   const diff = compareRuns(before, after);
   assert.equal(diff.comparable, true);
-  assert.equal(diff.pairs[0]?.change, 'fixed', 'the automatic transition stays visible');
+  assert.equal(diff.pairs[0]?.change, 'unknown', 'a score flip on coincident replies is not an agent fix');
   assert.match(diff.pairs[0]?.reviewNote ?? '', /Ответы агента совпали/);
-  assert.match(diff.headline, /Оценка выросла у 1/);
+  assert.match(diff.headline, /Общих оценённых карточек нет/);
   assert.match(diff.headline, /разными оценками: 1\./);
   assert.doesNotMatch(diff.headline, /Исправлено/);
   assert.deepEqual([before, after], original);
+  const acrossModes = record({ scenarios: [{ ...card, metrics: card.metrics!.filter(m => m.subject === 'agent') }],
+    settings: settingsSchema.parse({ repeats: 1, userModes: ['static', 'scripted'] }),
+    trials: [{ ...a, userMode: 'static' }, { ...after.trials[0]!, userMode: 'scripted' }],
+  });
+  assert.deepEqual(compareUserModes(acrossModes)[0]!.failedChecks, ['s1/metric:goal']);
+  assert.deepEqual(compareUserModes(acrossModes)[0]!.uniqueFailedChecks, [],
+    'coincident replies with a rubric flip do not establish a mode-specific failure');
   after.trials[0]!.events[1]!.text = 'A changed answer';
   assert.equal(compareRuns(before, after).pairs[0]?.reviewNote, undefined);
+  assert.deepEqual(compareUserModes(acrossModes)[0]!.uniqueFailedChecks, ['s1/metric:goal']);
   after.trials[0]!.events = [];
   before.trials[0]!.events = [];
   assert.equal(compareRuns(before, after).pairs[0]?.reviewNote, undefined, 'missing replies are not identical evidence');
@@ -126,15 +135,56 @@ test('judge calibration compares the latest human verdict with model estimates u
   const rows = judgeCalibration(r);
   const goal = rows.find(row => row.key === 'goal')!;
   assert.deepEqual([goal.subject, goal.n, goal.tp, goal.fn, goal.fp, goal.tn], ['agent', 3, 1, 1, 1, 0]);
-  assert.equal(goal.tpr, 0.5);
+  assert.equal(goal.tpr, 1 / 3, 'unknown stays in the denominator of human-confirmed failures');
   assert.equal(goal.tnr, 0);
-  assert.equal(goal.agreement, 1 / 3);
-  assert.equal(goal.sufficient, false);
+  assert.equal(goal.agreement, 1 / 4);
+  assert.deepEqual([goal.reviewed, goal.abstained, goal.coverage], [4, 1, 3 / 4]);
+  assert.equal(goal.sampleSufficient, false);
+  assert.equal(goal.validationStatus, 'not_established');
   const fidelity = rows.find(row => row.key === 'fidelity')!;
   assert.deepEqual([fidelity.subject, fidelity.n, fidelity.tpr, fidelity.tnr, fidelity.agreement], ['simulator', 0, null, null, null]);
   const time = rows.find(row => row.key === 'check:time')!;
   assert.deepEqual([time.subject, time.n, time.fp, time.tn], ['check', 1, 1, 0]);
   assert.equal(rows.some(row => row.key === 'check:extra'), true);
+});
+
+test('human agreement separates criterion definitions and judge protocols even when metric IDs match', async () => {
+  const a = { ...scenario('s1'), checks: [], metrics: [metrics[0]!] };
+  const b = { ...scenario('s2'), checks: [], metrics: [{ ...metrics[0]!, passCriteria: 'A different requirement' }] };
+  const r = record({ mode: 'live', scenarios: [a, b], trials: [], humanReviews: [] });
+  for (const [i, card, configurationHash] of [[0, a, 'v1'], [1, b, 'v1'], [2, a, 'v2']] as const) {
+    const t = trial(`t${i}`, card.id, 'reactive', 'ungraded', { assessments: [] });
+    t.assessments = await assessRepeated({ scenario: card, sources: [], trial: t }, { provider: 'offline', id: 'test', configurationHash },
+      { signal: new AbortController().signal, timeoutMs: 1000, beforeCall() {}, addUsage() {}, onJudgment(_id, audit) { t.judgeAudit = audit; } },
+      async () => JSON.stringify({ assessments: [{ metricId: 'goal', passCondition: 'met', failCondition: 'not_met', rationale: 'Fixture evidence', evidence: [1], citations: [{ seq: 1, quote: t.events.find(e => e.seq === 1)!.text! }] }] }));
+    r.trials.push(t); r.humanReviews.push(review(`h${i}`, t.id, 'pass', { metricId: 'goal' }));
+  }
+  const rows = judgeCalibration(r);
+  assert.equal(rows.length, 3);
+  assert.equal(new Set(rows.map(x => x.criterionHash)).size, 2);
+  assert.equal(new Set(rows.map(x => x.judgeHash)).size, 2);
+  assert.ok(rows.every(x => x.n === 1 && x.tnr === 1 && x.validationStatus === 'not_established'));
+  r.trials[0]!.judgeAudit!.attempts[0]!.raw = 'corrupt response';
+  const corrupt = judgeCalibration(r).find(x => x.missing)!;
+  assert.deepEqual([corrupt.reviewed, corrupt.n, corrupt.missing, corrupt.tnr], [1, 0, 1, 0]);
+});
+
+test('sample size cannot certify a judge or hide an absent class and missing assessments', () => {
+  const trials = Array.from({ length: 60 }, (_, i) => trial(`t${i}`, 's1', 'reactive', 'pass', {
+    assessments: [{ metricId: 'goal', result: 'pass', rationale: 'r', evidence: [1] }],
+  }));
+  const r = record({ scenarios: [scenario('s1')], trials,
+    humanReviews: trials.map((t, i) => review(`h${i}`, t.id, 'pass', { metricId: 'goal' })),
+  });
+  let goal = judgeCalibration(r).find(x => x.key === 'goal')!;
+  assert.equal(goal.n, 60); assert.equal(goal.sampleSufficient, false);
+  assert.equal(goal.tpr, null); assert.equal(goal.validationStatus, 'not_established');
+  r.humanReviews.slice(0, 30).forEach(h => { h.verdict = 'fail'; });
+  r.trials[0]!.assessments = [];
+  goal = judgeCalibration(r).find(x => x.key === 'goal')!;
+  assert.equal(goal.sampleSufficient, true);
+  assert.equal(goal.validationStatus, 'not_established', 'balanced review labels are not held-out validation');
+  assert.deepEqual([goal.reviewed, goal.n, goal.missing, goal.tpr, goal.tnr], [60, 59, 1, 0, 1]);
 });
 
 test('simulator fidelity compares reactive dialogues with real ones and reports human fidelity verdicts', () => {
@@ -171,7 +221,7 @@ test('evidence summary states observed comparison results plainly and lists what
   const evaluate = evidenceSummary(record({ trials: [trial('a', 's1', 'reactive', 'fail', { assessments: [{ metricId: 'goal', result: 'fail', rationale: 'r', evidence: [1] }] })], humanReviews: [review('h', 'a', 'fail', { metricId: 'goal' })] }));
   assert.equal(evaluate.comparison, null);
   assert.equal(evaluate.modes.length, 3);
-  assert.ok(evaluate.notes.some(note => /меньше чем на 60/.test(note) && /goal/.test(note)));
+  assert.ok(evaluate.notes.some(note => /мало примеров одного или обоих классов/.test(note) && /goal/.test(note)));
   assert.ok(evaluate.notes.some(note => /Реальные диалоги не загружены/.test(note)));
   const compare = evidenceSummary(record({ workflow: 'compare', comparisons: [{
     baselineId: 'b', candidateId: 'c', manifestHash: 'h', split: 'control', plannedPairs: 4, validPairs: 4, invalidPairs: 0, families: 2,
@@ -208,12 +258,12 @@ test('the verdict says how many dialogues passed, where the agent is weak, how m
     humanReviews: [review('h1', 't0', 'fail', { metricId: 'goal' }), review('h2', 't1', 'fail')], resultsReviewedAt: '2026-09-09T00:00:00Z', target: { kind: 'module', path: '/agent.mjs', exportName: 'createSession' },
   });
   const trusted = verdictSummary(mixed);
-  assert.equal(trusted.confidence, 'medium');
+  assert.equal(trusted.confidence, 'low');
   assert.ok(trusted.confidenceReasons.some(r => r.code === 'small_sample'));
   assert.deepEqual([trusted.passed, trusted.graded], [TRUSTED - 2, TRUSTED]);
   assert.equal(trusted.nextSteps.some(s => /своего агента/.test(s.text)), false);
   const partial = verdictSummary({ ...mixed, resultsReviewedAt: undefined, humanReviews: [] });
-  assert.equal(partial.confidence, 'medium');
+  assert.equal(partial.confidence, 'low');
   assert.ok(partial.confidenceReasons.some(r => /вердикт/.test(r.text)));
   const empty = verdictSummary(record());
   assert.equal(empty.passRate, null);
@@ -229,7 +279,7 @@ test('судья, расходящийся с человеком, назван �
   const humanReviews = trials.map((t, i) => review(`h${i}`, t.id, 'pass', { metricId: 'goal' }));
   const r = record({ scenarios: [scenario('s1')], trials, humanReviews });
   const evidence = evidenceSummary(r);
-  assert.ok(evidence.notes.some(n => /расходится с человеком в 42%.*goal/.test(n)), evidence.notes.join(' | '));
+  assert.ok(evidence.notes.some(n => /goal.*подтвердил 14 из 24/.test(n)), evidence.notes.join(' | '));
   assert.ok(evidence.verdict.nextSteps.some(n => n.code === 'rewrite_rubric' && n.detail === 'goal'));
 
   // Согласный судья молчит: подсказка появляется только когда есть о чём говорить.
@@ -341,14 +391,14 @@ test('high confidence requires human verdicts on every failed dialogue, not just
     resultsReviewedAt: '2026-09-09T00:00:00Z', humanReviews: [],
   });
   const finalizedOnly = verdictSummary(r);
-  assert.equal(finalizedOnly.confidence, 'medium');
+  assert.equal(finalizedOnly.confidence, 'low');
   assert.ok(finalizedOnly.confidenceReasons.some(n => n.code === 'no_human'));
   const partial = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail')] });
-  assert.equal(partial.confidence, 'medium');
+  assert.equal(partial.confidence, 'low');
   assert.ok(partial.confidenceReasons.some(n => n.code === 'unreviewed_failures' && n.count === 1));
   assert.ok(partial.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1));
   const complete = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'fail')] });
-  assert.equal(complete.confidence, 'medium');
+  assert.equal(complete.confidence, 'low');
   assert.equal(complete.nextSteps.some(n => n.code === 'record_verdicts'), false);
 });
 
@@ -359,15 +409,15 @@ test('unknown and invalid human verdicts are not decisions: they keep confidence
     resultsReviewedAt: '2026-09-09T00:00:00Z', humanReviews: [review('h0', 't0', 'unknown'), review('h1', 't1', 'invalid', { checkId: 'time' })],
   });
   const undecided = verdictSummary(r);
-  assert.equal(undecided.confidence, 'medium');
+  assert.equal(undecided.confidence, 'low');
   assert.ok(undecided.confidenceReasons.some(n => n.code === 'no_decisive_verdicts'));
   assert.ok(undecided.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 2));
   const half = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'unknown')] });
-  assert.equal(half.confidence, 'medium');
+  assert.equal(half.confidence, 'low');
   assert.ok(half.confidenceReasons.some(n => n.code === 'undecided_failures' && n.count === 1));
   assert.ok(half.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1));
   const decided = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'unknown'), review('h2', 't1', 'pass', { metricId: 'goal' })] });
-  assert.equal(decided.confidence, 'medium');
+  assert.equal(decided.confidence, 'low');
   assert.ok(decided.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1), 'a passing rubric label does not resolve a failed objective check');
 });
 
@@ -379,13 +429,13 @@ test('a revised human verdict counts by its latest value: fail replaced by unkno
     humanReviews: [review('h0', 't0', 'fail', {}, '2026-09-09T00:00:00Z'), review('h1', 't1', 'fail', {}, '2026-09-09T00:00:00Z'), review('h2', 't1', 'unknown', {}, '2026-09-09T01:00:00Z')],
   });
   const revised = verdictSummary(r);
-  assert.equal(revised.confidence, 'medium');
+  assert.equal(revised.confidence, 'low');
   assert.ok(revised.confidenceReasons.some(n => n.code === 'undecided_failures' && n.count === 1));
   assert.ok(revised.nextSteps.some(n => n.code === 'record_verdicts' && n.count === 1));
   const reaffirmed = verdictSummary({ ...r, humanReviews: [...r.humanReviews, review('h3', 't1', 'fail', {}, '2026-09-09T02:00:00Z')] });
-  assert.equal(reaffirmed.confidence, 'medium');
+  assert.equal(reaffirmed.confidence, 'low');
   const metricOnly = verdictSummary({ ...r, humanReviews: [review('h0', 't0', 'fail'), review('h1', 't1', 'fail', { metricId: 'goal' }, '2026-09-09T00:00:00Z'), review('h2', 't1', 'unknown', { metricId: 'goal' }, '2026-09-09T01:00:00Z')] });
-  assert.equal(metricOnly.confidence, 'medium');
+  assert.equal(metricOnly.confidence, 'low');
 });
 
 test('confidence needs distinct reviewed situations and complete evidence; demo repetitions never qualify', () => {
@@ -408,10 +458,10 @@ test('confidence needs distinct reviewed situations and complete evidence; demo 
 });
 
 test('run differences reject changed cards, missing or duplicate attempts and invalid evidence; rubric-only failures participate', () => {
-  const s = { ...scenario('s1'), checks: [] };
+  const s = { ...scenario('s1'), checks: [], metrics: metrics.filter(m => m.subject === 'agent') };
   const make = (id: string, result: 'pass' | 'fail' | 'unknown') => record({ id, scenarios: [s], settings: settingsSchema.parse({ repeats: 1, userModes: ['reactive'] }),
     trials: [{ ...trial('t', 's1', 'reactive', 'ungraded', { assessments: [{ metricId: 'goal', result, rationale: 'r', evidence: [1] }] }), checks: [] }] });
-  const before = make('before', 'fail'); const after = make('after', 'pass');
+  const before = make('before', 'fail'); const after = make('after', 'pass'); after.trials[0]!.events[1]!.text = 'The actual improved answer';
   assert.equal(compareRuns(before, after).fixed.length, 1);
   assert.equal(compareRuns(before, after).includesRubrics, true);
   assert.equal(compareRuns(before, make('unknown', 'unknown')).ungraded, 1);
@@ -581,4 +631,29 @@ test('comparison opens the repaired repeat before unchanged attempts of the same
   assert.equal(diff.fixed.length, 1);
   assert.deepEqual(diff.pairs.map(p => p.repeat), [2, 0, 1]);
   assert.deepEqual(diff.pairs.map(p => p.change), ['fixed', 'unchanged', 'unchanged']);
+});
+
+test('live rubric comparisons require recorded compatible judge protocols and a measured simulator', () => {
+  const card = { ...scenario('s1'), checks: [] };
+  const before = record({ id: 'before', mode: 'live', scenarios: [card], settings: settingsSchema.parse({ repeats: 1, userModes: ['reactive'] }),
+    trials: [{ ...trial('a', 's1', 'reactive', 'ungraded', { assessments: [
+      { metricId: 'goal', result: 'fail', rationale: 'Evidence', evidence: [1] },
+      { metricId: 'fidelity', result: 'pass', rationale: 'Evidence', evidence: [0] },
+    ] }), checks: [] }] });
+  const after = structuredClone(before); after.id = 'after'; after.trials[0]!.id = 'b'; after.trials[0]!.events[1]!.text = 'Better answer'; after.trials[0]!.assessments![0]!.result = 'pass';
+  assert.equal(compareRuns(before, after).comparable, false, 'legacy single votes cannot establish improvement');
+  for (const run of [before, after]) {
+    for (const a of run.trials[0]!.assessments!) a.citations = a.evidence.map(seq => ({ seq, quote: run.trials[0]!.events.find(e => e.seq === seq)!.text! }));
+    const data = judgeInput({ scenario: card, sources: run.sources, trial: run.trials[0]! });
+    run.trials[0]!.judgeAudit = { protocolHash: 'protocol-v1', inputHash: fingerprint(data), provider: 'offline', model: 'judge', prompt: 'prompt', input: JSON.stringify(data),
+      attempts: [0, 1].map(() => ({ startedAt: 'now', raw: JSON.stringify({ assessments: run.trials[0]!.assessments!.map(({ result, ...v }) => ({ ...v, passCondition: result === 'pass' ? 'met' : 'not_met', failCondition: result === 'fail' ? 'met' : 'not_met' })) }), assessments: structuredClone(run.trials[0]!.assessments!) })), notApplicable: [] };
+  }
+  assert.equal(compareRuns(before, after).fixed.length, 1);
+  after.trials[0]!.judgeAudit!.protocolHash = 'protocol-v2';
+  assert.equal(compareRuns(before, after).comparable, false);
+  after.trials[0]!.judgeAudit!.protocolHash = 'protocol-v1';
+  after.trials[0]!.assessments = after.trials[0]!.assessments!.filter(a => a.metricId !== 'fidelity');
+  const unknown = compareRuns(before, after);
+  assert.equal(unknown.fixed.length, 0); assert.equal(unknown.comparable, false);
+  assert.equal(verdictSummary(after).simulatorFlagged, 1);
 });

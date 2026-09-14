@@ -3,13 +3,13 @@ import {
   type ResourceLoader, type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
+import { assessRepeated, JUDGE_PROTOCOL, JUDGE_RESPONSE_FORMAT } from './judge.js';
 import { z } from 'zod';
 import {
   agentSchema, failureModeSchema, observedGoalSchema, observedProfileSchema, preparationSchema, proposalSchema, requirementSchema, scenarioSchema,
-  TOOL_NAMES, VERSION, fingerprint, simulatorFidelity, simulatorWasUsed, userTurnSchema, validateObservedGoals,
-  type CallContext, type MetricAssessment, type Runtime, type Settings, type TargetSession, type Tool,
+  TOOL_NAMES, VERSION, fingerprint, simulatorFidelity, userTurnSchema, validateObservedGoals,
+  type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
-import { judgeAssessment, judgeInput, judgeResponseSchema } from './judge.js';
 import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
@@ -39,8 +39,8 @@ const simulatorReplySchema = z.strictObject({ done: userTurnSchema.shape.done, m
   .describe('To stop immediately, return done:true and omit message. A nonempty message is always delivered to the target. done:true with a nonempty message means deliver this final user message, receive the target response, then end. done:true with an empty message means stop now without another target response.');
 const authHelp = 'Войдите в Pi через /login или задайте ключ выбранного провайдера, затем выберите доступную модель. Живой прогон никогда не подменяется демо.';
 
-export const evaluatorVersion = (settings: Settings): string => fingerprint({ protocol: VERSION, judge: ASSESS_ROLE, simulator: SIMULATOR_ROLE,
-  provider: settings.provider, model: settings.model, roles: settings.roles ?? {} });
+export const evaluatorVersion = (settings: Settings): string => fingerprint({ protocol: VERSION, judge: JUDGE_PROTOCOL, simulator: SIMULATOR_ROLE,
+  provider: settings.provider, model: settings.model, roles: settings.roles ?? {}, judgeModel: settings.judge });
 
 /** Explicit resources avoid global/project extensions, skills, AGENTS files and prompt discovery. */
 function resources(systemPrompt: string): ResourceLoader {
@@ -62,7 +62,7 @@ function resources(systemPrompt: string): ResourceLoader {
 
 async function controlledSession(
   modelRuntime: ModelRuntime, model: Model, systemPrompt: string, tools: Tool[],
-  ctx: CallContext, maxTokens = 16384, thinkingLevel: 'off' | 'medium' = 'off',
+  ctx: CallContext, maxTokens = 16384, temperature?: number, structuredJudge = false, thinkingLevel: 'off' | 'medium' = 'off',
 ): Promise<TargetSession> {
   ctx.signal.throwIfAborted();
   if (new Set(tools.map(t => t.name)).size !== tools.length
@@ -104,7 +104,8 @@ async function controlledSession(
       pendingUsage++;
       return await stream(m, { ...context, systemPrompt }, {
         ...options, signal: AbortSignal.any([activeSignal, ...(options?.signal ? [options.signal] : [])]),
-        timeoutMs: ctx.timeoutMs, maxRetries: 0, maxTokens: Math.min(maxTokens, model.maxTokens),
+        timeoutMs: ctx.timeoutMs, maxRetries: 0, maxTokens: Math.min(maxTokens, model.maxTokens), ...(temperature === undefined ? {} : { temperature }),
+        ...(structuredJudge ? { onPayload: (payload: unknown) => ({ ...(payload as Record<string, unknown>), response_format: JUDGE_RESPONSE_FORMAT }) } : {}),
       });
     } catch (error) {
       // Preserve our own budget/cancellation error; provider errors are sanitized at the response boundary.
@@ -171,7 +172,16 @@ async function controlledSession(
         if (boundaryError) throw boundaryError;
         const last = session.messages.slice(start).findLast(m => m.role === 'assistant');
         if (!last || last.role !== 'assistant' || last.stopReason !== 'stop') {
-          throw new Error(`Модель не довела ответ до конца (${last?.role === 'assistant' ? last.stopReason : 'ответа нет'}). Проверьте доступ к провайдеру и лимиты вызовов.`);
+          // Persist only a fixed diagnostic category; SDK errors can contain credentials and URLs.
+          const detail = last?.role === 'assistant' ? last.errorMessage ?? '' : '';
+          const category = /429|rate.?limit/i.test(detail) ? 'rate limit'
+            : /402|credit|balance/i.test(detail) ? 'insufficient credit'
+            : /401|403|unauthorized|forbidden/i.test(detail) ? 'access denied'
+            : /timeout|timed out/i.test(detail) ? 'timeout'
+            : /fetch failed|connection|socket|network/i.test(detail) ? 'connection failure'
+            : /context.?length|too many tokens/i.test(detail) ? 'context limit'
+            : last?.role === 'assistant' ? last.stopReason : 'missing response';
+          throw new Error(`Pi provider response incomplete: ${category}`);
         }
         const output = last.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
         if (!output.trim()) throw new Error('Модель вернула пустой ответ.');
@@ -231,8 +241,7 @@ async function jsonResponse<S extends z.ZodType>(
 ): Promise<z.infer<S>> {
   const prompt = `${role}\n${DATA_BOUNDARY}\nReturn exactly one compact JSON object, without markdown fences or pretty-printing whitespace, matching this JSON schema:\n${JSON.stringify(z.toJSONSchema(schema))}`;
   // Only target sessions contribute target trace events; simulator/planner events cannot affect target grades.
-  const session = await controlledSession(modelRuntime, model, prompt, [], { ...ctx, onTargetEvent: undefined }, 16384,
-    role === ASSESS_ROLE && model.reasoning ? 'medium' : 'off');
+  const session = await controlledSession(modelRuntime, model, prompt, [], { ...ctx, onTargetEvent: undefined });
   try {
     let message = JSON.stringify(input);
     let rejection = '';
@@ -454,23 +463,29 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
       );
     },
     async assess(input, ctx) {
-      const all = input.scenario.metrics ?? [];
-      const metrics = all.filter(m => m.subject === 'agent' || simulatorWasUsed(input.trial));
-      const unmeasured = all.filter(m => !metrics.includes(m)).map(m => ({ metricId: m.id, result: 'unknown' as const, evidence: [], rationale: 'Реактивный симулятор не участвовал; его качество не измерено.' }));
-      if (!metrics.length) return unmeasured;
-      const assessments: MetricAssessment[] = [];
-      for (const metric of metrics) {
-        const result = await ask(
-        'Оценка диалога',
-        ASSESS_ROLE,
-        judgeInput(metric, input.scenario, input.sources, input.trial),
-        judgeResponseSchema, ctx,
-        value => { try { judgeAssessment(metric, input.trial, value); return undefined; }
-          catch (error) { return error instanceof Error ? error.message : 'Invalid assessment evidence'; } },
-        );
-        assessments.push(judgeAssessment(metric, input.trial, result));
-      }
-      return [...assessments, ...unmeasured];
+      const judge = settings.roles?.judge ?? settings.judge ?? { provider: settings.provider, model: settings.model };
+      const upstream = settings.roles?.judge ? undefined : settings.judge?.upstream;
+      const resolved = modelRuntime.getModel(judge.provider, judge.model);
+      if (!resolved) throw new Error(`Judge model unavailable: ${judge.provider}/${judge.model}`);
+      // Pi's catalog selects the Anthropic-native endpoint for Sonnet. OpenRouter
+      // routing options belong to the Chat Completions adapter; use that adapter
+      // explicitly instead of recording a routing preference the transport ignores.
+      const judgeModel: Model = judge.provider === 'openrouter' ? {
+        ...resolved, api: 'openai-completions', baseUrl: 'https://openrouter.ai/api/v1',
+        compat: { ...resolved.compat, supportsDeveloperRole: false, maxTokensField: 'max_tokens', ...(upstream ? {
+          openRouterRouting: { only: [upstream], allow_fallbacks: false },
+        } : {}) },
+      } : resolved;
+      return assessRepeated(input, { ...judgeModel,
+        configurationHash: fingerprint({ api: judgeModel.api, baseUrl: judgeModel.baseUrl, compat: judgeModel.compat,
+          temperature: judgeModel.reasoning ? 'default' : 0, thinking: judgeModel.reasoning ? 'medium' : 'off' }),
+        transport: { api: judgeModel.api, upstream, structured: judge.provider === 'openrouter' },
+      }, ctx, async (prompt, data, recordPartial) => {
+        const session = await controlledSession(modelRuntime, judgeModel, prompt, [], { ...ctx, onTargetEvent: event => {
+          if (event.type === 'assistant' && event.text) recordPartial(event.text);
+        } }, 16384, judgeModel.reasoning ? undefined : 0, judge.provider === 'openrouter', judgeModel.reasoning ? 'medium' : 'off');
+        try { return await session.respond(data); } finally { await session.close(); }
+      });
     },
     async openTarget(agent, sources, tools, ctx) {
       agentSchema.parse(agent);

@@ -47,7 +47,7 @@ export async function previewCriteria(record: Experiment, scenarioId: string, ra
       : scores.length && scores.every(s => s === 'pass') ? 'pass' : 'unknown';
     results.push({ label, answer, expected: label === 'good' ? 'pass' : 'fail', result,
       matchesExpected: result === 'unknown' ? null : result === (label === 'good' ? 'pass' : 'fail'),
-      checks: exact.checks, assessments: trial.assessments ?? [], error: trial.assessmentError, unmeasured: exact.unmeasured });
+      checks: exact.checks, assessments: trial.assessments ?? [], judgeAudit: trial.judgeAudit, error: trial.assessmentError, unmeasured: exact.unmeasured });
   }
   const preview = { format: 'agent-lab-preview-1', id: randomUUID(), createdAt: new Date().toISOString(), runId: record.id, scenarioId,
     evaluatorVersion: evaluatorVersion(record.settings), criteriaHash: fingerprint({ checks: scenario.checks, metrics: scenario.metrics }),

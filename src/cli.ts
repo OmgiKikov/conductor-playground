@@ -6,13 +6,14 @@ import { spawn } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { ExperimentLab, draftHash } from './experiment.js';
 import { demoInput } from './demo.js';
-import { createInputSchema } from './contracts.js';
+import { createInputSchema, DEFAULT_JUDGE } from './contracts.js';
 import { compareRuns, evidenceSummary, evaluationExitCode } from './comparison.js';
 import { doctor, listSuites, readConnection, rememberedConnection, rememberConnection } from './connection.js';
 import { inspectPrompt, promptVersion, proposePrompt } from './prompt-edit.js';
 import { readData } from './imports.js';
 import { previewCriteria } from './preview.js';
 import { getPiStatus } from './pi.js';
+import { auditJudge } from './judge-audit.js';
 import { htmlReport, jsonReport, markdownReport } from './report.js';
 import { ExperimentStore } from './store.js';
 import { evidenceBundle, exportArtifacts } from './artifacts.js';
@@ -37,10 +38,11 @@ async function main() {
     connection: { type: 'string' }, directory: { type: 'string' }, 'code-only': { type: 'boolean' },
     'golden-file': { type: 'string' }, 'dialogues-file': { type: 'string' }, candidate: { type: 'string' },
     hypothesis: { type: 'string' }, trial: { type: 'string', multiple: true }, scenario: { type: 'string' },
-    yes: { type: 'boolean' }, case: { type: 'string', multiple: true },
+    yes: { type: 'boolean' }, repeats: { type: 'string' }, case: { type: 'string', multiple: true },
   } });
   const command = positionals[0];
   if (values.help || !command) {
+    process.stdout.write('  agent-lab audit-judge --id RUN --output NEW_DIRECTORY --repeats 10 --yes\n');
     process.stdout.write('  agent-lab preview --id RUN --scenario CASE --input examples.json --yes\n');
     process.stdout.write('Agent Lab — проверьте, что сломала правка вашего агента.\n\n  agent-lab                         Диалог в текущем проекте\n  agent-lab chat [опции Pi]          Напишите задачу обычными словами\n  agent-lab save-suite --id RUN --output .evals/regression.json [--case ID]\n  agent-lab evaluate --input .evals/regression.json --yes [--case ID]\n\nevaluate: 0 — все оценки пройдены; 1 — зарегистрирован провал; 2 — ошибка теста/среды или неполные данные.\n--yes разрешает расход в пределах сохранённых лимитов; ручной оценкой ожиданий это не считается.\n\n');
     process.stdout.write('  agent-lab doctor --connection connection.json --yes\n  agent-lab suites --directory .evals\n  agent-lab reassess --id RUN [--input criteria.json] --yes\n  agent-lab reassess --id RUN --code-only\n  agent-lab prompt-propose --id RUN --candidate prompt.md --hypothesis TEXT --trial TRIAL\n  agent-lab prompt-apply --input proposal.json --yes\n  agent-lab pilot --id RUN\n  evaluate принимает --connection; build — --golden-file и --dialogues-file (JSON/JSONL).\n\n');
@@ -70,6 +72,21 @@ async function main() {
     if (!values.id) throw new Error('Укажите --id RUN');
     const record = await new ExperimentStore(directory).get(values.id);
     process.stdout.write(JSON.stringify(evidenceSummary(record).pilot, null, 2) + '\n'); return;
+  }
+  if (command === 'audit-judge') {
+    if (!values.id || !values.output || !values.yes) throw new Error('audit-judge --id RUN --output NEW_DIRECTORY --yes [--repeats 10]. Используются сохранённые лимиты; агент не вызывается.');
+    const record = await new ExperimentStore(directory).get(values.id);
+    if (record.mode !== 'live') throw new Error('Для измерения модели нужен сохранённый живой прогон.');
+    const trials = record.trials.filter(t => ['pass', 'fail', 'ungraded'].includes(t.outcome) && (!values.case || values.case.includes(t.scenarioId)));
+    const inputs = trials.flatMap(trial => {
+      const scenario = record.scenarios.find(s => s.id === trial.scenarioId);
+      return scenario?.metrics?.length ? [{ scenario, sources: record.sources, trial }] : [];
+    });
+    await auditJudge(inputs, { ...record.settings, judge: record.settings.judge ?? DEFAULT_JUDGE }, resolve(values.output), Number(values.repeats ?? '10'));
+    const result = JSON.parse(await readFile(resolve(values.output, 'statistics.json'), 'utf8'));
+    process.stdout.write(JSON.stringify({ output: resolve(values.output), ...result }, null, 2) + '\n');
+    process.exitCode = !result.complete || result.statistics.pending ? 2 : result.ready ? 0 : 1;
+    return;
   }
   // Reading an atomic snapshot must not take the writer lock or mark another process interrupted.
   if (command === 'export' || command === 'diff') {
@@ -180,4 +197,4 @@ async function main() {
     await lab.close();
   }
 }
-void main().catch(error => { process.stderr.write(`Agent Lab: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = process.argv[2] === 'evaluate' ? 2 : 1; });
+void main().catch(error => { process.stderr.write(`Agent Lab: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = ['evaluate', 'audit-judge'].includes(process.argv[2] ?? '') ? 2 : 1; });

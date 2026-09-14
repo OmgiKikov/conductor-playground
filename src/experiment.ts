@@ -294,7 +294,7 @@ export class ExperimentLab {
       const prepared = validatePreparation({ requirements: record.requirements, questions: record.questions, agent: record.revisions[0]?.spec,
         scenarios: record.scenarios.map(({ split: _, ...s }) => s) }, record.sources, 'evaluate', record.profiles);
       record.scenarios = prepared.scenarios;
-      if (input.judge) record.settings.roles.judge = input.judge;
+      if (input.judge) { record.settings.judge = input.judge; delete record.settings.roles.judge; }
       record.evaluatorVersion = evaluatorVersion(record.settings);
       record.assessmentOf = previous.id;
       const trials = previous.trials.filter(t => !input.trialIds || input.trialIds.includes(t.id));
@@ -312,7 +312,7 @@ export class ExperimentLab {
           ctx.signal.throwIfAborted();
           const trial = structuredClone(original);
           const scenario = record.scenarios.find(s => s.id === trial.scenarioId)!;
-          trial.usage = emptyUsage(); delete trial.externalUsage; delete trial.assessments; delete trial.assessmentError;
+          trial.usage = emptyUsage(); delete trial.externalUsage; delete trial.assessments; delete trial.assessmentError; delete trial.judgeAudit;
           trial.manifestHash = record.manifestHash!;
           if (record.target.kind !== 'sandbox' && !trial.observation) trial.observation = { state: 'missing', tools: 'partial' };
           const started = performance.now();
@@ -442,6 +442,7 @@ export class ExperimentLab {
         record.usage.costUsd = usage.costUsd === null || record.usage.costUsd === null ? null : record.usage.costUsd + usage.costUsd;
       },
       onTrace: (trialId, event) => this.store.appendTrace(record.id, trialId, event),
+      onJudgment: (trialId, audit) => this.store.appendJudgment(record.id, trialId, audit),
     };
     active.done = (async () => {
       try {

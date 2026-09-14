@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  emptyUsage, userTurnSchema, scriptIssue, simulatorWasUsed, validateAssessments,
+  emptyUsage, userTurnSchema, scriptIssue, metricApplies, validateAssessments,
   type CallContext, type CheckResult, type DialogueMessage, type Revision,
   type Runtime, type Scenario, type Settings, type Source, type Target, type TargetSession, type TraceEvent, type Trial, type UserMode,
 } from './contracts.js';
@@ -237,7 +237,7 @@ export async function evaluateTrial(input: {
     stage = 'проверка наблюдений';
     trial.checks = grade(scenario, trial);
     const allPassed = trial.checks.length > 0 && trial.checks.every(check => check.passed);
-    trial.outcome = !stopped ? 'fail' : trial.checks.length === 0 ? 'ungraded' : allPassed ? 'pass' : 'fail';
+    trial.outcome = !stopped ? 'invalid' : trial.checks.length === 0 ? 'ungraded' : allPassed ? 'pass' : 'fail';
     trial.reason ||= !stopped ? 'Разговор не завершился в отведённое число реплик.' : trial.checks.length === 0
       ? 'Диалог дошёл до конца, но объективных проверок в карточке нет: оценки по рубрикам считаются отдельно.'
       : allPassed ? 'Все объективные проверки пройдены.' : 'Часть объективных проверок провалена.';
@@ -267,8 +267,12 @@ export async function evaluateTrial(input: {
       if (!runtime.assess) throw new Error('Metric assessment is unavailable for this runtime');
       ctx.signal.throwIfAborted();
       onStage?.('assessment');
-      trial.assessments = await assessTrial(runtime, scenario, sources, trial, localCtx);
+      trial.assessments = await assessTrial(runtime, scenario, sources, trial, { ...localCtx, onJudgment: (id, audit) => {
+        try { ctx.onJudgment?.(id, audit); }
+        catch (error) { persistenceFailed = true; persistenceError = error; throw error; }
+      } });
     } catch (error) {
+      if (persistenceFailed) throw persistenceError;
       trial.assessmentError = (ctx.signal.aborted ? 'Metric assessment cancelled' : error instanceof Error ? error.message : 'Metric assessment failed').slice(0, 4000);
     }
     trial.elapsedMs = Math.round(performance.now() - started);
@@ -282,9 +286,12 @@ export async function assessTrial(runtime: Runtime, scenario: Scenario, sources:
   const metrics = scenario.metrics ?? [];
   const assessments = validateAssessments(metrics, trial.events, await runtime.assess({
     scenario: structuredClone(scenario), sources: structuredClone(sources), trial: structuredClone(trial),
-  }, { ...ctx, onTargetEvent: undefined, onTrace: undefined }));
+  }, { ...ctx, onTargetEvent: undefined, onTrace: undefined, onJudgment: (id, audit) => {
+    trial.judgeAudit = structuredClone(audit);
+    ctx.onJudgment?.(id, audit);
+  } }));
   ctx.signal.throwIfAborted();
-  return assessments.map(assessment => !simulatorWasUsed(trial) && metrics.find(m => m.id === assessment.metricId)?.subject === 'simulator'
-    ? { ...assessment, result: 'unknown' as const, evidence: [], rationale: 'Реактивный симулятор не участвовал в этом диалоге; его качество не измерено.' }
+  return assessments.map(assessment => !metricApplies(metrics.find(m => m.id === assessment.metricId)!, trial)
+    ? { metricId: assessment.metricId, result: 'unknown' as const, evidence: [], rationale: 'Реактивный симулятор не участвовал в этом диалоге; его качество не измерено.' }
     : assessment);
 }

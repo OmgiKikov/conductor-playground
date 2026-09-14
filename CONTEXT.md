@@ -38,7 +38,7 @@ A native Pi package that turns a task, materials and real data into simulated di
 
 **Owner notes**: The owner's own hints about users, goals and situations, in their words. First-class input for synthetic cards, recorded as owner-supplied assumptions, never promoted to business rules.
 
-**Verdict**: The bounded interpretation of a run, separating execution completeness, deterministic checks, provisional rubric assessments, human review and provenance. Measurement confidence is an audit heuristic about the evidence, not a score of the agent's quality.
+**Verdict**: The bounded interpretation of a run, separating execution completeness, deterministic checks, provisional rubric assessments, human review and provenance. Audit completeness is a heuristic about the recorded evidence, not a score of the agent's quality or validation of the judge.
 
 **Draft**: An unapproved set of cards and evaluation conditions that the owner can still change. Updating a named card preserves other cards; deleting a card is a separate, explicit intention.
 
@@ -58,7 +58,11 @@ A native Pi package that turns a task, materials and real data into simulated di
 
 **Invalid trial**: An attempt that cannot measure the agent because simulation or infrastructure failed. An agent making a wrong decision is a valid failed trial.
 
-**Calibration**: Agreement between the model judge and the latest human verdict per metric or check. Fail is the positive class: TPR is the share of human-confirmed failures the judge also flagged, TNR the share of human-confirmed passes it also passed. Fewer than sixty labeled pairs is not enough to trust a rate.
+**Judge repeatability**: How often repeated assessments of an unchanged input and rubric agree. Consistency does not establish correctness.
+
+**Human agreement**: Descriptive agreement with the latest human verdict, kept separate for each criterion and judge version. Fail is the positive class: TPR is the share of human failures also flagged, TNR the share of human successes also passed; abstentions and missing judgments remain visible.
+
+**Judge validation**: Evidence that a fixed judge detects a specific failure mode on human-labeled examples held out from its development. Reviewing existing scores, approving a rubric or reaching a sample count does not establish validation.
 
 **Fidelity**: Descriptive gaps between reactive simulated dialogues and production dialogues: turns per dialogue, message length, question rate, disengagement rate, plus human fidelity verdicts. Small gaps do not prove realism; large gaps disprove it.
 

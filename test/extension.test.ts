@@ -339,7 +339,7 @@ test('build accepts an external module target, real dialogues and golden cases; 
     assert.match(await readFile(inspect.artifacts.htmlReport, 'utf8'), /<!doctype html>/);
     assert.equal(inspect.scenarios.filter((s: { provenance: string }) => s.provenance === 'curated').length, 1);
     const markdown = await readFile(inspect.artifacts.report, 'utf8');
-    assert.match(markdown, /Наблюдаемый результат/); assert.match(markdown, /Режимы пользователя/); assert.match(markdown, /Калибровка судьи/); assert.match(markdown, /Верность симулятора/);
+    assert.match(markdown, /Наблюдаемый результат/); assert.match(markdown, /Режимы пользователя/); assert.match(markdown, /Сверка с ручными вердиктами/); assert.match(markdown, /Верность симулятора/);
     assert.match(markdown, /Испытуемый: модуль/);
     await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
   } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }
@@ -361,7 +361,7 @@ test('the plain verdict leads every surface and the thorough preset widens the r
     assert.equal(evidence.settings.repeats, 2);
     const markdown = await readFile(thorough.artifacts.report, 'utf8');
     assert.ok(markdown.indexOf('## Итог') < markdown.indexOf('## Наблюдаемый результат'));
-    assert.match(markdown, /Доверие: низкое/);
+    assert.match(markdown, /Полнота аудита: низкая/);
     assert.match(markdown, /Карточки: синтетических 1, golden 0, из продакшна 0/);
     await assert.rejects(access(join(directory, '.agent-lab', '.lock')));
   } finally { await shutdown(); await rm(directory, { recursive: true, force: true }); }

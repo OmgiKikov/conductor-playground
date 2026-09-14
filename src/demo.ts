@@ -108,7 +108,7 @@ export function createDemoRuntime(): Runtime {
               : scenario.requirementIds.includes('preference') ? 'Revises the desired time once' : 'Ends after the assigned request is answered'] },
           successCriteria: `${scenario.user.goal} Preserve the appointment owner and booking status, and report only actions supported by tool results.`,
           assumptions: ['This is a curated, scripted appointment demo.', 'The user is authorized to access their fixture appointment.'],
-          metrics: structuredClone(demoMetrics),
+          metrics: structuredClone(demoMetrics.filter(m => m.subject === 'agent' || scenario.user.maxFollowUps !== 0)),
         }));
       }
       return preparationSchema.parse({

@@ -45,7 +45,7 @@ test('coincident replies with different scores are visible in Pi and exported re
   const board = new LabBoard({ record: after, before, comparison: bundle.comparison, section: 'comparison' }, theme, () => {}, () => {}, () => 40);
   try {
     for (const text of [board.render(120).join('\n'), htmlReport(bundle), markdownReport(bundle)]) {
-      assert.match(text, /Оценка выросла у 1/);
+      assert.match(text, /Общих оценённых карточек нет/);
       assert.match(text, /Ответы агента совпали/);
       assert.doesNotMatch(text, /Исправлено 1/);
     }
@@ -292,10 +292,12 @@ test('the statistics section renders the evidence summary in narrow and wide ter
   assert.match(text, /static/); assert.match(text, /reactive/);
   assert.match(text, /Вердиктов человека по метрикам и проверкам ещё нет/);
   assert.match(text, /Реальные диалоги: 1/);
-  assert.match(text, /Калибровка судьи/);
+  assert.match(text, /Сверка с ручными вердиктами/);
   board.dispose();
   const other = new LabBoard({ record }, theme, () => {}, () => {}, () => 40);
   other.handleInput('4');
+  other.render(120);
+  other.handleInput('\u001b[F');
   assert.match(stripTerminalSequences(other.render(120).join('\n')), /Верность симулятора/);
   other.dispose();
 });
@@ -316,7 +318,7 @@ test('the board leads with a plain verdict once dialogues exist and keeps the re
   assert.match(text, /Дальше/);
   assert.doesNotMatch(text, /TPR/);
   board.handleInput('4');
-  assert.match(board.render(120).join('\n'), /Достоверность измерения: низкое/);
+  assert.match(board.render(120).join('\n'), /Полнота аудита: низкая/);
   for (const width of [16, 40, 80]) for (const line of board.render(width)) assert.ok(visibleWidth(line) <= width, `overflow at ${width}`);
   board.dispose();
   const results = new LabBoard({ record }, theme, () => {}, () => {}, () => 40);

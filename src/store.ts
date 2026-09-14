@@ -2,7 +2,7 @@ import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises
 import { appendFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { experimentSchema, type Experiment, type TraceEvent } from './contracts.js';
+import { experimentSchema, judgeAuditSchema, type Experiment, type TraceEvent, type JudgeAudit } from './contracts.js';
 
 const idPattern = /^[a-zA-Z0-9_-]{1,80}$/;
 type LockOwner = { pid: number; token: string };
@@ -128,5 +128,12 @@ export class ExperimentStore {
     this.path(id);
     try { return await readFile(join(this.directory, `${id}.trace.jsonl`), 'utf8'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''; throw error; }
+  }
+  appendJudgment(id: string, trialId: string, audit: JudgeAudit): void {
+    if (!this.lockToken) throw new Error('Для записи оценки откройте лабораторию как писатель.');
+    this.path(id);
+    if (!idPattern.test(trialId)) throw new Error('Invalid trial ID');
+    // The existing evidence journal also survives interruption during assessment.
+    appendFileSync(join(this.directory, `${id}.trace.jsonl`), `${JSON.stringify({ trialId, judgeAudit: judgeAuditSchema.parse(audit) })}\n`, { mode: 0o600, flush: true });
   }
 }
