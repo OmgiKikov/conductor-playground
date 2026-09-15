@@ -13,7 +13,7 @@ export interface GigaContentPart {
   function_call?: { name: string; arguments?: unknown };
   function_result?: { name: string; result: unknown };
 }
-export interface GigaRequestMessage { role: string; content: GigaContentPart[] }
+export interface GigaRequestMessage { role: string; content: GigaContentPart[]; tools_state_id?: string }
 export interface GigaRequest {
   model: string;
   messages: GigaRequestMessage[];
@@ -21,16 +21,44 @@ export interface GigaRequest {
   tools?: { functions: { specifications: { name: string; description: string; parameters: unknown }[] } }[];
 }
 
-// Гейтвей и наш харнесс работают только с текстом; мысли/тул-коллы в истории сообщений отбрасываются.
+// Достаёт текстовые части content; мысли и тул-коллы — не текст, для них у buildChatRequest
+// есть отдельные ветки по роли (assistant с вызовом функции, toolResult с его результатом).
 function textOf(content: GigaMessage['content']): string {
   if (typeof content === 'string') return content;
   return content.filter(part => part.type === 'text').map(part => (part as { text: string }).text).join('\n');
+}
+
+/** Идентификатор вызова собран как `${tools_state_id}#${индекс}`, чтобы состояние читалось обратно из истории. */
+function stateOf(toolCallId: string): { tools_state_id?: string } {
+  const state = toolCallId.split('#')[0];
+  return state ? { tools_state_id: state } : {};
 }
 
 export function buildChatRequest(modelId: string, context: GigaContext, options: GigaOptions): GigaRequest {
   const messages: GigaRequestMessage[] = [];
   if (context.systemPrompt) messages.push({ role: 'system', content: [{ text: context.systemPrompt }] });
   for (const message of context.messages) {
+    if (message.role === 'toolResult') {
+      messages.push({
+        role: 'function',
+        content: [{ function_result: { name: message.toolName, result: textOf(message.content) } }],
+        ...stateOf(message.toolCallId),
+      });
+      continue;
+    }
+    if (message.role === 'assistant') {
+      const parts: GigaContentPart[] = [];
+      const text = textOf(message.content);
+      if (text) parts.push({ text });
+      let state: { tools_state_id?: string } = {};
+      for (const item of message.content) {
+        if (item.type !== 'toolCall') continue;
+        parts.push({ function_call: { name: item.name, arguments: item.arguments ?? {} } });
+        state = stateOf(item.id);
+      }
+      messages.push({ role: 'assistant', content: parts, ...state });
+      continue;
+    }
     messages.push({ role: message.role, content: [{ text: textOf(message.content) }] });
   }
   const modelOptions: Record<string, unknown> = {};

@@ -89,6 +89,25 @@ test('a request without tools omits the tools field', () => {
   assert.equal('tools' in payload, false);
 });
 
+test('tool call and its result travel back with the original tool state', () => {
+  const payload = buildChatRequest('GigaChat-3-Pro', {
+    messages: [
+      { role: 'user', content: 'Check A-1024', timestamp: 1 },
+      { role: 'assistant', content: [{ type: 'toolCall', id: 'state-7#0', name: 'lookup_record', arguments: { id: 'A-1024' } }],
+        api: 'giga-v2', provider: 'giga', model: 'GigaChat-3-Pro',
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: 'toolUse', timestamp: 2 },
+      { role: 'toolResult', toolCallId: 'state-7#0', toolName: 'lookup_record', isError: false,
+        content: [{ type: 'text', text: '{"status":"packed"}' }] },
+    ],
+  } as never, {});
+
+  assert.deepEqual(payload.messages.slice(1), [
+    { role: 'assistant', content: [{ function_call: { name: 'lookup_record', arguments: { id: 'A-1024' } } }], tools_state_id: 'state-7' },
+    { role: 'function', content: [{ function_result: { name: 'lookup_record', result: '{"status":"packed"}' } }], tools_state_id: 'state-7' },
+  ]);
+});
+
 const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
 
 test('assistant text parts are concatenated into a single string', () => {
