@@ -13,12 +13,27 @@ export interface GigaContentPart {
   function_call?: { name: string; arguments?: unknown };
   function_result?: { name: string; result: unknown };
 }
+
 export interface GigaRequestMessage { role: string; content: GigaContentPart[]; tools_state_id?: string }
+
 export interface GigaRequest {
   model: string;
   messages: GigaRequestMessage[];
   model_options?: Record<string, unknown>;
   tools?: { functions: { specifications: { name: string; description: string; parameters: unknown }[] } }[];
+}
+
+export interface GigaResponse {
+  model?: string;
+  created_at?: number;
+  finish_reason?: string;
+  messages?: { role?: string; content?: GigaContentPart[]; tool_state_id?: string; tools_state_id?: string }[];
+  usage?: {
+    input_tokens?: number;
+    input_tokens_details?: { prompt_tokens?: number; cached_tokens?: number };
+    output_tokens?: number;
+    total_tokens?: number;
+  };
 }
 
 // Достаёт текстовые части content; мысли и тул-коллы — не текст, для них у buildChatRequest
@@ -74,19 +89,6 @@ export function buildChatRequest(modelId: string, context: GigaContext, options:
     }];
   }
   return request;
-}
-
-export interface GigaResponse {
-  model?: string;
-  created_at?: number;
-  finish_reason?: string;
-  messages?: { role?: string; content?: GigaContentPart[]; tool_state_id?: string; tools_state_id?: string }[];
-  usage?: {
-    input_tokens?: number;
-    input_tokens_details?: { prompt_tokens?: number; cached_tokens?: number };
-    output_tokens?: number;
-    total_tokens?: number;
-  };
 }
 
 const noCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
