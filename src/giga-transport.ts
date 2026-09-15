@@ -45,12 +45,18 @@ export function requestOptions(config: GigaConfig, path: string, payload: string
 
 export function createGigaTransport(config: GigaConfig, timeoutMs = 120000): GigaTransport {
   return (path, body, signal) => new Promise((resolve, reject) => {
+    // addEventListener('abort', ...) below only fires on a FUTURE abort; a signal that is
+    // already aborted would otherwise send the request anyway and wait for a response that never comes.
+    if (signal?.aborted) { reject(new Error('Giga request aborted')); return; }
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const req = httpsRequest(requestOptions(config, path, payload, timeoutMs), response => {
       let text = '';
       response.setEncoding('utf8');
       response.on('data', chunk => { text += chunk; });
       response.on('end', () => resolve({ status: response.statusCode ?? 0, text }));
+      // Without this, a connection cut mid-body (proxy reset, truncated gateway response)
+      // leaves the promise pending forever: 'end' never fires and 'req' has already succeeded.
+      response.on('error', reject);
     });
     const abort = () => req.destroy(new Error('Giga request aborted'));
     signal?.addEventListener('abort', abort, { once: true });

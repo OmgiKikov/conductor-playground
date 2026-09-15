@@ -12,6 +12,12 @@ dist/
 *.key
 *.cer
 *.crt
+*.p12
+*.pfx
+*.jks
+*.der
+!test/fixtures/*.pem
+!test/fixtures/*.key
 
 # Local pilot evidence and runners depend on material outside this public repository.
 /docs/RELIABILITY.md
