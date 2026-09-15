@@ -177,7 +177,10 @@ test('each catalog failure is reported to stderr by category only, never a path 
     { category: 'bad configuration', run: () => createGigaProvider({
       GIGACHAT_URL: 'https://gateway.example', GIGACHAT_CERT_PATH: '/no/such/cert.pem', GIGACHAT_KEY_PATH: '/no/such/key.pem',
     }) },
-    { category: 'TLS', run: () => createGigaProvider({}, async () => { throw new Error('unable to verify the first certificate'); }) },
+    { category: 'connection UNABLE_TO_VERIFY_LEAF_SIGNATURE', run: () => createGigaProvider({}, async () => {
+      throw Object.assign(new Error('unable to verify the first certificate'), { code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' });
+    }) },
+    { category: 'timeout or aborted', run: () => createGigaProvider({}, async () => { throw new Error('Giga request timed out'); }) },
     { category: 'HTTP 403', run: () => createGigaProvider({}, async () => ({ status: 403, text: 'top secret denial body' })) },
     { category: 'bad JSON', run: () => createGigaProvider({}, async () => ({ status: 200, text: 'not json' })) },
     { category: 'empty catalog', run: () => createGigaProvider({}, async () => ({ status: 200, text: '{"data":[]}' })) },
@@ -186,7 +189,7 @@ test('each catalog failure is reported to stderr by category only, never a path 
     const lines = await capturedStderr(run);
     assert.equal(lines.length, 1, category);
     assert.match(lines[0]!, new RegExp(`\\(${category}\\)`), category);
-    assert.doesNotMatch(lines[0]!, /top secret|no\/such|cert\.pem|first certificate/, category);
+    assert.doesNotMatch(lines[0]!, /top secret|no\/such|cert\.pem|first certificate|Giga request/, category);
   }
 });
 
@@ -224,6 +227,24 @@ test('a gateway error surfaces as a failed model call, not as a parse error', as
   await assert.rejects(
     provider.streamSimple!(model, { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] }, {}).result(),
     /429/,
+  );
+});
+
+test('a gateway error message carries the status but never the response body', async () => {
+  const { provider } = await providerWith([{ status: 200, text: catalogBody }, { status: 500, text: 'echo of the secret prompt' }]);
+  const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
+  await assert.rejects(
+    provider.streamSimple!(model, { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] }, {}).result(),
+    (error: Error) => /HTTP 500/.test(error.message) && !/secret prompt/.test(error.message),
+  );
+});
+
+test('a successful status with a non-JSON body fails cleanly without echoing the body', async () => {
+  const { provider } = await providerWith([{ status: 200, text: catalogBody }, { status: 200, text: '<html>secret proxy page</html>' }]);
+  const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
+  await assert.rejects(
+    provider.streamSimple!(model, { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] }, {}).result(),
+    (error: Error) => /non-JSON/.test(error.message) && !/secret proxy page/.test(error.message),
   );
 });
 

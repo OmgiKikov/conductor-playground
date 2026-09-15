@@ -1,5 +1,5 @@
 import type { ModelRuntime, ProviderConfig } from '@earendil-works/pi-coding-agent';
-import { buildChatRequest, normalizeResponseFormat, parseCatalog, parseChatResponse, type GigaAssistantMessage } from './giga-protocol.js';
+import { buildChatRequest, normalizeResponseFormat, parseCatalog, parseChatResponse, type GigaAssistantMessage, type GigaResponse } from './giga-protocol.js';
 import { createGigaTransport, readGigaConfig, type GigaConfig, type GigaTransport } from './giga-transport.js';
 
 // Шлюз не сообщает ни окна контекста, ни лимита ответа, ни цен.
@@ -32,7 +32,13 @@ export async function createGigaProvider(
   try {
     const deadline = AbortSignal.timeout(CATALOG_TIMEOUT_MS);
     catalog = await transport('/v1/models', undefined, signal ? AbortSignal.any([signal, deadline]) : deadline);
-  } catch { reportCatalogFailure('TLS'); return undefined; }
+  } catch (error) {
+    // Код ошибки Node (ENOTFOUND, UNABLE_TO_VERIFY_LEAF_SIGNATURE, CERT_HAS_EXPIRED…) сразу
+    // говорит оператору, что чинить, и не несёт ни путей, ни содержимого сертификата.
+    const code = (error as NodeJS.ErrnoException).code;
+    reportCatalogFailure(code ? `connection ${code}` : 'timeout or aborted');
+    return undefined;
+  }
   if (catalog.status !== 200) { reportCatalogFailure(`HTTP ${catalog.status}`); return undefined; }
 
   let parsedCatalog: unknown;
@@ -61,10 +67,12 @@ export async function createGigaProvider(
         const hooked = (await options?.onPayload?.(base, model)) ?? base;
         const payload = normalizeResponseFormat(hooked as Record<string, unknown>);
         const response = await transport('/v2/chat/completions', payload, options?.signal);
-        if (response.status !== 200) {
-          throw new Error(`Giga gateway request failed with HTTP ${response.status}: ${response.text.slice(0, 200)}`);
-        }
-        return parseChatResponse(model, JSON.parse(response.text));
+        // Тело ответа в текст ошибки не попадает: там бывает эхо промпта или страница прокси.
+        if (response.status !== 200) throw new Error(`Giga gateway request failed with HTTP ${response.status}`);
+        let body: GigaResponse;
+        try { body = JSON.parse(response.text) as GigaResponse; }
+        catch { throw new Error('Giga gateway returned a non-JSON response'); }
+        return parseChatResponse(model, body);
       })();
       // AssistantMessageEventStream — класс с приватными полями из pi-ai, который сюда нельзя
       // импортировать напрямую; объект ниже реализует его публичный контракт (result +

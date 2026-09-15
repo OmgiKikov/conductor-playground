@@ -479,9 +479,8 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
           openRouterRouting: { only: [upstream], allow_fallbacks: false },
         } : {}) },
       } : resolved;
-      // giga speaks the same strict-schema contract as the OpenRouter adapter (see
-      // normalizeResponseFormat in giga-protocol.ts); without this the judge hook below
-      // never installs and the judge falls back to unstructured free-form output.
+      // The giga provider translates this hook's OpenAI-shaped schema into its own v2
+      // model_options (normalizeResponseFormat); without the hook its judge gets no strict schema.
       const structuredJudge = judge.provider === 'openrouter' || judge.provider === GIGA_PROVIDER_ID;
       return assessRepeated(input, { ...judgeModel,
         configurationHash: fingerprint({ api: judgeModel.api, baseUrl: judgeModel.baseUrl, compat: judgeModel.compat,

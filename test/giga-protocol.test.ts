@@ -157,6 +157,18 @@ test('an unrecognized finish reason fails the model call instead of being report
   }), /content_filter/);
 });
 
+test('a function call in the content wins over an unfamiliar finish reason label', () => {
+  // За шлюзом стоят и сторонние модели: их метка остановки для вызова инструмента может
+  // отличаться от function_call, а сам вызов в контенте — более надёжный признак.
+  const message = parseChatResponse(model, {
+    finish_reason: 'tool_calls',
+    messages: [{ role: 'assistant', tools_state_id: 'state-5',
+      content: [{ function_call: { name: 'lookup_record', arguments: { id: 'A-1024' } } }] }],
+    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+  });
+  assert.equal(message.stopReason, 'toolUse');
+});
+
 test('a response with no assistant-role message returns empty content instead of echoing another role', () => {
   const message = parseChatResponse(model, {
     finish_reason: 'stop', messages: [{ role: 'user', content: [{ text: 'echo' }] }],
