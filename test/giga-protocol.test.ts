@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildChatRequest, parseCatalog, parseChatResponse } from '../src/giga-protocol.js';
+import { buildChatRequest, normalizeResponseFormat, parseCatalog, parseChatResponse } from '../src/giga-protocol.js';
 
 test('catalog keeps chat models and drops embeddings and service entries', () => {
   const ids = parseCatalog({
@@ -85,4 +85,23 @@ test('a truncated answer reports the length stop reason', () => {
     usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
   });
   assert.equal(message.stopReason, 'length');
+});
+
+test('the judge schema moves from the OpenAI shape into v2 model options', () => {
+  const normalized = normalizeResponseFormat({
+    model: 'GigaChat-3-Pro',
+    messages: [{ role: 'user', content: [{ text: 'grade this' }] }],
+    model_options: { temperature: 0 },
+    response_format: { type: 'json_schema', json_schema: { name: 'agent_lab_judgment', strict: true, schema: { type: 'object' } } },
+  });
+  assert.deepEqual(normalized, {
+    model: 'GigaChat-3-Pro',
+    messages: [{ role: 'user', content: [{ text: 'grade this' }] }],
+    model_options: { temperature: 0, response_format: { type: 'json_schema', schema: { type: 'object' }, strict: true } },
+  });
+});
+
+test('a payload without response_format is returned unchanged', () => {
+  const payload = { model: 'Qwen3.6-35b', messages: [{ role: 'user', content: [{ text: 'hi' }] }] };
+  assert.deepEqual(normalizeResponseFormat({ ...payload }), payload);
 });

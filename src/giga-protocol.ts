@@ -89,3 +89,23 @@ export function parseCatalog(body: unknown): string[] {
     .filter(entry => typeof entry.id === 'string' && (!typed || entry.type === 'chat'))
     .map(entry => entry.id as string);
 }
+
+interface OpenAiResponseFormat {
+  type?: string;
+  json_schema?: { name?: string; strict?: boolean; schema?: unknown };
+}
+
+/*
+ * Хук onPayload в src/pi.ts кладёт схему судьи в OpenAI-форме на верхний уровень.
+ * Контракт v2 ждёт её как model_options.response_format с полем schema.
+ */
+export function normalizeResponseFormat(payload: Record<string, unknown>): Record<string, unknown> {
+  const format = payload.response_format as OpenAiResponseFormat | undefined;
+  if (!format) return payload;
+  const { response_format: _dropped, ...rest } = payload;
+  const modelOptions = { ...(rest.model_options as Record<string, unknown> | undefined) };
+  modelOptions.response_format = format.json_schema
+    ? { type: format.type ?? 'json_schema', schema: format.json_schema.schema, strict: format.json_schema.strict ?? true }
+    : format;
+  return { ...rest, model_options: modelOptions };
+}
