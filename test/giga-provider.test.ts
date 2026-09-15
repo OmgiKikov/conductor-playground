@@ -4,6 +4,11 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readGigaConfig, requestOptions } from '../src/giga-transport.js';
+import { createGigaProvider } from '../src/giga-provider.js';
+
+const catalogBody = JSON.stringify({ data: [
+  { id: 'GigaChat-3-Pro', type: 'chat' }, { id: 'glm-5.2', type: 'chat' }, { id: 'Embeddings', type: 'embeddings' },
+] });
 
 async function certDirectory() {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-giga-'));
@@ -96,4 +101,22 @@ test('request options carry the client certificate and honour the verification s
   const get = requestOptions(config, '/v1/models', undefined, 60000);
   assert.equal(get.method, 'GET');
   assert.deepEqual(get.headers, {});
+});
+
+test('the catalog of the gateway becomes the model list', async () => {
+  const paths: string[] = [];
+  const provider = await createGigaProvider({}, async path => { paths.push(path); return { status: 200, text: catalogBody }; });
+  assert.deepEqual(paths, ['/v1/models']);
+  assert.deepEqual(provider?.models?.map(model => model.id), ['GigaChat-3-Pro', 'glm-5.2']);
+  // Судья фиксирован на 16384 выходных токенах; меньший лимит молча обрезал бы вердикт.
+  assert.ok((provider?.models?.[0]?.maxTokens ?? 0) >= 16384);
+  assert.deepEqual(provider?.models?.[0]?.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+});
+
+test('without configuration or with an unusable catalog no provider is produced', async () => {
+  assert.equal(await createGigaProvider({}), undefined);
+  assert.equal(await createGigaProvider({}, async () => ({ status: 403, text: 'denied' })), undefined);
+  assert.equal(await createGigaProvider({}, async () => ({ status: 200, text: 'not json' })), undefined);
+  assert.equal(await createGigaProvider({}, async () => ({ status: 200, text: '{"data":[]}' })), undefined);
+  assert.equal(await createGigaProvider({}, async () => { throw new Error('network down'); }), undefined);
 });
