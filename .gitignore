@@ -6,6 +6,13 @@ dist/
 .env
 .DS_Store
 
+# Real certificates/keys must never be committed (test-only certs would live under test/fixtures instead).
+/certs/
+*.pem
+*.key
+*.cer
+*.crt
+
 # Local pilot evidence and runners depend on material outside this public repository.
 /docs/RELIABILITY.md
 /docs/aigw-audit/
