@@ -5,10 +5,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readGigaConfig, requestOptions } from '../src/giga-transport.js';
 import { createGigaProvider } from '../src/giga-provider.js';
+import type { GigaModel } from '../src/giga-protocol.js';
 
 const catalogBody = JSON.stringify({ data: [
   { id: 'GigaChat-3-Pro', type: 'chat' }, { id: 'glm-5.2', type: 'chat' }, { id: 'Embeddings', type: 'embeddings' },
 ] });
+
+const answerBody = JSON.stringify({
+  model: 'GigaChat-3-Pro:3.1.0', created_at: 1789463335, finish_reason: 'stop',
+  messages: [{ role: 'assistant', content: [{ text: 'Hello' }] }],
+  usage: { input_tokens: 17, input_tokens_details: { cached_tokens: 2 }, output_tokens: 3, total_tokens: 20 },
+});
+
+async function providerWith(replies: { status: number; text: string }[]) {
+  const sent: { path: string; body?: unknown }[] = [];
+  const provider = await createGigaProvider({}, async (path, body) => {
+    sent.push({ path, body });
+    return replies[sent.length - 1] ?? { status: 500, text: 'no reply configured' };
+  });
+  return { provider: provider!, sent };
+}
 
 async function certDirectory() {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-giga-'));
@@ -119,4 +135,41 @@ test('without configuration or with an unusable catalog no provider is produced'
   assert.equal(await createGigaProvider({}, async () => ({ status: 200, text: 'not json' })), undefined);
   assert.equal(await createGigaProvider({}, async () => ({ status: 200, text: '{"data":[]}' })), undefined);
   assert.equal(await createGigaProvider({}, async () => { throw new Error('network down'); }), undefined);
+});
+
+test('a completed answer is delivered as start and done events', async () => {
+  const { provider, sent } = await providerWith([{ status: 200, text: catalogBody }, { status: 200, text: answerBody }]);
+  const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
+  const stream = provider.streamSimple!(model, { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] }, { temperature: 0 });
+
+  const events: string[] = [];
+  for await (const event of stream) events.push(event.type);
+  assert.deepEqual(events, ['start', 'done']);
+
+  const message = await stream.result();
+  assert.deepEqual(message.content, [{ type: 'text', text: 'Hello' }]);
+  assert.equal(message.usage.input, 15);
+  assert.equal(sent[1]?.path, '/v2/chat/completions');
+  assert.deepEqual(sent[1]?.body, { model: 'GigaChat-3-Pro', messages: [{ role: 'user', content: [{ text: 'Hi' }] }], model_options: { temperature: 0 } });
+});
+
+test('the judge payload hook is applied and normalized into model options', async () => {
+  const { provider, sent } = await providerWith([{ status: 200, text: catalogBody }, { status: 200, text: answerBody }]);
+  const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
+  const options = {
+    onPayload: (payload: Record<string, unknown>) => ({ ...payload, response_format: { type: 'json_schema', json_schema: { name: 'verdict', strict: true, schema: { type: 'object' } } } }),
+  } as never;
+  await provider.streamSimple!(model, { messages: [{ role: 'user', content: 'grade', timestamp: 1 }] }, options).result();
+
+  assert.deepEqual((sent[1]?.body as { model_options?: unknown }).model_options,
+    { response_format: { type: 'json_schema', schema: { type: 'object' }, strict: true } });
+});
+
+test('a gateway error surfaces as a failed model call, not as a parse error', async () => {
+  const { provider } = await providerWith([{ status: 200, text: catalogBody }, { status: 429, text: '{"status":429,"message":"Too many requests"}' }]);
+  const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
+  await assert.rejects(
+    provider.streamSimple!(model, { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] }, {}).result(),
+    /429/,
+  );
 });
