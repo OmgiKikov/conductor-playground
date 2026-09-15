@@ -1,6 +1,6 @@
 import type { ModelRuntime, ProviderConfig } from '@earendil-works/pi-coding-agent';
 import { buildChatRequest, normalizeResponseFormat, parseCatalog, parseChatResponse, type GigaAssistantMessage } from './giga-protocol.js';
-import { createGigaTransport, readGigaConfig, type GigaTransport } from './giga-transport.js';
+import { createGigaTransport, readGigaConfig, type GigaConfig, type GigaTransport } from './giga-transport.js';
 
 // Шлюз не сообщает ни окна контекста, ни лимита ответа, ни цен.
 // maxTokens не ниже протокола судьи (16384), иначе вердикт молча обрежется.
@@ -11,12 +11,15 @@ export async function createGigaProvider(
   env: Record<string, string | undefined> = process.env,
   injectedTransport?: GigaTransport,
 ): Promise<ProviderConfig | undefined> {
-  const config = injectedTransport ? undefined : readGigaConfig(env);
-  if (!injectedTransport && !config) return undefined;
-  const transport = injectedTransport ?? createGigaTransport(config!);
-
+  let config: GigaConfig | undefined;
+  let transport: GigaTransport;
   let ids: string[] = [];
   try {
+    // readGigaConfig throws on an unreadable configured path (bad cert/key/CA path). That
+    // failure must degrade like any other misconfiguration, not crash every run on every provider.
+    config = injectedTransport ? undefined : readGigaConfig(env);
+    if (!injectedTransport && !config) return undefined;
+    transport = injectedTransport ?? createGigaTransport(config!);
     const catalog = await transport('/v1/models');
     if (catalog.status === 200) ids = parseCatalog(JSON.parse(catalog.text));
   } catch { return undefined; }

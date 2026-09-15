@@ -130,6 +130,17 @@ test('the catalog of the gateway becomes the model list', async () => {
   assert.deepEqual(provider?.models?.[0]?.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 });
 
+test('an unreadable certificate path degrades to no provider instead of crashing the run', async () => {
+  const directory = await certDirectory();
+  const env = {
+    GIGACHAT_URL: 'https://gateway.example',
+    GIGACHAT_CERT_PATH: join(directory, 'absent.pem'),
+    GIGACHAT_KEY_PATH: join(directory, 'key.pem'),
+  };
+  await assert.doesNotReject(createGigaProvider(env));
+  assert.equal(await createGigaProvider(env), undefined);
+});
+
 test('without configuration or with an unusable catalog no provider is produced', async () => {
   assert.equal(await createGigaProvider({}), undefined);
   assert.equal(await createGigaProvider({}, async () => ({ status: 403, text: 'denied' })), undefined);
