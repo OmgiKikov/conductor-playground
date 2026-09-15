@@ -6,10 +6,13 @@ import { createGigaTransport, readGigaConfig, type GigaConfig, type GigaTranspor
 // maxTokens не ниже протокола судьи (16384), иначе вердикт молча обрежется.
 const MAX_TOKENS = 32768;
 const CONTEXT_WINDOW = 128000;
+// Список моделей — не более чем справочник; в отличие от чата, ждать его 120 секунд незачем.
+const CATALOG_TIMEOUT_MS = 10000;
 
 export async function createGigaProvider(
   env: Record<string, string | undefined> = process.env,
   injectedTransport?: GigaTransport,
+  signal?: AbortSignal,
 ): Promise<ProviderConfig | undefined> {
   let config: GigaConfig | undefined;
   let transport: GigaTransport;
@@ -20,7 +23,8 @@ export async function createGigaProvider(
     config = injectedTransport ? undefined : readGigaConfig(env);
     if (!injectedTransport && !config) return undefined;
     transport = injectedTransport ?? createGigaTransport(config!);
-    const catalog = await transport('/v1/models');
+    const deadline = AbortSignal.timeout(CATALOG_TIMEOUT_MS);
+    const catalog = await transport('/v1/models', undefined, signal ? AbortSignal.any([signal, deadline]) : deadline);
     if (catalog.status === 200) ids = parseCatalog(JSON.parse(catalog.text));
   } catch { return undefined; }
   if (!ids.length) return undefined;
@@ -71,7 +75,8 @@ export async function registerGigaProvider(
   runtime: ModelRuntime,
   env: Record<string, string | undefined> = process.env,
   injectedTransport?: GigaTransport,
+  signal?: AbortSignal,
 ): Promise<void> {
-  const provider = await createGigaProvider(env, injectedTransport);
+  const provider = await createGigaProvider(env, injectedTransport, signal);
   if (provider) runtime.registerProvider(GIGA_PROVIDER_ID, provider);
 }

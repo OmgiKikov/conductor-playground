@@ -290,7 +290,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
   let modelRuntime: ModelRuntime;
   try { modelRuntime = injectedRuntime ?? await ModelRuntime.create({ allowModelNetwork: false, signal }); }
   catch { throw new Error(`Не удалось инициализировать Pi. ${authHelp}`); }
-  if (!injectedRuntime) await registerGigaProvider(modelRuntime);
+  if (!injectedRuntime) await registerGigaProvider(modelRuntime, undefined, undefined, signal);
   const model = modelRuntime.getModel(settings.provider, settings.model);
   if (!model) throw new Error(`Выбранная модель недоступна: ${settings.provider}/${settings.model}. ${authHelp}`);
   let available: Awaited<ReturnType<ModelRuntime['getAvailable']>>;

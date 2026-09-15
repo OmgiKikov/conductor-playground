@@ -141,6 +141,21 @@ test('an unreadable certificate path degrades to no provider instead of crashing
   assert.equal(await createGigaProvider(env), undefined);
 });
 
+test('the catalog request carries a bounded deadline even without a run signal', async () => {
+  let capturedSignal: AbortSignal | undefined;
+  await createGigaProvider({}, async (_path, _body, signal) => { capturedSignal = signal; return { status: 200, text: catalogBody }; });
+  assert.ok(capturedSignal instanceof AbortSignal);
+  assert.equal(capturedSignal?.aborted, false);
+});
+
+test('an already aborted run signal is honoured by the catalog request', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let capturedSignal: AbortSignal | undefined;
+  await createGigaProvider({}, async (_path, _body, signal) => { capturedSignal = signal; return { status: 200, text: catalogBody }; }, controller.signal);
+  assert.equal(capturedSignal?.aborted, true);
+});
+
 test('without configuration or with an unusable catalog no provider is produced', async () => {
   assert.equal(await createGigaProvider({}), undefined);
   assert.equal(await createGigaProvider({}, async () => ({ status: 403, text: 'denied' })), undefined);
