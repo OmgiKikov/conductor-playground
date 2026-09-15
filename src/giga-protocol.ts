@@ -8,7 +8,11 @@ export type GigaStream = ReturnType<StreamSimple>;
 export type GigaAssistantMessage = Awaited<ReturnType<GigaStream['result']>>;
 type GigaMessage = GigaContext['messages'][number];
 
-export interface GigaContentPart { text?: string }
+export interface GigaContentPart {
+  text?: string;
+  function_call?: { name: string; arguments?: unknown };
+  function_result?: { name: string; result: unknown };
+}
 export interface GigaRequestMessage { role: string; content: GigaContentPart[] }
 export interface GigaRequest {
   model: string;
@@ -66,7 +70,23 @@ function stopReason(finish: string | undefined, hasToolCall: boolean): GigaAssis
 
 export function parseChatResponse(model: GigaModel, body: GigaResponse): GigaAssistantMessage {
   const answer = body.messages?.find(message => message.role === 'assistant');
-  const text = (answer?.content ?? []).map(part => part.text ?? '').join('');
+  const state = answer?.tools_state_id ?? answer?.tool_state_id ?? '';
+  const parts = answer?.content ?? [];
+  const text = parts.map(part => part.text ?? '').join('');
+  const content: GigaAssistantMessage['content'] = [];
+  if (text) content.push({ type: 'text', text });
+  // Индекс в id считает только вызовы функций, а не позицию в content: гейтвей
+  // может прислать текст и вызов в одном сообщении, и текст не должен сдвигать нумерацию.
+  let callIndex = 0;
+  for (const part of parts) {
+    if (!part.function_call) continue;
+    content.push({
+      type: 'toolCall', id: `${state}#${callIndex}`, name: part.function_call.name,
+      arguments: (part.function_call.arguments ?? {}) as Record<string, unknown>,
+    });
+    callIndex += 1;
+  }
+  const hasToolCall = content.some(item => item.type === 'toolCall');
   const inputTokens = body.usage?.input_tokens ?? 0;
   // Шлюз изредка присылает cached_tokens больше input_tokens; без зажима это раздуло бы
   // восстановленный в src/pi.ts счётчик входных токенов сверх реально оплаченного.
@@ -75,11 +95,11 @@ export function parseChatResponse(model: GigaModel, body: GigaResponse): GigaAss
   const output = body.usage?.output_tokens ?? 0;
   return {
     role: 'assistant',
-    content: text ? [{ type: 'text', text }] : [],
+    content,
     api: model.api, provider: model.provider, model: model.id,
     ...(body.model ? { responseModel: body.model } : {}),
     usage: { input, output, cacheRead, cacheWrite: 0, totalTokens: body.usage?.total_tokens ?? input + cacheRead + output, cost: { ...noCost } },
-    stopReason: stopReason(body.finish_reason, false),
+    stopReason: stopReason(body.finish_reason, hasToolCall),
     ...(body.finish_reason ? { rawStopReason: body.finish_reason } : {}),
     timestamp: (body.created_at ?? Math.floor(Date.now() / 1000)) * 1000,
   };

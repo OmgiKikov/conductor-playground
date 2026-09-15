@@ -151,6 +151,38 @@ test('cached prompt tokens are reported separately so the caller does not count 
   });
 });
 
+test('a function call becomes a tool call whose id carries the tool state', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'function_call',
+    messages: [{
+      role: 'assistant', tool_state_id: '019e8373-dc9a-7883-af60-ebb20b79e1e1',
+      content: [{ function_call: { name: 'lookup_record', arguments: { id: 'A-1024' } } }],
+    }],
+    usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+  } as never);
+
+  assert.equal(message.stopReason, 'toolUse');
+  assert.deepEqual(message.content, [{
+    type: 'toolCall', id: '019e8373-dc9a-7883-af60-ebb20b79e1e1#0', name: 'lookup_record', arguments: { id: 'A-1024' },
+  }]);
+});
+
+test('text alongside a function call is preserved', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'function_call',
+    messages: [{
+      role: 'assistant', tools_state_id: 'state-2',
+      content: [{ text: 'Looking it up' }, { function_call: { name: 'lookup_record', arguments: {} } }],
+    }],
+    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+  } as never);
+
+  assert.deepEqual(message.content, [
+    { type: 'text', text: 'Looking it up' },
+    { type: 'toolCall', id: 'state-2#0', name: 'lookup_record', arguments: {} },
+  ]);
+});
+
 test('the judge schema moves from the OpenAI shape into v2 model options', () => {
   const normalized = normalizeResponseFormat({
     model: 'GigaChat-3-Pro',
