@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildChatRequest, parseCatalog } from '../src/giga-protocol.js';
+import { buildChatRequest, parseCatalog, parseChatResponse } from '../src/giga-protocol.js';
 
 test('catalog keeps chat models and drops embeddings and service entries', () => {
   const ids = parseCatalog({
@@ -49,4 +49,40 @@ test('request carries system prompt, roles and content parts', () => {
 test('request without sampling options omits model_options', () => {
   const payload = buildChatRequest('Qwen3.6-35b', { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] } as never, {});
   assert.deepEqual(payload, { model: 'Qwen3.6-35b', messages: [{ role: 'user', content: [{ text: 'Hi' }] }] });
+});
+
+const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as never;
+
+test('response text, model identity and stop reason are carried over', () => {
+  const message = parseChatResponse(model, {
+    model: 'GigaChat-3-Pro:3.1.0', created_at: 1789463335, finish_reason: 'stop',
+    messages: [{ role: 'assistant', content: [{ text: 'Hello' }, { text: ' world' }] }],
+    usage: { input_tokens: 17, input_tokens_details: { prompt_tokens: 17, cached_tokens: 2 }, output_tokens: 3, total_tokens: 20 },
+  });
+  assert.deepEqual(message.content, [{ type: 'text', text: 'Hello world' }]);
+  assert.equal(message.model, 'GigaChat-3-Pro');
+  assert.equal(message.responseModel, 'GigaChat-3-Pro:3.1.0');
+  assert.equal(message.stopReason, 'stop');
+});
+
+test('cached prompt tokens are reported separately so the caller does not count them twice', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'ok' }] }],
+    usage: { input_tokens: 17, input_tokens_details: { cached_tokens: 2 }, output_tokens: 3, total_tokens: 20 },
+  });
+  // src/pi.ts складывает input + cacheRead + cacheWrite, поэтому кэш вычтен из input.
+  assert.equal(message.usage.input, 15);
+  assert.equal(message.usage.cacheRead, 2);
+  assert.equal(message.usage.cacheWrite, 0);
+  assert.equal(message.usage.output, 3);
+  assert.equal(message.usage.totalTokens, 20);
+  assert.equal(message.usage.cost.total, 0);
+});
+
+test('a truncated answer reports the length stop reason', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'length', messages: [{ role: 'assistant', content: [{ text: 'cut' }] }],
+    usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
+  });
+  assert.equal(message.stopReason, 'length');
 });

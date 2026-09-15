@@ -35,6 +35,44 @@ export function buildChatRequest(modelId: string, context: GigaContext, options:
   return request;
 }
 
+export interface GigaResponse {
+  model?: string;
+  created_at?: number;
+  finish_reason?: string;
+  messages?: { role?: string; content?: GigaContentPart[]; tool_state_id?: string; tools_state_id?: string }[];
+  usage?: {
+    input_tokens?: number;
+    input_tokens_details?: { cached_tokens?: number };
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
+const noCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+
+function stopReason(finish: string | undefined, hasToolCall: boolean): GigaAssistantMessage['stopReason'] {
+  if (hasToolCall) return 'toolUse';
+  return finish === 'length' ? 'length' : 'stop';
+}
+
+export function parseChatResponse(model: GigaModel, body: GigaResponse): GigaAssistantMessage {
+  const answer = body.messages?.find(message => message.role === 'assistant') ?? body.messages?.[0];
+  const text = (answer?.content ?? []).map(part => part.text ?? '').join('');
+  const cacheRead = body.usage?.input_tokens_details?.cached_tokens ?? 0;
+  const input = Math.max((body.usage?.input_tokens ?? 0) - cacheRead, 0);
+  const output = body.usage?.output_tokens ?? 0;
+  return {
+    role: 'assistant',
+    content: text ? [{ type: 'text', text }] : [],
+    api: model.api, provider: model.provider, model: model.id,
+    ...(body.model ? { responseModel: body.model } : {}),
+    usage: { input, output, cacheRead, cacheWrite: 0, totalTokens: body.usage?.total_tokens ?? input + cacheRead + output, cost: { ...noCost } },
+    stopReason: stopReason(body.finish_reason, false),
+    ...(body.finish_reason ? { rawStopReason: body.finish_reason } : {}),
+    timestamp: (body.created_at ?? Math.floor(Date.now() / 1000)) * 1000,
+  } as GigaAssistantMessage;
+}
+
 interface CatalogEntry { id?: unknown; type?: unknown }
 
 /*
