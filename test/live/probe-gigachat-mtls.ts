@@ -57,13 +57,13 @@ const candidates: { label: string; targetUrl: string; body: string }[] = [
 const seen = new Set<string>();
 const unique = candidates.filter(c => (seen.has(c.targetUrl + c.body) ? false : (seen.add(c.targetUrl + c.body), true)));
 
-function post(targetUrl: string, body: string): Promise<{ status: number; text: string } | { error: string }> {
+function send(targetUrl: string, body?: string): Promise<{ status: number; text: string } | { error: string }> {
   return new Promise(resolve => {
     const parsed = new URL(targetUrl);
     const options: RequestOptions = {
       hostname: parsed.hostname, port: parsed.port || 443, path: parsed.pathname + parsed.search,
-      method: 'POST', cert, key, ca, rejectUnauthorized: !insecure, timeout: 15000,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      method: body === undefined ? 'GET' : 'POST', cert, key, ca, rejectUnauthorized: !insecure, timeout: 15000,
+      headers: body === undefined ? {} : { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     };
     const req = httpsRequest(options, res => {
       let text = '';
@@ -72,7 +72,7 @@ function post(targetUrl: string, body: string): Promise<{ status: number; text: 
     });
     req.on('timeout', () => { req.destroy(new Error('timeout')); });
     req.on('error', error => resolve({ error: error.message }));
-    req.write(body);
+    if (body !== undefined) req.write(body);
     req.end();
   });
 }
@@ -86,11 +86,28 @@ function classify(text: string): string {
   } catch { return 'not JSON'; }
 }
 
-for (const { label, targetUrl, body } of unique) {
-  const result = await post(targetUrl, body);
-  if ('error' in result) { console.log(`[FAIL]  ${label}\n        ${targetUrl}\n        error: ${result.error}\n`); continue; }
-  const preview = result.text.slice(0, 500).replace(/\n/g, ' ');
+const report = (label: string, targetUrl: string, result: Awaited<ReturnType<typeof send>>, describe?: (text: string) => string) => {
+  if ('error' in result) { console.log(`[FAIL]  ${label}\n        ${targetUrl}\n        error: ${result.error}\n`); return; }
+  const preview = result.text.slice(0, 2000).replace(/\n/g, ' ');
   const tag = result.status === 200 ? 'OK  ' : result.status === 404 ? '404 ' : `HTTP${result.status}`;
-  console.log(`[${tag}] ${label}\n        ${targetUrl}\n        ${result.status === 200 ? classify(result.text) : ''}\n        body: ${preview}\n`);
+  console.log(`[${tag}] ${label}\n        ${targetUrl}\n        ${result.status === 200 && describe ? describe(result.text) : ''}\n        body: ${preview}\n`);
+};
+
+console.log('--- chat contract ---\n');
+for (const { label, targetUrl, body } of unique) {
+  report(label, targetUrl, await send(targetUrl, body), classify);
 }
-console.log('Done. Look for [OK  ] lines above — those are the URL(s) your gateway actually accepts, and the classification tells you v1 vs v2.');
+
+// Which models this gateway actually serves: the catalog is not only GigaChat.
+console.log('--- model catalog ---\n');
+for (const version of ['v1', 'v2'] as const) {
+  const targetUrl = `${swapVersion(version === 'v1' ? 'v2' : 'v1', version)}/models`;
+  report(`GET ${version}/models`, targetUrl, await send(targetUrl), text => {
+    try {
+      const json = JSON.parse(text);
+      const ids = Array.isArray(json.data) ? json.data.map((m: { id?: string }) => m.id).filter(Boolean) : [];
+      return ids.length ? `${ids.length} models: ${ids.join(', ')}` : 'no "data" array in response';
+    } catch { return 'not JSON'; }
+  });
+}
+console.log('Done. [OK  ] lines under "chat contract" are the URLs your gateway accepts (v1 vs v2);\nthe "model catalog" section lists every model id you can actually select.');
