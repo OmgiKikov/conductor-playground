@@ -71,6 +71,24 @@ test('request without sampling options omits model_options', () => {
   assert.deepEqual(payload, { model: 'Qwen3.6-35b', messages: [{ role: 'user', content: [{ text: 'Hi' }] }] });
 });
 
+test('declared tools become function specifications', () => {
+  const payload = buildChatRequest('GigaChat-3-Pro', {
+    messages: [{ role: 'user', content: 'Check A-1024', timestamp: 1 }],
+    tools: [{ name: 'lookup_record', description: 'Read a record', parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } }],
+  } as never, {});
+
+  assert.deepEqual(payload.tools, [{
+    functions: {
+      specifications: [{ name: 'lookup_record', description: 'Read a record', parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } }],
+    },
+  }]);
+});
+
+test('a request without tools omits the tools field', () => {
+  const payload = buildChatRequest('GigaChat-3-Pro', { messages: [{ role: 'user', content: 'hi', timestamp: 1 }], tools: [] } as never, {});
+  assert.equal('tools' in payload, false);
+});
+
 const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
 
 test('assistant text parts are concatenated into a single string', () => {

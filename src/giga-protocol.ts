@@ -14,6 +14,7 @@ export interface GigaRequest {
   model: string;
   messages: GigaRequestMessage[];
   model_options?: Record<string, unknown>;
+  tools?: { functions: { specifications: { name: string; description: string; parameters: unknown }[] } }[];
 }
 
 // Гейтвей и наш харнесс работают только с текстом; мысли/тул-коллы в истории сообщений отбрасываются.
@@ -33,6 +34,13 @@ export function buildChatRequest(modelId: string, context: GigaContext, options:
   if (options.maxTokens !== undefined) modelOptions.max_tokens = options.maxTokens;
   const request: GigaRequest = { model: modelId, messages };
   if (Object.keys(modelOptions).length) request.model_options = modelOptions;
+  if (context.tools?.length) {
+    request.tools = [{
+      functions: {
+        specifications: context.tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
+      },
+    }];
+  }
   return request;
 }
 
