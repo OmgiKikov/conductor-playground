@@ -275,6 +275,7 @@ export async function getPiStatus(injectedRuntime?: ModelRuntime): Promise<{
   try {
     const signal = AbortSignal.timeout(10000);
     const runtime = injectedRuntime ?? await ModelRuntime.create({ allowModelNetwork: false, signal });
+    if (!injectedRuntime) await registerGigaProvider(runtime, undefined, undefined, signal);
     const available = await runtime.getAvailable(undefined, { signal });
     return {
       models: available.map(m => ({ provider: m.provider, id: m.id, name: m.name })),
