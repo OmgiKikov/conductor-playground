@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildChatRequest, normalizeResponseFormat, parseCatalog, parseChatResponse } from '../src/giga-protocol.js';
+import { buildChatRequest, type GigaModel, normalizeResponseFormat, parseCatalog, parseChatResponse } from '../src/giga-protocol.js';
 
 test('catalog keeps chat models and drops embeddings and service entries', () => {
   const ids = parseCatalog({
@@ -15,10 +15,30 @@ test('catalog keeps chat models and drops embeddings and service entries', () =>
   assert.deepEqual(ids, ['GigaChat-3-Pro', 'Qwen3.6-35b']);
 });
 
-test('a catalog without type fields keeps every entry, and malformed input yields nothing', () => {
+test('a catalog without type fields keeps every entry', () => {
   assert.deepEqual(parseCatalog({ data: [{ id: 'model-a' }, { id: 'model-b' }] }), ['model-a', 'model-b']);
+});
+
+test('a mixed catalog keeps every chat-capable entry regardless of which entries declare a type', () => {
+  const ids = parseCatalog({
+    data: [
+      { id: 'GigaChat-3-Pro', type: 'chat' },
+      { id: 'legacy-model' },
+      { id: 'EmbeddingsGigaR', type: 'embeddings' },
+    ],
+  });
+  assert.deepEqual(ids, ['GigaChat-3-Pro', 'legacy-model']);
+});
+
+test('a body without a data array yields nothing', () => {
   assert.deepEqual(parseCatalog({}), []);
+});
+
+test('a null body yields nothing', () => {
   assert.deepEqual(parseCatalog(null), []);
+});
+
+test('entries without a string id are dropped', () => {
   assert.deepEqual(parseCatalog({ data: [{ object: 'model' }] }), []);
 });
 
@@ -32,7 +52,7 @@ test('request carries system prompt, roles and content parts', () => {
         stopReason: 'stop', timestamp: 2 },
       { role: 'user', content: [{ type: 'text', text: 'Again' }], timestamp: 3 },
     ],
-  } as never, { temperature: 0, maxTokens: 512 });
+  }, { temperature: 0, maxTokens: 512 });
 
   assert.deepEqual(payload, {
     model: 'GigaChat-3-Pro',
@@ -47,36 +67,42 @@ test('request carries system prompt, roles and content parts', () => {
 });
 
 test('request without sampling options omits model_options', () => {
-  const payload = buildChatRequest('Qwen3.6-35b', { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] } as never, {});
+  const payload = buildChatRequest('Qwen3.6-35b', { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] }, {});
   assert.deepEqual(payload, { model: 'Qwen3.6-35b', messages: [{ role: 'user', content: [{ text: 'Hi' }] }] });
 });
 
-const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as never;
+const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
 
-test('response text, model identity and stop reason are carried over', () => {
+test('assistant text parts are concatenated into a single string', () => {
   const message = parseChatResponse(model, {
-    model: 'GigaChat-3-Pro:3.1.0', created_at: 1789463335, finish_reason: 'stop',
-    messages: [{ role: 'assistant', content: [{ text: 'Hello' }, { text: ' world' }] }],
+    finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'Hello' }, { text: ' world' }] }],
     usage: { input_tokens: 17, input_tokens_details: { prompt_tokens: 17, cached_tokens: 2 }, output_tokens: 3, total_tokens: 20 },
   });
   assert.deepEqual(message.content, [{ type: 'text', text: 'Hello world' }]);
-  assert.equal(message.model, 'GigaChat-3-Pro');
-  assert.equal(message.responseModel, 'GigaChat-3-Pro:3.1.0');
-  assert.equal(message.stopReason, 'stop');
 });
 
-test('cached prompt tokens are reported separately so the caller does not count them twice', () => {
+test('the response reports the requested model id, not the gateway build string', () => {
   const message = parseChatResponse(model, {
-    finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'ok' }] }],
-    usage: { input_tokens: 17, input_tokens_details: { cached_tokens: 2 }, output_tokens: 3, total_tokens: 20 },
+    model: 'GigaChat-3-Pro:3.1.0', finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'Hello' }] }],
+    usage: { input_tokens: 17, output_tokens: 3, total_tokens: 20 },
   });
-  // src/pi.ts складывает input + cacheRead + cacheWrite, поэтому кэш вычтен из input.
-  assert.equal(message.usage.input, 15);
-  assert.equal(message.usage.cacheRead, 2);
-  assert.equal(message.usage.cacheWrite, 0);
-  assert.equal(message.usage.output, 3);
-  assert.equal(message.usage.totalTokens, 20);
-  assert.equal(message.usage.cost.total, 0);
+  assert.equal(message.model, 'GigaChat-3-Pro');
+});
+
+test('the gateway build string is carried separately as responseModel', () => {
+  const message = parseChatResponse(model, {
+    model: 'GigaChat-3-Pro:3.1.0', finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'Hello' }] }],
+    usage: { input_tokens: 17, output_tokens: 3, total_tokens: 20 },
+  });
+  assert.equal(message.responseModel, 'GigaChat-3-Pro:3.1.0');
+});
+
+test('a normal completion reports the stop reason as stop', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'Hello' }] }],
+    usage: { input_tokens: 17, output_tokens: 3, total_tokens: 20 },
+  });
+  assert.equal(message.stopReason, 'stop');
 });
 
 test('a truncated answer reports the length stop reason', () => {
@@ -85,6 +111,26 @@ test('a truncated answer reports the length stop reason', () => {
     usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
   });
   assert.equal(message.stopReason, 'length');
+});
+
+test('a response with no assistant-role message returns empty content instead of echoing another role', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'stop', messages: [{ role: 'user', content: [{ text: 'echo' }] }],
+    usage: { input_tokens: 5, output_tokens: 0, total_tokens: 5 },
+  });
+  assert.deepEqual(message.content, []);
+});
+
+test('cached prompt tokens are reported separately so the caller does not count them twice', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'stop', messages: [{ role: 'assistant', content: [{ text: 'ok' }] }],
+    usage: { input_tokens: 17, input_tokens_details: { cached_tokens: 2 }, output_tokens: 3, total_tokens: 20 },
+  });
+  // src/pi.ts складывает input + cacheRead + cacheWrite, поэтому кэш вычтен из input.
+  assert.deepEqual(message.usage, {
+    input: 15, output: 3, cacheRead: 2, cacheWrite: 0, totalTokens: 20,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  });
 });
 
 test('the judge schema moves from the OpenAI shape into v2 model options', () => {

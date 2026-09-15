@@ -16,6 +16,7 @@ export interface GigaRequest {
   model_options?: Record<string, unknown>;
 }
 
+// Гейтвей и наш харнесс работают только с текстом; мысли/тул-коллы в истории сообщений отбрасываются.
 function textOf(content: GigaMessage['content']): string {
   if (typeof content === 'string') return content;
   return content.filter(part => part.type === 'text').map(part => (part as { text: string }).text).join('\n');
@@ -42,7 +43,7 @@ export interface GigaResponse {
   messages?: { role?: string; content?: GigaContentPart[]; tool_state_id?: string; tools_state_id?: string }[];
   usage?: {
     input_tokens?: number;
-    input_tokens_details?: { cached_tokens?: number };
+    input_tokens_details?: { prompt_tokens?: number; cached_tokens?: number };
     output_tokens?: number;
     total_tokens?: number;
   };
@@ -56,10 +57,13 @@ function stopReason(finish: string | undefined, hasToolCall: boolean): GigaAssis
 }
 
 export function parseChatResponse(model: GigaModel, body: GigaResponse): GigaAssistantMessage {
-  const answer = body.messages?.find(message => message.role === 'assistant') ?? body.messages?.[0];
+  const answer = body.messages?.find(message => message.role === 'assistant');
   const text = (answer?.content ?? []).map(part => part.text ?? '').join('');
-  const cacheRead = body.usage?.input_tokens_details?.cached_tokens ?? 0;
-  const input = Math.max((body.usage?.input_tokens ?? 0) - cacheRead, 0);
+  const inputTokens = body.usage?.input_tokens ?? 0;
+  // Шлюз изредка присылает cached_tokens больше input_tokens; без зажима это раздуло бы
+  // восстановленный в src/pi.ts счётчик входных токенов сверх реально оплаченного.
+  const cacheRead = Math.min(body.usage?.input_tokens_details?.cached_tokens ?? 0, inputTokens);
+  const input = inputTokens - cacheRead;
   const output = body.usage?.output_tokens ?? 0;
   return {
     role: 'assistant',
@@ -70,7 +74,7 @@ export function parseChatResponse(model: GigaModel, body: GigaResponse): GigaAss
     stopReason: stopReason(body.finish_reason, false),
     ...(body.finish_reason ? { rawStopReason: body.finish_reason } : {}),
     timestamp: (body.created_at ?? Math.floor(Date.now() / 1000)) * 1000,
-  } as GigaAssistantMessage;
+  };
 }
 
 interface CatalogEntry { id?: unknown; type?: unknown }
@@ -83,10 +87,8 @@ interface CatalogEntry { id?: unknown; type?: unknown }
 export function parseCatalog(body: unknown): string[] {
   const data = (body as { data?: unknown } | null)?.data;
   if (!Array.isArray(data)) return [];
-  const entries = data as CatalogEntry[];
-  const typed = entries.some(entry => typeof entry.type === 'string');
-  return entries
-    .filter(entry => typeof entry.id === 'string' && (!typed || entry.type === 'chat'))
+  return (data as CatalogEntry[])
+    .filter(entry => typeof entry.id === 'string' && (typeof entry.type !== 'string' || entry.type === 'chat'))
     .map(entry => entry.id as string);
 }
 
