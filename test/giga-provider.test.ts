@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { readGigaConfig, requestOptions } from '../src/giga-transport.js';
-import { createGigaProvider } from '../src/giga-provider.js';
+import { createGigaProvider, registerGigaProvider } from '../src/giga-provider.js';
 import type { GigaModel } from '../src/giga-protocol.js';
 
 const catalogBody = JSON.stringify({ data: [
@@ -172,4 +173,33 @@ test('a gateway error surfaces as a failed model call, not as a parse error', as
     provider.streamSimple!(model, { messages: [{ role: 'user', content: 'Hi', timestamp: 1 }] }, {}).result(),
     /429/,
   );
+});
+
+test('a registered provider exposes its models through the Pi runtime', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-giga-runtime-'));
+  const runtime = await ModelRuntime.create({
+    authPath: join(directory, 'auth.json'), modelsPath: null,
+    modelsStorePath: join(directory, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false,
+  });
+  try {
+    await registerGigaProvider(runtime, {}, async () => ({ status: 200, text: catalogBody }));
+    assert.equal(runtime.getModel('giga', 'GigaChat-3-Pro')?.id, 'GigaChat-3-Pro');
+    assert.deepEqual((await runtime.getAvailable('giga')).map(model => model.id), ['GigaChat-3-Pro', 'glm-5.2']);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('registration is silent when the gateway is not configured', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'agent-lab-giga-empty-'));
+  const runtime = await ModelRuntime.create({
+    authPath: join(directory, 'auth.json'), modelsPath: null,
+    modelsStorePath: join(directory, 'models-store.json'), allowModelNetwork: false, refreshOnCreate: false,
+  });
+  try {
+    await registerGigaProvider(runtime, {});
+    assert.equal(runtime.getModel('giga', 'GigaChat-3-Pro'), undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

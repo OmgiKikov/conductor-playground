@@ -1,4 +1,4 @@
-import type { ProviderConfig } from '@earendil-works/pi-coding-agent';
+import type { ModelRuntime, ProviderConfig } from '@earendil-works/pi-coding-agent';
 import { buildChatRequest, normalizeResponseFormat, parseCatalog, parseChatResponse, type GigaAssistantMessage } from './giga-protocol.js';
 import { createGigaTransport, readGigaConfig, type GigaTransport } from './giga-transport.js';
 
@@ -59,4 +59,16 @@ export async function createGigaProvider(
       } as unknown as ReturnType<NonNullable<ProviderConfig['streamSimple']>>;
     },
   };
+}
+
+export const GIGA_PROVIDER_ID = 'giga';
+
+/** Внутренний шлюз нельзя описать декларативным models.json: там нужен клиентский сертификат. */
+export async function registerGigaProvider(
+  runtime: ModelRuntime,
+  env: Record<string, string | undefined> = process.env,
+  injectedTransport?: GigaTransport,
+): Promise<void> {
+  const provider = await createGigaProvider(env, injectedTransport);
+  if (provider) runtime.registerProvider(GIGA_PROVIDER_ID, provider);
 }

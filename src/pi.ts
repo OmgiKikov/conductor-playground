@@ -10,6 +10,7 @@ import {
   TOOL_NAMES, VERSION, fingerprint, simulatorFidelity, userTurnSchema, validateObservedGoals,
   type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
+import { registerGigaProvider } from './giga-provider.js';
 import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
@@ -289,6 +290,7 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
   let modelRuntime: ModelRuntime;
   try { modelRuntime = injectedRuntime ?? await ModelRuntime.create({ allowModelNetwork: false, signal }); }
   catch { throw new Error(`Не удалось инициализировать Pi. ${authHelp}`); }
+  if (!injectedRuntime) await registerGigaProvider(modelRuntime);
   const model = modelRuntime.getModel(settings.provider, settings.model);
   if (!model) throw new Error(`Выбранная модель недоступна: ${settings.provider}/${settings.model}. ${authHelp}`);
   let available: Awaited<ReturnType<ModelRuntime['getAvailable']>>;
