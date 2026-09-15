@@ -9,6 +9,11 @@ export interface GigaConfig {
   rejectUnauthorized: boolean;
 }
 
+// GIGACHAT_INSECURE отключает проверку сертификата шлюза без каких-либо других признаков в
+// работе провайдера; предупреждение печатается один раз за процесс, чтобы боевой запуск
+// с этим флагом не остался незамеченным, но не заспамил лог на каждое обращение к конфигу.
+let insecureWarningLogged = false;
+
 /**
  * Возвращает `undefined`, если не задана обязательная переменная; бросает, если заданный путь не читается.
  *
@@ -20,12 +25,17 @@ export function readGigaConfig(env: Record<string, string | undefined> = process
   const certPath = env.GIGACHAT_CERT_PATH;
   const keyPath = env.GIGACHAT_KEY_PATH;
   if (!url || !certPath || !keyPath) return undefined;
+  const rejectUnauthorized = env.GIGACHAT_INSECURE !== '1';
+  if (!rejectUnauthorized && !insecureWarningLogged) {
+    insecureWarningLogged = true;
+    process.stderr.write('giga: GIGACHAT_INSECURE=1 — проверка сертификата шлюза отключена\n');
+  }
   return {
     baseUrl: url.replace(/\/+$/, '').replace(/\/v[12]$/, ''),
     cert: readFileSync(certPath),
     key: readFileSync(keyPath),
     ca: env.GIGACHAT_CA_PATH ? readFileSync(env.GIGACHAT_CA_PATH) : undefined,
-    rejectUnauthorized: env.GIGACHAT_INSECURE !== '1',
+    rejectUnauthorized,
   };
 }
 
