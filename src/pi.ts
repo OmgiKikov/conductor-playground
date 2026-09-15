@@ -10,7 +10,7 @@ import {
   TOOL_NAMES, VERSION, fingerprint, simulatorFidelity, userTurnSchema, validateObservedGoals,
   type CallContext, type Runtime, type Settings, type TargetSession, type Tool,
 } from './contracts.js';
-import { registerGigaProvider } from './giga-provider.js';
+import { GIGA_PROVIDER_ID, registerGigaProvider } from './giga-provider.js';
 import { AGENT_ROLE, ASSESS_ROLE, DATA_BOUNDARY, EXTERNAL_CARDS_CLAUSE, FAILURE_MODES_ROLE, FAMILY_PLAN_ROLE, GOALS_ROLE, IMPROVE_ROLE, PROFILES_ROLE, REQUIREMENTS_ROLE, SIMULATOR_ROLE, TOOL_GUIDE, cardsRole } from './prompts.js';
 
 type Model = NonNullable<ReturnType<ModelRuntime['getModel']>>;
@@ -478,14 +478,18 @@ export async function createPiRuntime(settings: Settings, injectedRuntime?: Mode
           openRouterRouting: { only: [upstream], allow_fallbacks: false },
         } : {}) },
       } : resolved;
+      // giga speaks the same strict-schema contract as the OpenRouter adapter (see
+      // normalizeResponseFormat in giga-protocol.ts); without this the judge hook below
+      // never installs and the judge falls back to unstructured free-form output.
+      const structuredJudge = judge.provider === 'openrouter' || judge.provider === GIGA_PROVIDER_ID;
       return assessRepeated(input, { ...judgeModel,
         configurationHash: fingerprint({ api: judgeModel.api, baseUrl: judgeModel.baseUrl, compat: judgeModel.compat,
           temperature: judgeModel.reasoning ? 'default' : 0, thinking: judgeModel.reasoning ? 'medium' : 'off' }),
-        transport: { api: judgeModel.api, upstream, structured: judge.provider === 'openrouter' },
+        transport: { api: judgeModel.api, upstream, structured: structuredJudge },
       }, ctx, async (prompt, data, recordPartial) => {
         const session = await controlledSession(modelRuntime, judgeModel, prompt, [], { ...ctx, onTargetEvent: event => {
           if (event.type === 'assistant' && event.text) recordPartial(event.text);
-        } }, 16384, judgeModel.reasoning ? undefined : 0, judge.provider === 'openrouter', judgeModel.reasoning ? 'medium' : 'off');
+        } }, 16384, judgeModel.reasoning ? undefined : 0, structuredJudge, judgeModel.reasoning ? 'medium' : 'off');
         try { return await session.respond(data); } finally { await session.close(); }
       });
     },

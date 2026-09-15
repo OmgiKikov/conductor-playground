@@ -6,6 +6,8 @@ import { test } from 'node:test';
 import { ModelRuntime, type ProviderConfig } from '@earendil-works/pi-coding-agent';
 import { createPiRuntime, getPiStatus } from '../src/pi.js';
 import { DEFAULT_JUDGE, emptyUsage, settingsSchema, type CallContext, type Scenario, type Tool, type Trial } from '../src/contracts.js';
+import { GIGA_PROVIDER_ID } from '../src/giga-provider.js';
+import { JUDGE_RESPONSE_FORMAT } from '../src/judge.js';
 
 type Request = Parameters<NonNullable<ProviderConfig['streamSimple']>>[1];
 type Options = Parameters<NonNullable<ProviderConfig['streamSimple']>>[2];
@@ -684,6 +686,50 @@ test('role overrides select the actual SDK model independently for simulation an
     const result = await adapter.assess!({ scenario, sources: [], trial }, callContext().ctx);
     assert.equal(result[0]!.result, 'pass');
     assert.deepEqual(f.modelsUsed, ['test-model', 'role-model', 'role-model']);
+  } finally { await f.close(); }
+});
+
+test('a giga judge receives the strict schema hook, not only a hand-injected one', async () => {
+  const f = await fixture(() => { throw new Error('The planner provider must not assess'); });
+  let installedHook: unknown;
+  f.runtime.registerProvider(GIGA_PROVIDER_ID, {
+    api: 'giga-v2', apiKey: 'fixture-only-not-a-real-key', baseUrl: 'https://gateway.example/v2',
+    models: [{ id: 'giga-judge-model', name: 'Giga fixture', reasoning: false, input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 32768 }],
+    streamSimple(model, _context, options) {
+      installedHook = options?.onPayload;
+      const finished = (async (): Promise<Message> => {
+        const base = { model: model.id, messages: [] };
+        const hooked = (await options?.onPayload?.(base, model)) ?? base;
+        assert.deepEqual((hooked as { response_format?: unknown }).response_format, JUDGE_RESPONSE_FORMAT);
+        const answer = JSON.stringify({ assessments: [
+          { metricId: 'goal', passCondition: 'met', failCondition: 'not_met', rationale: 'Recorded reply provides help', evidence: [1], citations: [{ seq: 1, quote: 'Here is help' }] },
+        ] });
+        return {
+          role: 'assistant', content: [{ type: 'text', text: answer }], api: model.api, provider: model.provider, model: model.id,
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: 'stop', timestamp: Date.now(),
+        };
+      })();
+      return {
+        result: () => finished,
+        async *[Symbol.asyncIterator]() {
+          const message = await finished;
+          yield { type: 'start', partial: message };
+          yield { type: 'done', reason: message.stopReason, message };
+        },
+      } as ReturnType<ModelRuntime['streamSimple']>;
+    },
+  });
+  try {
+    const adapter = await createPiRuntime({ ...settings, judge: { provider: GIGA_PROVIDER_ID, model: 'giga-judge-model' } }, f.runtime);
+    const scenario = { ...plainCard(0), split: 'dev' as const, metrics: [reviewFields.metrics[0]!] };
+    const trial: Trial = { id: 't', scenarioId: scenario.id, familyId: scenario.familyId, revisionId: 'r', userMode: 'static', repeat: 0, split: 'dev',
+      manifestHash: 'hash', outcome: 'ungraded', reason: '', checks: [], initialState: scenario.initialState, finalState: scenario.initialState,
+      usage: emptyUsage(), elapsedMs: 1, events: [{ seq: 0, type: 'user', text: 'Help' }, { seq: 1, type: 'assistant', text: 'Here is help' }] };
+    const result = await adapter.assess!({ scenario, sources: [], trial }, callContext().ctx);
+    assert.equal(typeof installedHook, 'function', 'controlledSession must install onPayload for a giga judge, not only for openrouter');
+    assert.equal(result[0]!.result, 'pass');
   } finally { await f.close(); }
 });
 
