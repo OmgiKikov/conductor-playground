@@ -106,6 +106,16 @@ function stopReason(finish: string | undefined, hasToolCall: boolean): GigaAssis
   return finish === 'length' ? 'length' : 'stop';
 }
 
+// Gateways commonly send function_call.arguments as a JSON-encoded string rather than an
+// object; passing that string straight to a tool would fail its validation obscurely.
+function functionArguments(raw: unknown): Record<string, unknown> {
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw) as Record<string, unknown>; }
+    catch { return {}; }
+  }
+  return (raw ?? {}) as Record<string, unknown>;
+}
+
 export function parseChatResponse(model: GigaModel, body: GigaResponse): GigaAssistantMessage {
   const answer = body.messages?.find(message => message.role === 'assistant');
   const state = answer?.tools_state_id ?? answer?.tool_state_id ?? '';
@@ -120,7 +130,7 @@ export function parseChatResponse(model: GigaModel, body: GigaResponse): GigaAss
     if (!part.function_call) continue;
     content.push({
       type: 'toolCall', id: `${state}#${callIndex}`, name: part.function_call.name,
-      arguments: (part.function_call.arguments ?? {}) as Record<string, unknown>,
+      arguments: functionArguments(part.function_call.arguments),
     });
     callIndex += 1;
   }

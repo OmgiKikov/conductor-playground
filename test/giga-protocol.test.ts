@@ -193,6 +193,26 @@ test('a function call becomes a tool call whose id carries the tool state', () =
   }]);
 });
 
+test('a function call whose arguments arrive as a JSON string is parsed into an object', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'function_call',
+    messages: [{ role: 'assistant', tools_state_id: 'state-9',
+      content: [{ function_call: { name: 'lookup_record', arguments: '{"id":"A-1024"}' } }] }],
+    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+  } as never);
+  assert.deepEqual(message.content, [{ type: 'toolCall', id: 'state-9#0', name: 'lookup_record', arguments: { id: 'A-1024' } }]);
+});
+
+test('a function call whose arguments are an unparseable string falls back to no arguments', () => {
+  const message = parseChatResponse(model, {
+    finish_reason: 'function_call',
+    messages: [{ role: 'assistant', tools_state_id: 'state-9',
+      content: [{ function_call: { name: 'lookup_record', arguments: 'not json' } }] }],
+    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+  } as never);
+  assert.deepEqual(message.content, [{ type: 'toolCall', id: 'state-9#0', name: 'lookup_record', arguments: {} }]);
+});
+
 test('text alongside a function call is preserved', () => {
   const message = parseChatResponse(model, {
     finish_reason: 'function_call',
