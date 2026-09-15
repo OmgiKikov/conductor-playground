@@ -93,7 +93,15 @@ export function buildChatRequest(modelId: string, context: GigaContext, options:
 
 const noCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
+const KNOWN_FINISH_REASONS = new Set(['stop', 'length', 'function_call']);
+
+// A content-filter block or a gateway-side error also arrives as a completed HTTP response with
+// some finish_reason; treating anything unrecognized as a clean stop would grade a censored or
+// empty body as if the model had answered normally.
 function stopReason(finish: string | undefined, hasToolCall: boolean): GigaAssistantMessage['stopReason'] {
+  if (finish !== undefined && !KNOWN_FINISH_REASONS.has(finish)) {
+    throw new Error(`Giga gateway reported an unrecognized finish reason: ${finish}`);
+  }
   if (hasToolCall) return 'toolUse';
   return finish === 'length' ? 'length' : 'stop';
 }

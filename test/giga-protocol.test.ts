@@ -150,6 +150,13 @@ test('a truncated answer reports the length stop reason', () => {
   assert.equal(message.stopReason, 'length');
 });
 
+test('an unrecognized finish reason fails the model call instead of being reported as a clean stop', () => {
+  assert.throws(() => parseChatResponse(model, {
+    finish_reason: 'content_filter', messages: [{ role: 'assistant', content: [{ text: '' }] }],
+    usage: { input_tokens: 5, output_tokens: 0, total_tokens: 5 },
+  }), /content_filter/);
+});
+
 test('a response with no assistant-role message returns empty content instead of echoing another role', () => {
   const message = parseChatResponse(model, {
     finish_reason: 'stop', messages: [{ role: 'user', content: [{ text: 'echo' }] }],
