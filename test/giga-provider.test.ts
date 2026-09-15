@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readGigaConfig } from '../src/giga-transport.js';
+import { readGigaConfig, requestOptions } from '../src/giga-transport.js';
 
 async function certDirectory() {
   const directory = await mkdtemp(join(tmpdir(), 'agent-lab-giga-'));
@@ -70,4 +70,30 @@ test('a configured but unreadable certificate path fails loudly', async () => {
     GIGACHAT_CERT_PATH: join(directory, 'absent.pem'),
     GIGACHAT_KEY_PATH: join(directory, 'key.pem'),
   }), /absent\.pem/);
+});
+
+test('request options carry the client certificate and honour the verification switch', async () => {
+  const directory = await certDirectory();
+  const config = readGigaConfig({
+    GIGACHAT_URL: 'https://gateway.example/v1',
+    GIGACHAT_CERT_PATH: join(directory, 'cert.pem'),
+    GIGACHAT_KEY_PATH: join(directory, 'key.pem'),
+    GIGACHAT_CA_PATH: join(directory, 'ca.pem'),
+  })!;
+
+  const post = requestOptions(config, '/v2/chat/completions', '{"model":"x"}', 60000);
+  assert.equal(post.hostname, 'gateway.example');
+  assert.equal(post.path, '/v2/chat/completions');
+  assert.equal(post.method, 'POST');
+  assert.equal(post.rejectUnauthorized, true);
+  assert.equal(post.cert?.toString(), 'test-cert');
+  assert.equal(post.key?.toString(), 'test-key');
+  assert.equal(post.ca?.toString(), 'test-ca');
+  assert.equal(post.headers?.['Content-Type'], 'application/json');
+  // Транспортная аутентификация: заголовка авторизации быть не должно.
+  assert.equal(Object.keys(post.headers ?? {}).some(name => name.toLowerCase() === 'authorization'), false);
+
+  const get = requestOptions(config, '/v1/models', undefined, 60000);
+  assert.equal(get.method, 'GET');
+  assert.deepEqual(get.headers, {});
 });
