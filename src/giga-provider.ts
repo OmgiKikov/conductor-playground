@@ -9,25 +9,38 @@ const CONTEXT_WINDOW = 128000;
 // Список моделей — не более чем справочник; в отличие от чата, ждать его 120 секунд незачем.
 const CATALOG_TIMEOUT_MS = 10000;
 
+/** Единственная точка диагностики отказа каталога: только категория, без тела ответа, путей и содержимого сертификатов. */
+function reportCatalogFailure(category: string): void {
+  process.stderr.write(`giga: каталог моделей недоступен (${category})\n`);
+}
+
 export async function createGigaProvider(
   env: Record<string, string | undefined> = process.env,
   injectedTransport?: GigaTransport,
   signal?: AbortSignal,
 ): Promise<ProviderConfig | undefined> {
   let config: GigaConfig | undefined;
-  let transport: GigaTransport;
-  let ids: string[] = [];
   try {
     // readGigaConfig throws on an unreadable configured path (bad cert/key/CA path). That
     // failure must degrade like any other misconfiguration, not crash every run on every provider.
     config = injectedTransport ? undefined : readGigaConfig(env);
-    if (!injectedTransport && !config) return undefined;
-    transport = injectedTransport ?? createGigaTransport(config!);
+  } catch { reportCatalogFailure('bad configuration'); return undefined; }
+  if (!injectedTransport && !config) return undefined;
+  const transport = injectedTransport ?? createGigaTransport(config!);
+
+  let catalog: { status: number; text: string };
+  try {
     const deadline = AbortSignal.timeout(CATALOG_TIMEOUT_MS);
-    const catalog = await transport('/v1/models', undefined, signal ? AbortSignal.any([signal, deadline]) : deadline);
-    if (catalog.status === 200) ids = parseCatalog(JSON.parse(catalog.text));
-  } catch { return undefined; }
-  if (!ids.length) return undefined;
+    catalog = await transport('/v1/models', undefined, signal ? AbortSignal.any([signal, deadline]) : deadline);
+  } catch { reportCatalogFailure('TLS'); return undefined; }
+  if (catalog.status !== 200) { reportCatalogFailure(`HTTP ${catalog.status}`); return undefined; }
+
+  let parsedCatalog: unknown;
+  try { parsedCatalog = JSON.parse(catalog.text); }
+  catch { reportCatalogFailure('bad JSON'); return undefined; }
+
+  const ids = parseCatalog(parsedCatalog);
+  if (!ids.length) { reportCatalogFailure('empty catalog'); return undefined; }
 
   return {
     name: 'Internal model gateway',

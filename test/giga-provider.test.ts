@@ -164,6 +164,32 @@ test('without configuration or with an unusable catalog no provider is produced'
   assert.equal(await createGigaProvider({}, async () => { throw new Error('network down'); }), undefined);
 });
 
+async function capturedStderr(run: () => Promise<unknown>): Promise<string[]> {
+  const lines: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: unknown) => { lines.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try { await run(); } finally { process.stderr.write = original; }
+  return lines;
+}
+
+test('each catalog failure is reported to stderr by category only, never a path or a response body', async () => {
+  const cases: { category: string; run: () => Promise<unknown> }[] = [
+    { category: 'bad configuration', run: () => createGigaProvider({
+      GIGACHAT_URL: 'https://gateway.example', GIGACHAT_CERT_PATH: '/no/such/cert.pem', GIGACHAT_KEY_PATH: '/no/such/key.pem',
+    }) },
+    { category: 'TLS', run: () => createGigaProvider({}, async () => { throw new Error('unable to verify the first certificate'); }) },
+    { category: 'HTTP 403', run: () => createGigaProvider({}, async () => ({ status: 403, text: 'top secret denial body' })) },
+    { category: 'bad JSON', run: () => createGigaProvider({}, async () => ({ status: 200, text: 'not json' })) },
+    { category: 'empty catalog', run: () => createGigaProvider({}, async () => ({ status: 200, text: '{"data":[]}' })) },
+  ];
+  for (const { category, run } of cases) {
+    const lines = await capturedStderr(run);
+    assert.equal(lines.length, 1, category);
+    assert.match(lines[0]!, new RegExp(`\\(${category}\\)`), category);
+    assert.doesNotMatch(lines[0]!, /top secret|no\/such|cert\.pem|first certificate/, category);
+  }
+});
+
 test('a completed answer is delivered as start and done events', async () => {
   const { provider, sent } = await providerWith([{ status: 200, text: catalogBody }, { status: 200, text: answerBody }]);
   const model = { id: 'GigaChat-3-Pro', api: 'giga-v2', provider: 'giga' } as GigaModel;
